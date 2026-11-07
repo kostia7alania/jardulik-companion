@@ -20,6 +20,11 @@ import (
 
 const restoreDownloadLimit = 20 << 20
 
+// Only unavailable copies may be superseded by a verified replacement.
+type restoreAvailabilityError struct{ error }
+
+func (e *restoreAvailabilityError) Unwrap() error { return e.error }
+
 type RestoreMediaResult struct {
 	Expected              int            `json:"expected"`
 	Verified              int            `json:"verified"` // Includes newly restored originals.
@@ -113,7 +118,7 @@ func RestoreMedia(ctx context.Context, tg *Telegram, dest string) (result Restor
 		}
 		needed[sha] = m
 	}
-	var failures []error
+	var failures, fatal []error
 	seen := map[string]bool{}
 	for _, receipt := range manifest.Receipts {
 		if len(needed) == 0 {
@@ -122,10 +127,11 @@ func RestoreMedia(ctx context.Context, tg *Telegram, dest string) (result Restor
 		if err = ctx.Err(); err != nil {
 			return result, err
 		}
-		if receipt.Kind != "profile_version" || seen[receipt.SourceSHA] {
+		copyKey := receipt.SourceSHA + ":" + receipt.FileID
+		if receipt.Kind != "profile_version" || seen[copyKey] {
 			continue
 		}
-		seen[receipt.SourceSHA] = true
+		seen[copyKey] = true
 		gap := ""
 		switch {
 		case !restoreSHA(receipt.SourceSHA) || receipt.Size <= 0 || receipt.FileID == "" || receipt.MessageID <= 0 || receipt.ChatID == 0 || receipt.EncryptedSHA != "" || (receipt.ReturnedSize > 0 && receipt.ReturnedSize != receipt.Size):
@@ -137,7 +143,11 @@ func RestoreMedia(ctx context.Context, tg *Telegram, dest string) (result Restor
 		}
 		if gap != "" {
 			result.SupportGaps = append(result.SupportGaps, gap)
-			failures = append(failures, errors.New(gap))
+			failure := errors.New(gap)
+			failures = append(failures, failure)
+			if gap == "invalid_whole_profile_receipt" {
+				fatal = append(fatal, failure)
+			}
 			continue
 		}
 		err = restoreProfileDocument(ctx, root, tg, receipt, expected, needed, &result)
@@ -146,14 +156,19 @@ func RestoreMedia(ctx context.Context, tg *Telegram, dest string) (result Restor
 				return result, ctx.Err()
 			}
 			result.SupportGaps = append(result.SupportGaps, "profile_zip_recovery_failed:"+receipt.SourceSHA)
-			failures = append(failures, fmt.Errorf("profile ZIP %s: %w", receipt.SourceSHA, err))
+			failure := fmt.Errorf("profile ZIP %s: %w", receipt.SourceSHA, err)
+			failures = append(failures, failure)
+			if _, unavailable := err.(*restoreAvailabilityError); !unavailable {
+				fatal = append(fatal, failure)
+			}
 		}
 	}
 	if len(needed) > 0 {
 		result.SupportGaps = append(result.SupportGaps, "snapshot_media_not_recovered_from_delivered_whole_zips")
 		failures = append(failures, fmt.Errorf("%d snapshot media originals remain missing", len(needed)))
+		return result, errors.Join(failures...)
 	}
-	return result, errors.Join(failures...)
+	return result, errors.Join(fatal...)
 }
 
 func restoreProfileDocument(ctx context.Context, root *os.Root, tg *Telegram, receipt archiveReceipt, expected, needed map[string]archiveMedia, result *RestoreMediaResult) (resultErr error) {
@@ -167,7 +182,9 @@ func restoreProfileDocument(ctx context.Context, root *os.Root, tg *Telegram, re
 		if errors.Is(removeErr, os.ErrNotExist) {
 			removeErr = nil
 		}
-		resultErr = errors.Join(resultErr, closeErr, removeErr)
+		if closeErr != nil || removeErr != nil {
+			resultErr = errors.Join(resultErr, closeErr, removeErr)
+		}
 	}()
 	if err = downloadRestoreZIP(ctx, tg, receipt, file); err != nil {
 		return err
@@ -176,14 +193,13 @@ func restoreProfileDocument(ctx context.Context, root *os.Root, tg *Telegram, re
 	if err != nil {
 		return err
 	}
-	entries, err := preflightProfileMediaZIP(ctx, z, expected)
+	mediaEntries, err := preflightProfileMediaZIP(ctx, z, expected)
 	if err != nil {
 		return err
 	}
-	for _, entry := range z.File {
-		sha := strings.TrimPrefix(entry.Name, "media/")
+	for sha, entry := range mediaEntries {
 		m, ok := needed[sha]
-		if !ok || entries["media/"+sha] != entry {
+		if !ok {
 			continue
 		}
 		if err = root.Mkdir("media", 0700); err != nil && !errors.Is(err, os.ErrExist) {
@@ -214,14 +230,22 @@ func preflightProfileMediaZIP(ctx context.Context, z *zip.Reader, expected map[s
 		return nil, fmt.Errorf("%w: profile entry count", errArchiveBudget)
 	}
 	entries := map[string]*zip.File{}
+	mediaEntries := map[string]*zip.File{}
 	var total uint64
 	for _, f := range z.File {
 		name := f.Name
 		if !filepath.IsLocal(name) || filepath.Clean(name) != name || strings.Contains(name, "\\") || !f.Mode().IsRegular() || entries[name] != nil {
 			return nil, errors.New("unsafe or duplicate profile ZIP entry")
 		}
-		if name != "raw.json" && name != "manifest.json" && (!strings.HasPrefix(name, "media/") || !restoreSHA(strings.TrimPrefix(name, "media/"))) {
-			return nil, errors.New("unexpected profile ZIP entry")
+		if name != "raw.json" && name != "manifest.json" {
+			sha, err := archiveMediaSHA(name)
+			if err != nil || !restoreSHA(sha) {
+				return nil, errors.New("unexpected profile ZIP entry")
+			}
+			if mediaEntries[sha] != nil {
+				return nil, errors.New("duplicate normalized profile media SHA")
+			}
+			mediaEntries[sha] = f
 		}
 		if f.UncompressedSize64 > serviceRestoreLimit || total > serviceRestoreLimit-f.UncompressedSize64 {
 			return nil, fmt.Errorf("%w: profile uncompressed size", errArchiveBudget)
@@ -242,7 +266,7 @@ func preflightProfileMediaZIP(ctx context.Context, z *zip.Reader, expected map[s
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > serviceManifestLimit || json.Unmarshal(b, &manifest) != nil || manifest.Format != "jardulik-companion-archive/v1" || manifest.ProfileID <= 0 || manifest.VersionID <= 0 || manifest.ObserverID <= 0 || len(manifest.Files) != len(entries)-1 {
+	if len(b) > serviceManifestLimit || json.Unmarshal(b, &manifest) != nil || manifest.Format != "jardulik-companion-archive/v1" || manifest.ProfileID <= 0 || manifest.VersionID <= 0 || manifest.ObserverID < 0 || len(manifest.Files) != len(entries)-1 {
 		return nil, errors.New("invalid profile manifest")
 	}
 	files := map[string]archiveFile{}
@@ -251,8 +275,11 @@ func preflightProfileMediaZIP(ctx context.Context, z *zip.Reader, expected map[s
 		if source.Name == "manifest.json" || entry == nil || files[source.Name].Name != "" || source.ByteSize < 0 || uint64(source.ByteSize) != entry.UncompressedSize64 || !restoreSHA(source.SHA256) {
 			return nil, errors.New("invalid profile file inventory")
 		}
-		if strings.HasPrefix(source.Name, "media/") && source.Name != "media/"+source.SHA256 {
-			return nil, errors.New("profile media filename/hash mismatch")
+		if strings.HasPrefix(source.Name, "media/") {
+			sha, err := archiveMediaSHA(source.Name)
+			if err != nil || sha != source.SHA256 {
+				return nil, errors.New("profile media filename/hash mismatch")
+			}
 		}
 		files[source.Name] = source
 		in, err := entry.Open()
@@ -270,21 +297,25 @@ func preflightProfileMediaZIP(ctx context.Context, z *zip.Reader, expected map[s
 		if m.State != "complete" {
 			continue
 		}
-		source, ok := files["media/"+m.SHA256]
-		if !ok || !restoreSHA(m.SHA256) || source.SHA256 != m.SHA256 || source.ByteSize != m.Size {
+		entry := mediaEntries[m.SHA256]
+		if entry == nil || !restoreSHA(m.SHA256) {
+			return nil, errors.New("profile media is absent from its file inventory")
+		}
+		source, ok := files[entry.Name]
+		if !ok || source.SHA256 != m.SHA256 || source.ByteSize != m.Size {
 			return nil, errors.New("profile media is absent from its file inventory")
 		}
 		if want, ok := expected[m.SHA256]; ok && want.Size != m.Size {
 			return nil, errors.New("profile media conflicts with snapshot inventory")
 		}
-		declared["media/"+m.SHA256] = true
+		declared[m.SHA256] = true
 	}
-	for name := range files {
-		if strings.HasPrefix(name, "media/") && !declared[name] {
+	for sha := range mediaEntries {
+		if !declared[sha] {
 			return nil, errors.New("profile ZIP contains undeclared media")
 		}
 	}
-	return entries, nil
+	return mediaEntries, nil
 }
 
 // Use the existing Telegram client without handing a path-string API authority
@@ -299,10 +330,13 @@ func downloadRestoreZIP(ctx context.Context, tg *Telegram, receipt archiveReceip
 		Size int64  `json:"file_size"`
 	}
 	if err := api.Call(ctx, "getFile", map[string]string{"file_id": receipt.FileID}, &info); err != nil {
-		return err
+		return &restoreAvailabilityError{err}
 	}
-	if info.Size < 0 || info.Size > restoreDownloadLimit || (info.Size > 0 && info.Size != receipt.Size) {
-		return errors.New("Telegram file exceeds the 20 MiB budget or differs from the whole-file receipt")
+	if info.Size > restoreDownloadLimit {
+		return &restoreAvailabilityError{errors.New("Telegram file exceeds the 20 MiB download budget")}
+	}
+	if info.Size < 0 || (info.Size > 0 && info.Size != receipt.Size) {
+		return errors.New("Telegram file size differs from the whole-file receipt")
 	}
 	if info.Path == "" || path.IsAbs(info.Path) || path.Clean(info.Path) != info.Path || strings.Contains(info.Path, "\\") || info.Path == ".." || strings.HasPrefix(info.Path, "../") {
 		return errors.New("unsafe Telegram file path")
@@ -319,11 +353,14 @@ func downloadRestoreZIP(ctx context.Context, tg *Telegram, receipt archiveReceip
 	}
 	response, err := client.Do(req)
 	if err != nil {
-		return redactedTransportError(err)
+		return &restoreAvailabilityError{redactedTransportError(err)}
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK || response.ContentLength > receipt.Size {
-		return errors.New("Telegram whole-file download rejected or oversized")
+	if response.StatusCode != http.StatusOK {
+		return &restoreAvailabilityError{errors.New("Telegram whole-file download rejected")}
+	}
+	if response.ContentLength > receipt.Size {
+		return errors.New("Telegram whole-file download exceeds its receipt size")
 	}
 	return verifyRestoreSource(ctx, response.Body, out, receipt.SourceSHA, receipt.Size)
 }

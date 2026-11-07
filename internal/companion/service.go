@@ -23,6 +23,7 @@ type Service struct {
 	TG       *Telegram
 	Media    *MediaManager
 	Archiver *Archiver
+	Watcher  *ProfileWatcher
 	locks    sync.Map
 	runs     sync.Map
 }
@@ -34,6 +35,7 @@ func NewService(c Config) (*Service, error) {
 	}
 	v := &Service{Config: c, Store: s, Client: NewClient(s, c), TG: NewTelegram(c), Media: NewMediaManager(s, c)}
 	v.Archiver = NewArchiver(c, s, v.TG, v.Media)
+	v.Watcher = NewProfileWatcher(c, s, v.Client)
 	return v, nil
 }
 func (s *Service) Close() error { return s.Store.Close() }
@@ -69,10 +71,16 @@ func (s *Service) Run(ctx context.Context) error {
 		return err
 	}
 	var background sync.WaitGroup
-	background.Add(3)
+	background.Add(4)
 	go func() { defer background.Done(); s.Media.Run(ctx) }()
-	go func() { defer background.Done(); s.Archiver.Run(ctx) }()
+	go func() {
+		defer background.Done()
+		if !s.Config.ArchivePaused {
+			s.Archiver.Run(ctx)
+		}
+	}()
 	go func() { defer background.Done(); s.runPrivateCardRepair(ctx) }()
+	go func() { defer background.Done(); s.Watcher.Run(ctx) }()
 	queues := make([]chan Update, 4)
 	var workers sync.WaitGroup
 	for i := range queues {
@@ -247,6 +255,23 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		return
 	}
 	cmd := strings.Split(fields[0], "@")[0]
+	if strings.HasPrefix(cmd, "/text_") || strings.HasPrefix(cmd, "/fav_") {
+		prefix := "/text_"
+		if strings.HasPrefix(cmd, "/fav_") {
+			prefix = "/fav_"
+		}
+		id, err := strconv.ParseInt(strings.TrimPrefix(cmd, prefix), 10, 64)
+		if err == nil && id > 0 {
+			if p, err := s.Store.Profile(ctx, owner, id); err == nil {
+				if prefix == "/text_" {
+					s.fullText(ctx, owner, p)
+				} else if s.Store.Favorite(ctx, owner, id) == nil {
+					_ = s.say(ctx, owner, "Сохранено в избранное.", nil)
+				}
+			}
+		}
+		return
+	}
 	switch cmd {
 	case "/start":
 		source := "direct"
@@ -423,6 +448,9 @@ func (s *Service) status(ctx context.Context, owner int64) {
 	if owner == s.Config.OwnerID {
 		text += "\nБэкап: " + s.Archiver.BackupStatus(ctx)
 	}
+	if s.Watcher != nil {
+		text += "\n" + s.Watcher.Status(ctx, owner)
+	}
 	_ = s.say(ctx, owner, text, nil)
 }
 func (s *Service) Fetch(ctx context.Context, owner int64) (int, error) {
@@ -473,19 +501,53 @@ func (s *Service) next(ctx context.Context, owner int64) {
 func profileText(p StoredProfile) string {
 	v := p.Profile
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s", v.String("name"))
-	if age := v.String("age"); age != "" {
-		fmt.Fprintf(&b, ", %s", age)
+	name := strings.Join(strings.Fields(v.String("name")+" "+v.String("surName")), " ")
+	b.WriteString(name)
+	age, height := v.String("age"), v.String("height")
+	if age == "0" {
+		age = ""
 	}
-	fmt.Fprintf(&b, "\nJardulik #%d\n", p.ID)
-	for _, f := range []struct{ Key, Label string }{{"surName", "Фамилия"}, {"country", "Страна"}, {"city", "Город"}, {"height", "Рост"}, {"goal", "Цель"}, {"worldview", "Мировоззрение"}, {"children", "Дети"}, {"profession", "Занятие"}, {"familyNames", "Родственные фамилии"}, {"languages", "Языки"}, {"description", "О себе"}} {
-		if val := profileValue(v, f.Key); val != "" {
-			fmt.Fprintf(&b, "\n%s: %s", f.Label, val)
+	if height == "0" {
+		height = ""
+	}
+	if age != "" || height != "" {
+		b.WriteString(", " + strings.Trim(age+"/"+height, "/"))
+	}
+	var location []string
+	for _, key := range []string{"country", "city"} {
+		if val := profileValue(v, key); val != "" {
+			location = append(location, val)
 		}
 	}
-	if p.LastSeen != "" {
-		fmt.Fprintf(&b, "\n\n%s", displayTime(p.LastSeen))
+	if len(location) > 0 {
+		b.WriteString("\n📍 " + strings.Join(location, ", "))
 	}
+	for _, f := range []struct{ key, icon string }{{"goal", "🎯 "}, {"worldview", "🙏 "}, {"children", "👶 "}, {"profession", "💼 "}, {"languages", "🗣 "}} {
+		if v.String(f.key) == "dont_tell" {
+			continue
+		}
+		if val := profileValue(v, f.key); val != "" {
+			if f.key == "children" && v.String("children") == "none" {
+				val = "Детей нет"
+			}
+			b.WriteString("\n" + f.icon + val)
+		}
+	}
+	if family := profileValue(v, "familyNames"); meaningfulProfileValue(family) {
+		b.WriteString("\nРодственные фамилии: " + family)
+	}
+	if bio := profileValue(v, "description"); meaningfulProfileValue(bio) {
+		b.WriteString("\n\n" + bio)
+	}
+	var footer []string
+	if fields := missingProfileFields(v); len(fields) > 0 {
+		footer = append(footer, "Не указано: "+strings.Join(fields, ", "))
+	}
+	if p.LastSeen != "" {
+		footer = append(footer, displayTime(p.LastSeen))
+	}
+	footer = append(footer, fmt.Sprintf("Jardulik: %d", p.ID))
+	b.WriteString("\n\n" + strings.Join(footer, "\n"))
 	return b.String()
 }
 func (s *Service) Deliver(ctx context.Context, owner int64, p StoredProfile) error {
@@ -536,7 +598,7 @@ func (s *Service) history(ctx context.Context, owner, id int64) {
 		return
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Анкета #%d: %s\nВерсий в этой выборке: %d\n", id, a[0].Profile.String("name"), len(a))
+	fmt.Fprintf(&b, "Анкета #%d: %s\nСнимков в истории: %d\n", id, a[0].Profile.String("name"), len(a))
 	for i, p := range a {
 		fmt.Fprintf(&b, "\n%s", displayTime(p.LastSeen))
 		if i+1 < len(a) {

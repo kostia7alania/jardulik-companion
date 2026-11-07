@@ -18,15 +18,26 @@ const Version = "0.1.0"
 
 type Config struct {
 	DataDir, Token, APIBase, TelegramBase              string
+	UserAgent                                          string
 	OwnerID, SourceBotID, BackupChatID, BackupThreadID int64
 	SessionKey, BackupKey                              []byte
 	AllowReactions                                     bool
+	ArchivePaused                                      bool
 	MinFreeBytes                                       uint64
 	InitMaxAge                                         time.Duration
+	WatchInterval, WatchGap                            time.Duration
+	WatchDailyLimit                                    int
 }
 
 func LoadConfig() (Config, error) {
-	c := Config{DataDir: os.Getenv("APP_DATA_DIR"), Token: os.Getenv("TELEGRAM_BOT_TOKEN"), APIBase: "https://api.jardulik.app/api", TelegramBase: "https://api.telegram.org", MinFreeBytes: 2 << 30, InitMaxAge: 24 * time.Hour}
+	c := Config{DataDir: os.Getenv("APP_DATA_DIR"), Token: os.Getenv("TELEGRAM_BOT_TOKEN"), APIBase: "https://api.jardulik.app/api", TelegramBase: "https://api.telegram.org", MinFreeBytes: 2 << 30, InitMaxAge: 24 * time.Hour, WatchInterval: 24 * time.Hour, WatchGap: 20 * time.Second, WatchDailyLimit: 300}
+	c.UserAgent = strings.TrimSpace(os.Getenv("JARDULIK_USER_AGENT"))
+	if c.UserAgent == "" {
+		c.UserAgent = defaultUserAgent
+	}
+	if len(c.UserAgent) > 1024 || strings.ContainsAny(c.UserAgent, "\r\n\x00") {
+		return c, errors.New("invalid JARDULIK_USER_AGENT")
+	}
 	if c.DataDir == "" {
 		c.DataDir = "./data"
 	}
@@ -50,6 +61,7 @@ func LoadConfig() (Config, error) {
 		}
 	}
 	c.AllowReactions = os.Getenv("ALLOW_REACTIONS") == "true"
+	c.ArchivePaused = os.Getenv("ARCHIVE_WORKER_PAUSED") == "true"
 	if s := os.Getenv("MIN_FREE_BYTES"); s != "" {
 		c.MinFreeBytes, err = strconv.ParseUint(s, 10, 64)
 		if err != nil {

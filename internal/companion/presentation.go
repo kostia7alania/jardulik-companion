@@ -1,6 +1,8 @@
 package companion
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,6 +22,26 @@ func displayTime(raw string) string {
 	value = value.In(time.FixedZone("UTC+3", 3*60*60))
 	weekdays := [...]string{"вс", "пн", "вт", "ср", "чт", "пт", "сб"}
 	return value.Format("2.01.06, 15:04") + " (" + weekdays[value.Weekday()] + ", UTC+3)"
+}
+
+func forumTopicURL(chatID, threadID int64) string {
+	chat := strconv.FormatInt(chatID, 10)
+	if !strings.HasPrefix(chat, "-100") || threadID <= 0 {
+		return ""
+	}
+	channel := strings.TrimPrefix(chat, "-100")
+	if channel == "" || channel == "0" {
+		return ""
+	}
+	return fmt.Sprintf("https://t.me/c/%s/%d", channel, threadID)
+}
+
+func profileHeading(v Profile) string {
+	name:=strings.Join(strings.Fields(v.String("name")+" "+v.String("surName"))," ")
+	age,height:=v.String("age"),v.String("height")
+	if age=="0" {age=""};if height=="0" {height=""}
+	if age!="" || height!="" {name+=", "+strings.Trim(age+"/"+height,"/")}
+	return name
 }
 
 // Telegram entity offsets count UTF-16 units. Keeping this stricter budget also
@@ -44,8 +66,7 @@ func profileCaption(text string) string {
 		return prefix
 	}
 	const tail = "\n\nПолный текст по кнопке."
-	prefix, _ := telegramPrefix(text, 1024-len([]rune(tail)))
-	return strings.TrimRight(prefix, " \n") + tail
+	return captionWithTail(text, tail, 1024)
 }
 
 func profileValue(p Profile, key string) string {
@@ -84,4 +105,67 @@ func profileValue(p Profile, key string) string {
 		}
 	}
 	return raw
+}
+
+func meaningfulProfileValue(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "null", "нет", "none", "не указано":
+		return false
+	}
+	return true
+}
+
+func albumProfileCaption(text string, id int64) string {
+	footer := fmt.Sprintf("\n\nТекст: /text_%d\nИзбранное: /fav_%d · /next", id, id)
+	return captionWithTail(text, footer, 1024)
+}
+
+func textUnits(text string) int {
+	n := 0
+	for _, r := range text {
+		n++
+		if r > 0xffff {
+			n++
+		}
+	}
+	return n
+}
+
+func captionWithTail(text, tail string, limit int) string {
+	if _, rest := telegramPrefix(text+tail, limit); rest == "" {
+		return text + tail
+	}
+	body, footer := text, ""
+	if i := strings.LastIndex(text, "\n\n"); i >= 0 && strings.Contains(text[i:], "Jardulik:") {
+		body, footer = text[:i], text[i:]
+	}
+	budget := limit - textUnits(footer+tail) - 2
+	if budget < 0 {
+		prefix, _ := telegramPrefix(text, limit-textUnits(tail))
+		return prefix + tail
+	}
+	prefix, _ := telegramPrefix(body, budget)
+	return strings.TrimRight(prefix, " \n") + "…" + footer + tail
+}
+
+func missingProfileFields(p Profile) []string {
+	var missing []string
+	for _, f := range []struct{ key, label string }{{"surName", "фамилия"}, {"age", "возраст"}, {"height", "рост"}, {"country", "страна"}, {"city", "город"}, {"goal", "цель знакомства"}, {"worldview", "мировоззрение"}, {"children", "дети"}, {"profession", "занятие"}, {"languages", "языки"}, {"familyNames", "родственные фамилии"}, {"description", "о себе"}} {
+		value, present := p[f.key]
+		if !present {
+			continue
+		}
+		raw := strings.ToLower(strings.TrimSpace(valueString(value)))
+		empty := raw == "" || raw == "null" || raw == "[]" || raw == "dont_tell"
+		if (f.key == "age" || f.key == "height") && raw == "0" {
+			empty = true
+		}
+		if (f.key == "description" || f.key == "familyNames") && !meaningfulProfileValue(raw) {
+			empty = true
+		}
+		if empty {
+			missing = append(missing, f.label)
+		}
+	}
+	return missing
 }

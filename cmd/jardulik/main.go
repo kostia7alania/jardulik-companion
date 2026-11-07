@@ -119,6 +119,13 @@ func run() error {
 		}
 		fmt.Println("Profile post repair requested. Completion is recorded separately; original ZIP documents are retained.")
 		return nil
+	case "repair-zips":
+		return s.Archiver.RequestZIPRepair(ctx)
+	case "reconcile-albums":
+		if err = s.Archiver.ReconcileCaptionedAlbums(ctx); err != nil {
+			return err
+		}
+		return s.RefreshCardCaptions(ctx)
 	default:
 		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, restore, restore-media, repair-posts (service stopped), version")
 	}

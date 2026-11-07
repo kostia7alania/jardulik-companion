@@ -86,7 +86,7 @@ func (m *MediaManager) Ensure(ctx context.Context, j MediaJob) (resultErr error)
 	if err != nil {
 		return err
 	}
-	r.Header.Set("User-Agent", "JardulikCompanion/"+Version)
+	upstreamHeaders(r, m.Config.UserAgent, true)
 	defer func() {
 		if resultErr != nil && ctx.Err() == nil {
 			m.Store.MediaFailure(ctx, j.ID, "download_failed")

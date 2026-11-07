@@ -3,6 +3,8 @@ package companion
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,15 +28,16 @@ func (e *UpstreamError) Error() string {
 }
 
 type Client struct {
-	Store *Store
-	Base  string
-	HTTP  *http.Client
-	locks sync.Map
-	Now   func() time.Time
+	Store     *Store
+	Base      string
+	UserAgent string
+	HTTP      *http.Client
+	locks     sync.Map
+	Now       func() time.Time
 }
 
 func NewClient(s *Store, c Config) *Client {
-	return &Client{Store: s, Base: strings.TrimRight(c.APIBase, "/"), HTTP: &http.Client{Timeout: 25 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}, Now: time.Now}
+	return &Client{Store: s, Base: strings.TrimRight(c.APIBase, "/"), UserAgent: c.UserAgent, HTTP: &http.Client{Timeout: 25 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}, Now: time.Now}
 }
 func (c *Client) lock(owner int64) *sync.Mutex {
 	return c.Store.SessionMutex(owner)
@@ -53,8 +56,7 @@ func (c *Client) exchange(ctx context.Context, method, path, token string, paylo
 	if err != nil {
 		return nil, errors.New("invalid upstream request")
 	}
-	r.Header.Set("Accept", "application/json")
-	r.Header.Set("User-Agent", "JardulikCompanion/"+Version)
+	upstreamHeaders(r, c.UserAgent, false)
 	if payload != nil {
 		r.Header.Set("Content-Type", "application/json")
 	}
@@ -117,6 +119,11 @@ func (c *Client) Login(ctx context.Context, owner int64, raw string) error {
 	if err != nil {
 		return err
 	}
+	var generation [16]byte
+	if _, err = rand.Read(generation[:]); err != nil {
+		return err
+	}
+	session.Generation = hex.EncodeToString(generation[:])
 	if err = c.Store.SaveSession(ctx, owner, session); err != nil {
 		return err
 	}
@@ -161,7 +168,7 @@ func (c *Client) refreshLocked(ctx context.Context, owner int64, s Session) (Ses
 	return s, nil
 }
 
-func (c *Client) token(ctx context.Context, owner int64, after401 string) (Session, error) {
+func (c *Client) token(ctx context.Context, owner int64, after401 string, generation ...string) (Session, error) {
 	mu := c.lock(owner)
 	mu.Lock()
 	defer mu.Unlock()
@@ -171,6 +178,9 @@ func (c *Client) token(ctx context.Context, owner int64, after401 string) (Sessi
 	}
 	if s.State != "connected" {
 		return s, errors.New("сессия приостановлена; нужно повторное подключение /connect")
+	}
+	if after401 != "" && len(generation) > 0 && s.Generation != generation[0] {
+		return s, errors.New("сессия изменилась; старый запрос отменён")
 	}
 	if after401 != "" && s.Token != after401 {
 		return s, nil
@@ -182,21 +192,33 @@ func (c *Client) token(ctx context.Context, owner int64, after401 string) (Sessi
 }
 
 func (c *Client) Request(ctx context.Context, owner int64, method, path string, payload any) ([]byte, error) {
+	return c.requestSession(ctx, owner, method, path, payload, nil)
+}
+
+func (c *Client) requestSession(ctx context.Context, owner int64, method, path string, payload any, expected *Session) ([]byte, error) {
 	s, err := c.token(ctx, owner, "")
 	if err != nil {
 		return nil, err
 	}
+	if expected != nil && (s.Generation != expected.Generation || s.UserID != expected.UserID) {
+		return nil, errors.New("сессия изменилась; старый запрос отменён")
+	}
 	b, err := c.exchange(ctx, method, path, s.Token, payload)
 	var ue *UpstreamError
 	if errors.As(err, &ue) && ue.Status == 401 {
-		s, err = c.token(ctx, owner, s.Token)
+		s, err = c.token(ctx, owner, s.Token, s.Generation)
 		if err != nil {
 			return nil, err
 		}
 		b, err = c.exchange(ctx, method, path, s.Token, payload)
 	}
 	if errors.As(err, &ue) && (ue.Status == 403 || ue.Status == 429 || ue.Kind == "unexpected_response_or_challenge") {
-		c.Store.SessionState(ctx, owner, "paused", ue.Kind)
+		mu := c.lock(owner)
+		mu.Lock()
+		if current, e := c.Store.Session(ctx, owner); e == nil && current.Generation == s.Generation && current.Token == s.Token {
+			c.Store.SessionState(ctx, owner, "paused", ue.Kind)
+		}
+		mu.Unlock()
 	}
 	return b, err
 }
@@ -212,7 +234,7 @@ func (c *Client) Me(ctx context.Context, owner int64) (Profile, error) {
 	if err != nil {
 		return nil, errors.New("сначала /connect")
 	}
-	b, err := c.Request(ctx, owner, "GET", "/user/getMe?userId="+strconv.FormatInt(s.UserID, 10), nil)
+	b, err := c.requestSession(ctx, owner, "GET", "/user/getMe?userId="+strconv.FormatInt(s.UserID, 10), nil, &s)
 	if err != nil {
 		return nil, err
 	}
@@ -222,6 +244,13 @@ func (c *Client) Me(ctx context.Context, owner int64) (Profile, error) {
 	}
 	if p.ID() != s.UserID {
 		return nil, errors.New("Jardulik account identity changed")
+	}
+	mu := c.lock(owner)
+	mu.Lock()
+	defer mu.Unlock()
+	current, e := c.Store.Session(ctx, owner)
+	if e != nil || current.Generation != s.Generation || current.UserID != s.UserID {
+		return nil, errors.New("сессия изменилась; старый ответ отменён")
 	}
 	err = c.Store.SaveAccount(ctx, owner, p)
 	return p, err
@@ -243,7 +272,7 @@ func (c *Client) Users(ctx context.Context, owner int64, page int) ([]Profile, e
 	if n := number(account["maxAge"]); n >= 18 {
 		q.Set("ageMax", strconv.FormatInt(n, 10))
 	}
-	b, err := c.Request(ctx, owner, "GET", "/user/getUsers?"+q.Encode(), nil)
+	b, err := c.requestSession(ctx, owner, "GET", "/user/getUsers?"+q.Encode(), nil, &s)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +293,7 @@ func (c *Client) FullProfile(ctx context.Context, owner, id int64) (Profile, err
 		return nil, err
 	}
 	q := url.Values{"viewerUserId": {strconv.FormatInt(s.UserID, 10)}, "targetUserId": {strconv.FormatInt(id, 10)}}
-	b, err := c.Request(ctx, owner, "GET", "/user/getUser?"+q.Encode(), nil)
+	b, err := c.requestSession(ctx, owner, "GET", "/user/getUser?"+q.Encode(), nil, &s)
 	if err != nil {
 		return nil, err
 	}

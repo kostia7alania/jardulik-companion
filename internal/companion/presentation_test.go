@@ -35,6 +35,43 @@ func TestProfileLabelsTimeAndCaption(t *testing.T) {
 	}
 }
 
+func TestCompactProfileAndMissingFields(t *testing.T) {
+	p := StoredProfile{ID: 7, LastSeen: "2026-11-07 22:10:00", Profile: Profile{"name": "Ира", "surName": "Иванова", "age": 25, "height": 170, "country": "Russia", "city": "Vladikavkaz", "children": "none", "description": "", "languages": "[]", "profession": ""}}
+	text := profileText(p)
+	if !strings.HasPrefix(text, "Ира Иванова, 25/170\n📍 Россия, Владикавказ") || !strings.HasSuffix(text, "Jardulik: 7") {
+		t.Fatal(text)
+	}
+	if !strings.Contains(text, "Не указано: занятие, языки, о себе") || strings.Contains(text, "Не указано: дети") {
+		t.Fatal(text)
+	}
+	if !strings.Contains(text, "Детей нет") {
+		t.Fatal("explicit negative response lost")
+	}
+	p.Profile["description"] = strings.Repeat("🙂", 800)
+	caption := profileCaption(profileText(p))
+	if _, rest := telegramPrefix(caption, 1024); rest != "" || !strings.Contains(caption, "Jardulik: 7") || !strings.Contains(caption, "(вс, UTC+3)") || !strings.Contains(caption, "Не указано:") {
+		t.Fatal("long biography displaced required footer")
+	}
+	if got := forumTopicURL(-1004401653948, 5); got != "https://t.me/c/4401653948/5" {
+		t.Fatal(got)
+	}
+}
+
+func TestPrivateArchiveLinkOnlyForOwner(t *testing.T) {
+	s, p := cardFixture(t, 1)
+	s.Config.OwnerID = 1
+	s.Config.BackupChatID = -1004401653948
+	if _, err := s.Store.DB.Exec("INSERT INTO mirror_topics(profile_id,thread_id) VALUES(10,5)"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(s.cardText(context.Background(), 1, p), "https://t.me/c/4401653948/5") {
+		t.Fatal("owner missing topic link")
+	}
+	if strings.Contains(s.cardText(context.Background(), 2, p), "https://t.me/c/") {
+		t.Fatal("private group locator leaked to customer")
+	}
+}
+
 func cardFixture(t *testing.T, n int) (*Service, StoredProfile) {
 	t.Helper()
 	store, c := testStore(t)
@@ -116,7 +153,7 @@ func TestPhotoAndDescriptionOneCard(t *testing.T) {
 			}
 			want := []string{"sendPhoto"}
 			if n == 3 {
-				want = []string{"sendMediaGroup", "editMessageReplyMarkup"}
+				want = []string{"sendMediaGroup"}
 			}
 			if !reflect.DeepEqual(methods, want) {
 				t.Fatal(methods)
@@ -185,39 +222,38 @@ func TestArchiveCallbackOwnerAndChat(t *testing.T) {
 	}
 }
 
-func TestRepairKeepsOldPostsWhenAlbumButtonsFail(t *testing.T) {
-	s, p := cardFixture(t, 3)
-	ctx := context.Background()
-	if _, err := s.Store.DB.ExecContext(ctx, "INSERT INTO deliveries(owner_id,version_id,state,message_ids) VALUES(1,?,'sent','[10,11,12,13]')", p.VersionID); err != nil {
-		t.Fatal(err)
-	}
-	var calls []string
-	s.TG.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		method := filepath.Base(r.URL.Path)
-		calls = append(calls, method)
-		_, _ = io.Copy(io.Discard, r.Body)
-		if method == "sendMediaGroup" {
-			fmt.Fprint(w, `{"ok":true,"result":[{"message_id":30,"chat":{"id":1}},{"message_id":31,"chat":{"id":1}},{"message_id":32,"chat":{"id":1}}]}`)
-			return
+func TestAlbumKeepsFullTextAccessibleWithoutMarkup(t *testing.T) {
+	svc, p := cardFixture(t, 3)
+	p.Profile["description"] = strings.Repeat("Длинное описание ", 180) + "FULL-END"
+	calls := 0
+	svc.TG.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if filepath.Base(r.URL.Path) != "sendMediaGroup" {
+			t.Fatal("unsupported album markup or separate post")
 		}
-		if method != "editMessageReplyMarkup" {
-			t.Fatalf("old posts deleted without buttons: %s", method)
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatal(err)
 		}
-		fmt.Fprint(w, `{"ok":false,"error_code":429,"description":"Too Many Requests"}`)
+		defer r.MultipartForm.RemoveAll()
+		var media []map[string]string
+		if err := json.Unmarshal([]byte(r.FormValue("media")), &media); err != nil {
+			t.Fatal(err)
+		}
+		caption := media[0]["caption"]
+		if !strings.Contains(caption, "/text_10") || !strings.Contains(caption, "/fav_10") {
+			t.Fatal("full text inaccessible")
+		}
+		if _, rest := telegramPrefix(caption, 1024); rest != "" {
+			t.Fatal("caption too long")
+		}
+		fmt.Fprint(w, `{"ok":true,"result":[{"message_id":30,"chat":{"id":1}},{"message_id":31,"chat":{"id":1}},{"message_id":32,"chat":{"id":1}}]}`)
 	})}
-	if err := s.RepairPrivateCards(ctx); err == nil {
-		t.Fatal("unconfirmed controls treated as complete")
+	ids, err := svc.sendProfileCard(context.Background(), 1, p)
+	if err != nil || len(ids) != 3 || calls != 1 {
+		t.Fatalf("%v %v %d", ids, err, calls)
 	}
-	var record privateCardRepair
-	if err := json.Unmarshal([]byte(s.Store.Meta(ctx, "repaired_card:1")), &record); err != nil {
-		t.Fatal(err)
-	}
-	if record.State != "uncertain" || !reflect.DeepEqual(record.OldIDs, []int64{10, 11, 12, 13}) || !reflect.DeepEqual(record.NewIDs, []int64{30, 31, 32}) {
-		t.Fatalf("repair provenance lost: %+v", record)
-	}
-	before := len(calls)
-	if err := s.RepairPrivateCards(ctx); err == nil || len(calls) != before {
-		t.Fatal("unresolved repair replayed or hidden")
+	if !strings.Contains(profileText(p), "FULL-END") {
+		t.Fatal("full original description lost")
 	}
 }
 

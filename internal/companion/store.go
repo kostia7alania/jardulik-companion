@@ -36,12 +36,13 @@ func (s *Store) SessionMutex(owner int64) *sync.Mutex {
 }
 
 type Session struct {
-	Token   string          `json:"token"`
-	Refresh string          `json:"refreshToken"`
-	UserID  int64           `json:"userId"`
-	Expires int64           `json:"expires"`
-	State   string          `json:"-"`
-	Account json.RawMessage `json:"-"`
+	Token      string          `json:"token"`
+	Refresh    string          `json:"refreshToken"`
+	UserID     int64           `json:"userId"`
+	Expires    int64           `json:"expires"`
+	Generation string          `json:"generation,omitempty"`
+	State      string          `json:"-"`
+	Account    json.RawMessage `json:"-"`
 }
 type Profile map[string]any
 type StoredProfile struct {

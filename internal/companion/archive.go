@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -56,6 +57,13 @@ CREATE TABLE IF NOT EXISTS archive_versions (
  version_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, profile_id INTEGER NOT NULL,
  fingerprint TEXT NOT NULL, state TEXT NOT NULL, thread_id INTEGER NOT NULL DEFAULT 0,
  message_ids TEXT NOT NULL DEFAULT '[]', source_sha TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS archive_zip_repairs (
+ version_id INTEGER PRIMARY KEY, state TEXT NOT NULL, old_source_sha TEXT NOT NULL,
+ old_filename TEXT NOT NULL, old_path TEXT NOT NULL DEFAULT '', old_message_id INTEGER NOT NULL,
+ new_source_sha TEXT NOT NULL DEFAULT '', new_filename TEXT NOT NULL DEFAULT '', new_path TEXT NOT NULL DEFAULT '',
+ new_message_id INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS archive_profile_repairs (
@@ -149,6 +157,7 @@ func (a *Archiver) Run(ctx context.Context) {
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='uncertain',error='worker_restarted_during_request' WHERE state='processing'")
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_backups SET state='uncertain',error='worker_restarted_during_request' WHERE state='processing'")
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE meta SET value='uncertain' WHERE key='archive_repair_requested' AND value='processing'")
+	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE meta SET value='uncertain' WHERE key='archive_zip_repair_requested' AND value='processing'")
 	for ctx.Err() == nil {
 		a.mu.Lock()
 		err = a.processOne(ctx)
@@ -236,6 +245,9 @@ func (a *Archiver) processOne(ctx context.Context) error {
 	if handled, err := a.processQueuedRepair(ctx); handled || err != nil {
 		return err
 	}
+	if handled, err := a.processQueuedZIPRepair(ctx); handled || err != nil {
+		return err
+	}
 	if a.Config.BackupChatID == 0 || a.Config.BackupThreadID <= 0 {
 		return nil
 	}
@@ -309,10 +321,47 @@ func mirrorFingerprint(p Profile, jobs []MediaJob) (string, error) {
 	return digest(b), nil
 }
 
+func (a *Archiver) topicName(ctx context.Context, p StoredProfile) (string, error) {
+	latest, err := scanProfile(a.Store.DB.QueryRowContext(ctx, "SELECT id,profile_id,raw_json,first_seen,last_seen FROM versions WHERE profile_id=? ORDER BY last_seen DESC,id DESC LIMIT 1", p.ID))
+	if err != nil {
+		return "", err
+	}
+	return truncateRunes("💁‍♀️"+profileHeading(latest.Profile), 128), nil
+}
+
+func (a *Archiver) ensureTopicTitle(ctx context.Context, p StoredProfile, thread int64) error {
+	if thread <= 0 || thread == a.Config.BackupThreadID {
+		return errors.New("profile topic id is invalid")
+	}
+	name, err := a.topicName(ctx, p)
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("topic_title:%d", p.ID)
+	var saved string
+	err = a.Store.DB.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", key).Scan(&saved)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if saved == name {
+		return nil
+	}
+	var confirmed bool
+	if err = a.groupCall(ctx, func() error {
+		return a.TG.Call(ctx, "editForumTopic", map[string]any{"chat_id": a.Config.BackupChatID, "message_thread_id": thread, "name": name}, &confirmed)
+	}); err != nil {
+		return err
+	}
+	if !confirmed {
+		return errors.New("profile topic title edit is unconfirmed")
+	}
+	return a.Store.SetMeta(ctx, key, name)
+}
+
 func (a *Archiver) topic(ctx context.Context, p StoredProfile) (int64, error) {
 	var thread int64
 	if err := a.Store.DB.QueryRowContext(ctx, "SELECT thread_id FROM mirror_topics WHERE profile_id=?", p.ID).Scan(&thread); err == nil {
-		return thread, nil
+		return thread, a.ensureTopicTitle(ctx, p, thread)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
@@ -324,14 +373,13 @@ func (a *Archiver) topic(ctx context.Context, p StoredProfile) (int64, error) {
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
+	name, err := a.topicName(ctx, p)
+	if err != nil {
+		return 0, err
+	}
 	if _, err = a.Store.DB.ExecContext(ctx, "INSERT INTO archive_topic_jobs(profile_id,state) VALUES(?,'processing') ON CONFLICT(profile_id) DO UPDATE SET state='processing',updated_at=CURRENT_TIMESTAMP", p.ID); err != nil {
 		return 0, err
 	}
-	name := fmt.Sprintf("Jardulik %d: %s", p.ID, p.Profile.String("name"))
-	if age := p.Profile.String("age"); age != "" {
-		name += ", " + age
-	}
-	name = truncateRunes(name, 128)
 	var result struct {
 		Thread int64 `json:"message_thread_id"`
 	}
@@ -355,6 +403,9 @@ func (a *Archiver) topic(ctx context.Context, p StoredProfile) (int64, error) {
 		return 0, err
 	}
 	if _, err = tx.ExecContext(ctx, "UPDATE archive_topic_jobs SET state='sent',error='' WHERE profile_id=?", p.ID); err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", fmt.Sprintf("topic_title:%d", p.ID), name); err != nil {
 		return 0, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -388,12 +439,12 @@ type archiveFile struct {
 type archiveManifest struct {
 	Format        string               `json:"format"`
 	CapturedAt    string               `json:"captured_at"`
-	CaptureDevice string               `json:"capture_device_ref"`
-	OS            string               `json:"os"`
-	OSRelease     string               `json:"os_release"`
-	Kernel        string               `json:"kernel_release"`
-	Hardware      string               `json:"hardware_model"`
-	Architecture  string               `json:"architecture"`
+	CaptureDevice string               `json:"capture_device_ref,omitempty"`
+	OS            string               `json:"os,omitempty"`
+	OSRelease     string               `json:"os_release,omitempty"`
+	Kernel        string               `json:"kernel_release,omitempty"`
+	Hardware      string               `json:"hardware_model,omitempty"`
+	Architecture  string               `json:"architecture,omitempty"`
 	AppVersion    string               `json:"app_version"`
 	ProfileID     int64                `json:"profile_id,omitempty"`
 	VersionID     int64                `json:"version_id,omitempty"`
@@ -435,9 +486,19 @@ type archiveReceipt struct {
 }
 
 func baseManifest() archiveManifest {
-	host, _ := os.Hostname()
-	if host == "" {
-		host = "unknown"
+	return archiveManifest{Format: "jardulik-companion-archive/v1", CapturedAt: nowStamp(), AppVersion: Version, Coverage: map[string]any{"telegram_server_bytes_verified": false}}
+}
+
+// These are capture-server properties, never the observer's or profile's phone.
+func (a *Archiver) profileManifest(owner int64) archiveManifest {
+	manifest := baseManifest()
+	if owner == a.Config.OwnerID {
+		return manifest
+	}
+	manifest.ObserverID = owner
+	manifest.CaptureDevice, _ = os.Hostname()
+	if manifest.CaptureDevice == "" {
+		manifest.CaptureDevice = "unknown"
 	}
 	readMetadata := func(path string) string {
 		b, err := os.ReadFile(path)
@@ -446,7 +507,12 @@ func baseManifest() archiveManifest {
 		}
 		return truncateRunes(strings.TrimSpace(string(b)), 2048)
 	}
-	return archiveManifest{Format: "jardulik-companion-archive/v1", CapturedAt: nowStamp(), CaptureDevice: host, OS: runtime.GOOS, OSRelease: readMetadata("/etc/os-release"), Kernel: readMetadata("/proc/sys/kernel/osrelease"), Hardware: readMetadata("/sys/devices/virtual/dmi/id/product_name"), Architecture: runtime.GOARCH, AppVersion: Version, Coverage: map[string]any{"telegram_server_bytes_verified": false}}
+	manifest.OS = runtime.GOOS
+	manifest.OSRelease = readMetadata("/etc/os-release")
+	manifest.Kernel = readMetadata("/proc/sys/kernel/osrelease")
+	manifest.Hardware = readMetadata("/sys/devices/virtual/dmi/id/product_name")
+	manifest.Architecture = runtime.GOARCH
+	return manifest
 }
 
 func sourceFilename(raw string) string {
@@ -510,17 +576,16 @@ func addZipFile(z *zip.Writer, name, path string) (archiveFile, error) {
 }
 
 func (a *Archiver) profileZIP(ctx context.Context, p StoredProfile, owner int64, jobs []MediaJob) (string, string, archiveManifest, error) {
-	manifest := baseManifest()
+	manifest := a.profileManifest(owner)
 	manifest.ProfileID = p.ID
 	manifest.VersionID = p.VersionID
-	manifest.ObserverID = owner
 	manifest.FirstSeen = p.FirstSeen
 	manifest.LastSeen = p.LastSeen
 	dir := filepath.Join(a.Config.DataDir, "archive-staging")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", "", manifest, err
 	}
-	f, err := os.CreateTemp(dir, fmt.Sprintf("jardulik-%d-v%d-*.zip", p.ID, p.VersionID))
+	f, err := os.CreateTemp(dir, fmt.Sprintf("%s__jardulik-%d-v%d-*.zip", a.now().In(time.FixedZone("UTC+3", 10800)).Format("20060102T150405-0700"), p.ID, p.VersionID))
 	if err != nil {
 		return "", "", manifest, err
 	}
@@ -575,7 +640,7 @@ func (a *Archiver) profileZIP(ctx context.Context, p StoredProfile, owner int64,
 		if e != nil {
 			return "", "", manifest, e
 		}
-		entry, err = addZipFile(z, "media/"+j.SHA, mediaPath)
+		entry, err = addZipFile(z, archiveMediaName(j.SHA, j.MIME), mediaPath)
 		if err != nil {
 			return "", "", manifest, err
 		}
@@ -638,11 +703,26 @@ func (a *Archiver) receipt(ctx context.Context, sourceSHA, kind, path, encrypted
 }
 
 func moderationText(p StoredProfile, _ string, missing int) string {
-	text := profileText(p) + fmt.Sprintf("\nВерсия архива: %d", p.VersionID)
+	text := profileText(p)
 	if missing > 0 {
 		text += fmt.Sprintf("\nНедоступных исходных фото: %d. Подробности в ZIP.", missing)
 	}
 	return text
+}
+
+func (a *Archiver) profileCardText(p StoredProfile, missing int, thread int64, limit int, noPhotos bool) string {
+	text := moderationText(p, "", missing)
+	if noPhotos {
+		text += "\nФото пока недоступны."
+	}
+	tail := ""
+	if link := forumTopicURL(a.Config.BackupChatID, thread); link != "" {
+		tail = "\n\n📍 " + link
+	}
+	if textUnits(text+tail) > limit {
+		tail = "\n\nПолный текст по кнопке." + tail
+	}
+	return captionWithTail(text, tail, limit)
 }
 
 func archiveProfileKeyboard(version int64) any {
@@ -687,9 +767,8 @@ func (a *Archiver) sendProfileCard(ctx context.Context, p StoredProfile, jobs []
 		}
 	}
 	sort.SliceStable(selected, func(i, j int) bool { return selected[i].Position < selected[j].Position })
-	text := moderationText(p, "", missing)
-	caption := profileCaption(text)
-	keyboard := archiveProfileKeyboard(p.VersionID)
+	caption := a.profileCardText(p, missing, thread, 1024, false)
+	var keyboard any // Archive controls belong to the first, whole-ZIP message.
 	var ids []int64
 	record := func(messages []SentMessage) error {
 		for _, m := range messages {
@@ -701,11 +780,7 @@ func (a *Archiver) sendProfileCard(ctx context.Context, p StoredProfile, jobs []
 		return save(ids)
 	}
 	if len(selected) == 0 {
-		body := text + "\nФото пока недоступны."
-		if prefix, rest := telegramPrefix(body, 4096); rest != "" {
-			const tail = "\n\nПолный текст по кнопке."
-			body = truncateRunes(prefix, 4096-len([]rune(tail))) + tail
-		}
+		body := a.profileCardText(p, missing, thread, 4096, true)
 		var m SentMessage
 		err := a.groupCall(ctx, func() (err error) {
 			m, err = a.TG.SendText(ctx, a.Config.BackupChatID, thread, body, keyboard)
@@ -748,18 +823,7 @@ func (a *Archiver) sendProfileCard(ctx context.Context, p StoredProfile, jobs []
 				if err = record(album); err != nil {
 					return ids, err
 				}
-				if first {
-					var accepted SentMessage
-					err = a.groupCall(ctx, func() error {
-						return a.TG.Call(ctx, "editMessageReplyMarkup", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": ids[0], "reply_markup": keyboard}, &accepted)
-					})
-					if err != nil {
-						return ids, err
-					}
-					if accepted.ID != ids[0] {
-						return ids, errors.New("profile keyboard edit unconfirmed")
-					}
-				}
+
 				first = false
 				i = end
 				continue
@@ -839,12 +903,15 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 	if err != nil {
 		var state string
 		_ = a.Store.DB.QueryRowContext(ctx, "SELECT state FROM archive_topic_jobs WHERE profile_id=?", p.ID).Scan(&state)
+		if thread > 0 {
+			state = archiveFailureState(err)
+		}
 		if state == "uncertain" || state == "error" {
 			_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state=?,error='topic_unavailable' WHERE version_id=?", state, version)
 		}
 		return err
 	}
-	path, sha, manifest, err := a.profileZIP(ctx, p, owner, jobs)
+	path, sha, _, err := a.profileZIP(ctx, p, owner, jobs)
 	if err != nil {
 		return err
 	}
@@ -862,7 +929,7 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 	var document SentMessage
 	err = a.groupCall(ctx, func() error {
 		var e error
-		document, e = a.TG.SendDocument(ctx, a.Config.BackupChatID, thread, path, fmt.Sprintf("Jardulik %d, версия %d. Целый исходный архив.\nSHA-256 %s\nУстройство: %s\nИсточник: Jardulik API; снимок %s", p.ID, p.VersionID, sha, manifest.CaptureDevice, displayTime(p.LastSeen)))
+		document, e = a.TG.SendDocumentCard(ctx, a.Config.BackupChatID, thread, path, fmt.Sprintf("Анкета #%d\nСохранено: %s\nЦелый исходный архив. SHA-256 %s\nИсточник: Jardulik API", p.ID, displayTime(p.LastSeen), sha), archiveProfileKeyboard(p.VersionID))
 		return e
 	})
 	if err == nil {
@@ -911,6 +978,9 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, "INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids) VALUES(?,'sent','[]',?)", version, string(idsJSON)); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO archive_zip_repairs(version_id,state,old_source_sha,old_filename,old_message_id,new_source_sha,new_filename,new_message_id) VALUES(?,'skipped',?,?,?,?,?,?)", version, sha, filepath.Base(path), document.ID, sha, filepath.Base(path), document.ID); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1111,9 +1181,9 @@ func (a *Archiver) repairProfilePost(ctx context.Context, version int64) (retErr
 		}
 	}()
 	var edited SentMessage
-	caption := fmt.Sprintf("Jardulik %d, версия %d. Целый исходный архив.\nSHA-256 %s\nИсточник: Jardulik API; снимок %s\nTelegram: ZIP сохранён %s", p.ID, p.VersionID, sourceSHA, displayTime(p.LastSeen), displayTime(sentAt))
+	caption := fmt.Sprintf("Анкета #%d\nСохранено: %s\nЦелый исходный архив. SHA-256 %s\nИсточник: Jardulik API\nTelegram: ZIP сохранён %s", p.ID, displayTime(p.LastSeen), sourceSHA, displayTime(sentAt))
 	err = a.groupCall(ctx, func() error {
-		return a.TG.Call(ctx, "editMessageCaption", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": receiptMessage, "caption": caption}, &edited)
+		return a.TG.Call(ctx, "editMessageCaption", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": receiptMessage, "caption": caption, "reply_markup": archiveProfileKeyboard(version)}, &edited)
 	})
 	if err != nil {
 		return err
@@ -1166,6 +1236,677 @@ func (a *Archiver) repairProfilePost(ctx context.Context, version int64) (retErr
 		return err
 	}
 	return tx.Commit()
+}
+
+// ReconcileCaptionedAlbums repairs only fully recorded albums from the former
+// album-markup failure. It never uploads or guesses IDs for an unknown send.
+func (a *Archiver) ReconcileCaptionedAlbums(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	lock, err := os.OpenFile(filepath.Join(a.Config.DataDir, "archive-worker.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return errors.New("archive worker is active; stop the service before reconciling albums")
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	if err = a.init(ctx); err != nil {
+		return err
+	}
+	rows, err := a.Store.DB.QueryContext(ctx, `SELECT av.version_id FROM archive_versions av LEFT JOIN archive_profile_repairs repair ON repair.version_id=av.version_id
+ WHERE (av.state='uncertain' AND av.error='source_zip_sent_card_unconfirmed' AND av.message_ids<>'[]')
+ OR (repair.state='uncertain' AND repair.error='telegram_400' AND repair.new_message_ids<>'[]') ORDER BY av.version_id`)
+	if err != nil {
+		return err
+	}
+	var versions []int64
+	for rows.Next() {
+		var version int64
+		if err = rows.Scan(&version); err != nil {
+			rows.Close()
+			return err
+		}
+		versions = append(versions, version)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, version := range versions {
+		if err = a.reconcileCaptionedAlbum(ctx, version); err != nil {
+			return fmt.Errorf("album version %d: %w", version, err)
+		}
+	}
+	var unresolved int
+	if err = a.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM archive_versions av LEFT JOIN archive_profile_repairs repair ON repair.version_id=av.version_id
+ WHERE av.error IN ('reconciling_known_album','known_album_reconciliation_unconfirmed') OR repair.state='reconciling' OR repair.error='known_album_reconciliation_unconfirmed'`).Scan(&unresolved); err != nil {
+		return err
+	}
+	if unresolved > 0 {
+		return fmt.Errorf("%d known album reconciliations require operator reconciliation; no network operations were replayed", unresolved)
+	}
+	return nil
+}
+
+func (a *Archiver) editKnownCaption(ctx context.Context, id int64, caption string, keyboard any) error {
+	if id <= 0 {
+		return errors.New("known message id is missing")
+	}
+	payload := map[string]any{"chat_id": a.Config.BackupChatID, "message_id": id, "caption": caption}
+	if keyboard != nil {
+		payload["reply_markup"] = keyboard
+	}
+	var edited SentMessage
+	err := a.groupCall(ctx, func() error { return a.TG.Call(ctx, "editMessageCaption", payload, &edited) })
+	var rejected *TelegramError
+	if errors.As(err, &rejected) && rejected.Code == 400 && strings.Contains(strings.ToLower(rejected.Description), "message is not modified") {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if edited.ID != id {
+		return errors.New("known message caption edit is unconfirmed")
+	}
+	return nil
+}
+
+func (a *Archiver) reconcileCaptionedAlbum(ctx context.Context, version int64) (retErr error) {
+	var owner, thread, zipID, receiptChat, receiptThread int64
+	var idsJSON, oldJSON, repairState, sourceSHA, fingerprint string
+	err := a.Store.DB.QueryRowContext(ctx, `SELECT av.owner_id,av.thread_id,av.source_sha,av.fingerprint,
+ CASE WHEN repair.state='uncertain' THEN repair.new_message_ids ELSE av.message_ids END,
+ COALESCE(repair.old_message_ids,'[]'),COALESCE(repair.state,''),r.chat_id,r.thread_id,r.message_id
+ FROM archive_versions av JOIN archive_receipts r ON r.source_sha=av.source_sha LEFT JOIN archive_profile_repairs repair ON repair.version_id=av.version_id WHERE av.version_id=?`, version).Scan(&owner, &thread, &sourceSHA, &fingerprint, &idsJSON, &oldJSON, &repairState, &receiptChat, &receiptThread, &zipID)
+	if err != nil {
+		return err
+	}
+	if receiptChat != a.Config.BackupChatID || receiptThread != thread || thread <= 0 || thread == a.Config.BackupThreadID || zipID <= 0 {
+		return errors.New("album ZIP receipt does not identify its profile topic")
+	}
+	p, err := a.Store.Version(ctx, owner, version)
+	if err != nil {
+		return err
+	}
+	jobs, err := a.Store.MediaJobs(ctx, owner, version)
+	if err != nil {
+		return err
+	}
+	hasFull := false
+	missing := 0
+	for _, j := range jobs {
+		if j.State == "complete" && j.SHA != "" && j.Role == "photos" {
+			hasFull = true
+		}
+		if j.State != "complete" || j.SHA == "" {
+			missing++
+		}
+	}
+	expected := 0
+	for _, j := range jobs {
+		if j.State == "complete" && j.SHA != "" && ((hasFull && j.Role == "photos") || (!hasFull && j.Role == "miniPhotos")) {
+			expected++
+		}
+	}
+	if expected < 2 {
+		return errors.New("record is not a complete multi-photo album")
+	}
+	var ids, oldIDs []int64
+	if json.Unmarshal([]byte(idsJSON), &ids) != nil || len(ids) != expected || json.Unmarshal([]byte(oldJSON), &oldIDs) != nil {
+		return errors.New("known album inventory is incomplete")
+	}
+	seen := map[int64]bool{zipID: true}
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			return errors.New("known album inventory is invalid")
+		}
+		seen[id] = true
+	}
+	var deleteIDs []int64
+	for _, id := range oldIDs {
+		if id <= 0 || (id != zipID && seen[id]) {
+			return errors.New("legacy cleanup inventory conflicts with confirmed album")
+		}
+		if id != zipID {
+			seen[id] = true
+			deleteIDs = append(deleteIDs, id)
+		}
+	}
+	if repairState == "uncertain" && len(oldIDs) == 0 {
+		return errors.New("legacy cleanup inventory is missing")
+	}
+	if _, err = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='processing',error='reconciling_known_album' WHERE version_id=?", version); err != nil {
+		return err
+	}
+	if repairState == "uncertain" {
+		if _, err = a.Store.DB.ExecContext(ctx, "UPDATE archive_profile_repairs SET state='reconciling',error='known_album_reconciliation' WHERE version_id=?", version); err != nil {
+			return err
+		}
+	}
+	defer func() {
+		if retErr != nil {
+			_, _ = a.Store.DB.ExecContext(context.WithoutCancel(ctx), "UPDATE archive_versions SET state='uncertain',error='known_album_reconciliation_unconfirmed' WHERE version_id=?", version)
+			if repairState == "uncertain" {
+				_, _ = a.Store.DB.ExecContext(context.WithoutCancel(ctx), "UPDATE archive_profile_repairs SET state='uncertain',error='known_album_reconciliation_unconfirmed' WHERE version_id=?", version)
+			}
+		}
+	}()
+	zipCaption := fmt.Sprintf("Анкета #%d\nСохранено: %s\nЦелый исходный архив. SHA-256 %s\nИсточник: Jardulik API", p.ID, displayTime(p.LastSeen), sourceSHA)
+	if err = a.editKnownCaption(ctx, zipID, zipCaption, archiveProfileKeyboard(version)); err != nil {
+		return err
+	}
+	if err = a.editKnownCaption(ctx, ids[0], a.profileCardText(p, missing, thread, 1024, false), nil); err != nil {
+		return err
+	}
+	for _, id := range deleteIDs {
+		var deleted bool
+		err = a.groupCall(ctx, func() error {
+			return a.TG.Call(ctx, "deleteMessage", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": id}, &deleted)
+		})
+		var rejected *TelegramError
+		if errors.As(err, &rejected) && rejected.Code == 400 && strings.Contains(strings.ToLower(rejected.Description), "message to delete not found") {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if !deleted {
+			return errors.New("known legacy message deletion unconfirmed")
+		}
+	}
+	state := "sent"
+	if missing > 0 {
+		state = "partial"
+	}
+	tx, err := a.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE archive_versions SET state=?,error='',message_ids=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=?", state, idsJSON, version); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO mirror_posts(fingerprint,profile_id,thread_id,message_ids) VALUES(?,?,?,?) ON CONFLICT(fingerprint) DO UPDATE SET message_ids=excluded.message_ids", fingerprint, p.ID, thread, idsJSON); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids) VALUES(?,'sent',?,?) ON CONFLICT(version_id) DO UPDATE SET state='sent',new_message_ids=excluded.new_message_ids,error='',updated_at=CURRENT_TIMESTAMP", version, oldJSON, idsJSON); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (a *Archiver) RequestZIPRepair(ctx context.Context) error {
+	if err := a.init(ctx); err != nil {
+		return err
+	}
+	var unresolved int
+	if err := a.Store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM archive_zip_repairs WHERE state NOT IN ('sent','skipped')").Scan(&unresolved); err != nil {
+		return err
+	}
+	if unresolved > 0 {
+		return errors.New("ZIP repairs require operator reconciliation before another request")
+	}
+	result, err := a.Store.DB.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES('archive_zip_repair_requested','pending') ON CONFLICT(key) DO UPDATE SET value='pending' WHERE value='done'")
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	var state string
+	if err = a.Store.DB.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='archive_zip_repair_requested'").Scan(&state); err != nil {
+		return err
+	}
+	if state == "pending" {
+		return nil
+	}
+	return fmt.Errorf("ZIP repair request is %s; reconcile it before requesting another pass", state)
+}
+
+func (a *Archiver) processQueuedZIPRepair(ctx context.Context) (bool, error) {
+	// Presentation repair owns the topic until its complete maintenance pass ends.
+	if state := a.Store.Meta(ctx, "archive_repair_requested"); state != "" && state != "done" {
+		return false, nil
+	}
+	result, err := a.Store.DB.ExecContext(ctx, "UPDATE meta SET value='processing' WHERE key='archive_zip_repair_requested' AND value='pending'")
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil || count == 0 {
+		return false, err
+	}
+	err = a.repairZIPsLocked(ctx)
+	state := "done"
+	finishCtx := context.WithoutCancel(ctx)
+	if err != nil {
+		state = "error"
+		var unknown int
+		if scanErr := a.Store.DB.QueryRowContext(finishCtx, "SELECT COUNT(*) FROM archive_zip_repairs WHERE state='uncertain'").Scan(&unknown); scanErr != nil || unknown > 0 || ctx.Err() != nil {
+			state = "uncertain"
+		}
+	} else if ctx.Err() != nil {
+		state = "uncertain"
+		err = ctx.Err()
+	}
+	if saveErr := a.Store.SetMeta(finishCtx, "archive_zip_repair_requested", state); saveErr != nil {
+		return true, errors.Join(err, saveErr)
+	}
+	return true, err
+}
+
+// The existing archive worker owns the mutex and file lock for this whole pass.
+func (a *Archiver) repairZIPsLocked(ctx context.Context) error {
+	if _, err := a.Store.DB.ExecContext(ctx, "UPDATE archive_zip_repairs SET state='uncertain',error='worker_restarted_during_request' WHERE state IN ('inspecting','editing')"); err != nil {
+		return err
+	}
+	rows, err := a.Store.DB.QueryContext(ctx, `SELECT av.version_id FROM archive_versions av JOIN archive_receipts r ON r.source_sha=av.source_sha
+ LEFT JOIN archive_zip_repairs repair ON repair.version_id=av.version_id WHERE av.state IN ('sent','partial','uncertain') AND r.kind='profile_version' AND repair.version_id IS NULL ORDER BY av.version_id`)
+	if err != nil {
+		return err
+	}
+	var versions []int64
+	for rows.Next() {
+		var version int64
+		if err = rows.Scan(&version); err != nil {
+			rows.Close()
+			return err
+		}
+		versions = append(versions, version)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, version := range versions {
+		if err = a.repairZIP(ctx, version); err != nil {
+			return fmt.Errorf("profile ZIP %d: %w", version, err)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+	var unresolved int
+	if err = a.Store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM archive_zip_repairs WHERE state NOT IN ('sent','skipped')").Scan(&unresolved); err != nil {
+		return err
+	}
+	if unresolved > 0 {
+		return fmt.Errorf("%d ZIP repairs require operator reconciliation", unresolved)
+	}
+	return nil
+}
+
+func (a *Archiver) retainOriginalZIP(ctx context.Context, r archiveReceipt) (string, error) {
+	if _, err := a.mediaSourcePath(r.SourceSHA); err != nil {
+		return "", err
+	}
+	if r.Size <= 0 || r.Size > 49<<20 {
+		return "", errors.New("original ZIP exceeds bounded repair download")
+	}
+	dir := filepath.Join(a.Config.DataDir, "archive-originals")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, r.SourceSHA+".zip")
+	validate := func(candidate string) error {
+		info, err := os.Lstat(candidate)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() || info.Size() != r.Size {
+			return errors.New("original ZIP file metadata mismatch")
+		}
+		sha, size, err := fileDigest(candidate)
+		if err != nil {
+			return err
+		}
+		if sha != r.SourceSHA || size != r.Size {
+			return errors.New("original ZIP hash/size mismatch")
+		}
+		return nil
+	}
+	if err := validate(path); err == nil {
+		return path, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	// Prefer an already retained local original; otherwise recover the exact file ID.
+	if filepath.Base(r.Name) == r.Name {
+		candidate := filepath.Join(a.Config.DataDir, "archive-staging", r.Name)
+		if err := validate(candidate); err == nil {
+			data, err := os.ReadFile(candidate)
+			if err != nil {
+				return "", err
+			}
+			if err = os.WriteFile(path, data, 0600); err != nil {
+				return "", err
+			}
+			return path, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	temp, err := os.CreateTemp(dir, ".download-*.zip")
+	if err != nil {
+		return "", err
+	}
+	temporary := temp.Name()
+	temp.Close()
+	os.Remove(temporary)
+	defer os.Remove(temporary)
+	if err = a.TG.Download(ctx, r.FileID, temporary); err != nil {
+		return "", err
+	}
+	if err = validate(temporary); err != nil {
+		return "", err
+	}
+	if err = os.Rename(temporary, path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (a *Archiver) refreshConfirmedProfileCaption(ctx context.Context, version, owner, thread int64) error {
+	var inventory string
+	err := a.Store.DB.QueryRowContext(ctx, `SELECT av.message_ids FROM archive_versions av JOIN archive_profile_repairs layout ON layout.version_id=av.version_id WHERE av.version_id=? AND layout.state='sent'`, version).Scan(&inventory)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	if json.Unmarshal([]byte(inventory), &ids) != nil || len(ids) == 0 {
+		return errors.New("confirmed profile card inventory is missing")
+	}
+	seen := map[int64]bool{}
+	for _, id := range ids {
+		if id <= 0 || seen[id] {
+			return errors.New("confirmed profile card inventory is invalid")
+		}
+		seen[id] = true
+	}
+	p, err := a.Store.Version(ctx, owner, version)
+	if err != nil {
+		return err
+	}
+	jobs, err := a.Store.MediaJobs(ctx, owner, version)
+	if err != nil {
+		return err
+	}
+	hasFull := false
+	missing := 0
+	for _, j := range jobs {
+		if j.State == "complete" && j.SHA != "" && j.Role == "photos" {
+			hasFull = true
+		}
+		if j.State != "complete" || j.SHA == "" {
+			missing++
+		}
+	}
+	expected := 0
+	for _, j := range jobs {
+		if j.State == "complete" && j.SHA != "" && ((hasFull && j.Role == "photos") || (!hasFull && j.Role == "miniPhotos")) {
+			expected++
+		}
+	}
+	if expected == 0 {
+		return nil
+	}
+	if expected != len(ids) {
+		return errors.New("confirmed profile photo inventory is incomplete")
+	}
+	return a.editKnownCaption(ctx, ids[0], a.profileCardText(p, missing, thread, 1024, false), nil)
+}
+
+func (a *Archiver) repairZIP(ctx context.Context, version int64) (retErr error) {
+	var owner, thread, profile int64
+	var r archiveReceipt
+	err := a.Store.DB.QueryRowContext(ctx, `SELECT av.owner_id,av.profile_id,av.thread_id,r.source_sha,r.kind,r.filename,r.byte_size,r.encrypted_sha,r.chat_id,r.thread_id,r.message_id,r.file_id,r.file_unique_id,r.returned_file_size,r.sent_at
+ FROM archive_versions av JOIN archive_receipts r ON r.source_sha=av.source_sha WHERE av.version_id=?`, version).Scan(&owner, &profile, &thread, &r.SourceSHA, &r.Kind, &r.Name, &r.Size, &r.EncryptedSHA, &r.ChatID, &r.ThreadID, &r.MessageID, &r.FileID, &r.FileUniqueID, &r.ReturnedSize, &r.SentAt)
+	if err != nil {
+		return err
+	}
+	if r.ChatID != a.Config.BackupChatID || r.ThreadID != thread || thread <= 0 || thread == a.Config.BackupThreadID || r.MessageID <= 0 || r.FileID == "" {
+		return errors.New("ZIP receipt does not identify its profile topic")
+	}
+	if err = a.ensureTopicTitle(ctx, StoredProfile{ID: profile}, thread); err != nil {
+		return err
+	}
+	if _, err = a.Store.DB.ExecContext(ctx, "INSERT INTO archive_zip_repairs(version_id,state,old_source_sha,old_filename,old_message_id) VALUES(?,'inspecting',?,?,?)", version, r.SourceSHA, r.Name, r.MessageID); err != nil {
+		return err
+	}
+	editing := false
+	defer func() {
+		if retErr != nil {
+			state := "error"
+			if editing {
+				state = "uncertain"
+			}
+			_, _ = a.Store.DB.ExecContext(context.WithoutCancel(ctx), "UPDATE archive_zip_repairs SET state=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=?", state, archiveErrorCode(retErr), version)
+		}
+	}()
+	oldPath, err := a.retainOriginalZIP(ctx, r)
+	if err != nil {
+		return err
+	}
+	if _, err = a.Store.DB.ExecContext(ctx, "UPDATE archive_zip_repairs SET old_path=? WHERE version_id=?", oldPath, version); err != nil {
+		return err
+	}
+	jobs, err := a.Store.MediaJobs(ctx, owner, version)
+	if err != nil {
+		return err
+	}
+	path, sha, manifest, changed, err := a.repackProfileZIP(ctx, oldPath, profile, version, owner, jobs)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		editing = true
+		if err = a.refreshConfirmedProfileCaption(ctx, version, owner, thread); err != nil {
+			return err
+		}
+		_, err = a.Store.DB.ExecContext(ctx, "UPDATE archive_zip_repairs SET state='skipped',new_source_sha=old_source_sha,new_filename=old_filename,new_message_id=old_message_id,updated_at=CURRENT_TIMESTAMP WHERE version_id=?", version)
+		return err
+	}
+	if _, err = a.Store.DB.ExecContext(ctx, "UPDATE archive_zip_repairs SET state='editing',new_path=?,new_filename=?,new_source_sha=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=?", path, filepath.Base(path), sha, version); err != nil {
+		return err
+	}
+	editing = true
+	var edited SentMessage
+	caption := fmt.Sprintf("Анкета #%d\nСохранено: %s\nЦелый исходный архив. SHA-256 %s\nИсточник: Jardulik API", profile, displayTime(manifest.LastSeen), sha)
+	err = a.groupCall(ctx, func() (err error) {
+		edited, err = a.TG.EditDocument(ctx, a.Config.BackupChatID, r.MessageID, path, caption)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if edited.ID != r.MessageID || edited.Document == nil || edited.Document.FileID == "" {
+		return errors.New("replacement ZIP delivery identifiers are unconfirmed")
+	}
+	if err = a.receipt(ctx, sha, "profile_version", path, "", thread, edited); err != nil {
+		return err
+	}
+	tx, err := a.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE archive_versions SET source_sha=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=? AND source_sha=?", sha, version, r.SourceSHA); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE archive_zip_repairs SET state='sent',new_message_id=?,error='',updated_at=CURRENT_TIMESTAMP WHERE version_id=?", edited.ID, version); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	return a.refreshConfirmedProfileCaption(ctx, version, owner, thread)
+}
+
+// Repack only ZIP names and manifest file names. Raw JSON, every source byte,
+// capture metadata and role/position inventory remain exactly attributable.
+func (a *Archiver) repackProfileZIP(ctx context.Context, source string, profile, version, owner int64, jobs []MediaJob) (path, sha string, manifest archiveManifest, changed bool, retErr error) {
+	z, err := zip.OpenReader(source)
+	if err != nil {
+		return "", "", manifest, false, err
+	}
+	defer z.Close()
+	if _, err = preflightProfileMediaZIP(ctx, &z.Reader, nil); err != nil {
+		return "", "", manifest, false, err
+	}
+	entries := make(map[string]*zip.File, len(z.File))
+	for _, file := range z.File {
+		entries[file.Name] = file
+	}
+	input, err := entries["manifest.json"].Open()
+	if err != nil {
+		return "", "", manifest, false, err
+	}
+	rawManifest, err := io.ReadAll(io.LimitReader(input, serviceManifestLimit+1))
+	input.Close()
+	if err != nil {
+		return "", "", manifest, false, err
+	}
+	if err = json.Unmarshal(rawManifest, &manifest); err != nil {
+		return "", "", manifest, false, err
+	}
+	if manifest.ProfileID != profile || manifest.VersionID != version || (manifest.ObserverID != 0 && manifest.ObserverID != owner) {
+		return "", "", manifest, false, errors.New("original ZIP identity conflicts with recorded version")
+	}
+	var raw map[string]json.RawMessage
+	if err = json.Unmarshal(rawManifest, &raw); err != nil {
+		return "", "", manifest, false, err
+	}
+	if owner == a.Config.OwnerID {
+		for _, key := range []string{"capture_device_ref", "os", "os_release", "kernel_release", "hardware_model", "architecture", "observer_id"} {
+			if _, present := raw[key]; present {
+				delete(raw, key)
+				changed = true
+			}
+		}
+		manifest.CaptureDevice, manifest.OS, manifest.OSRelease, manifest.Kernel, manifest.Hardware, manifest.Architecture = "", "", "", "", "", ""
+		manifest.ObserverID = 0
+	}
+	names := map[string]string{}
+	mime := map[string]string{}
+	for _, j := range jobs {
+		if j.SHA != "" {
+			mime[j.SHA] = j.MIME
+		}
+	}
+	for name := range entries {
+		names[name] = name
+		if !strings.HasPrefix(name, "media/") {
+			continue
+		}
+		mediaSHA, err := archiveMediaSHA(name)
+		if err != nil {
+			return "", "", manifest, false, err
+		}
+		if name == "media/"+mediaSHA {
+			kind := mime[mediaSHA]
+			if kind == "" {
+				input, err := entries[name].Open()
+				if err != nil {
+					return "", "", manifest, false, err
+				}
+				header, err := io.ReadAll(io.LimitReader(input, 512))
+				input.Close()
+				if err != nil {
+					return "", "", manifest, false, err
+				}
+				kind = http.DetectContentType(header)
+			}
+			names[name] = archiveMediaName(mediaSHA, kind)
+			changed = true
+		}
+	}
+	if !changed {
+		return "", "", manifest, false, nil
+	}
+	var files []map[string]json.RawMessage
+	if err = json.Unmarshal(raw["files"], &files); err != nil {
+		return "", "", manifest, false, err
+	}
+	for _, f := range files {
+		var name string
+		if err = json.Unmarshal(f["name"], &name); err != nil {
+			return "", "", manifest, false, err
+		}
+		f["name"], _ = json.Marshal(names[name])
+	}
+	raw["files"], err = json.Marshal(files)
+	if err != nil {
+		return "", "", manifest, false, err
+	}
+	updated, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return "", "", manifest, false, err
+	}
+	dir := filepath.Join(a.Config.DataDir, "archive-staging")
+	if err = os.MkdirAll(dir, 0700); err != nil {
+		return "", "", manifest, false, err
+	}
+	out, err := os.CreateTemp(dir, fmt.Sprintf("%s__jardulik-%d-v%d-extensions-*.zip", a.now().In(time.FixedZone("UTC+3", 10800)).Format("20060102T150405-0700"), profile, version))
+	if err != nil {
+		return "", "", manifest, false, err
+	}
+	path = out.Name()
+	defer out.Close()
+	writer := zip.NewWriter(out)
+	ordered := make([]string, 0, len(entries))
+	for name := range entries {
+		ordered = append(ordered, name)
+	}
+	sort.Strings(ordered)
+	for _, name := range ordered {
+		if ctx.Err() != nil {
+			return path, "", manifest, false, ctx.Err()
+		}
+		if name == "manifest.json" {
+			if _, err = addZipBytes(writer, name, updated); err != nil {
+				return path, "", manifest, false, err
+			}
+			continue
+		}
+		entry, err := writer.Create(names[name])
+		if err != nil {
+			return path, "", manifest, false, err
+		}
+		in, err := entries[name].Open()
+		if err != nil {
+			return path, "", manifest, false, err
+		}
+		_, err = io.Copy(entry, io.LimitReader(in, serviceRestoreLimit+1))
+		in.Close()
+		if err != nil {
+			return path, "", manifest, false, err
+		}
+	}
+	if err = writer.Close(); err != nil {
+		return path, "", manifest, false, err
+	}
+	if err = out.Close(); err != nil {
+		return path, "", manifest, false, err
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() > 49<<20 {
+		return path, "", manifest, false, errors.New("replacement whole ZIP exceeds upload limit")
+	}
+	sha, _, err = fileDigest(path)
+	if err != nil {
+		return path, "", manifest, false, err
+	}
+	return path, sha, manifest, true, nil
 }
 
 func (a *Archiver) allReceipts(ctx context.Context, db *sql.DB) ([]archiveReceipt, error) {
@@ -1228,7 +1969,7 @@ func (a *Archiver) serviceZIPFromSnapshot(ctx context.Context, id int64, dbpath 
 	if err = os.MkdirAll(dir, 0700); err != nil {
 		return "", manifest, err
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%s__jardulik-service__backup-%d.zip", a.now().UTC().Format("20060102T150405Z"), id))
+	path := filepath.Join(dir, fmt.Sprintf("%s__jardulik-service__backup-%d.zip", a.now().In(time.FixedZone("UTC+3", 10800)).Format("20060102T150405-0700"), id))
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return "", manifest, err
@@ -1310,7 +2051,7 @@ func (a *Archiver) serviceZIPFromSnapshot(ctx context.Context, id int64, dbpath 
 			if e != nil {
 				return "", manifest, e
 			}
-			entry, err = addZipFile(z, "media/"+m.sha, mediaPath)
+			entry, err = addZipFile(z, archiveMediaName(m.sha, m.mime), mediaPath)
 			if err != nil {
 				return "", manifest, err
 			}
@@ -1353,7 +2094,7 @@ func (a *Archiver) processBackup(ctx context.Context, id int64) error {
 		}
 		_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_backups SET state=?,path=?,error=? WHERE id=?", state, path, reason, id)
 		if state == "oversize" {
-			return a.notify(ctx, "Бэкап не отправлен: целый архив превышает проверенный бюджет восстановления. Он сохранён на VPS без дробления; нужна отдельная схема передачи и восстановления целого файла.")
+			return a.notify(ctx, "Бэкап не отправлен: целый архив превышает проверенный бюджет восстановления. Он сохранён локально без дробления; нужна отдельная схема передачи и восстановления целого файла.")
 		}
 		return err
 	}
@@ -1396,7 +2137,7 @@ func (a *Archiver) processBackup(ctx context.Context, id int64) error {
 		return err
 	}
 	_ = os.Remove(path) // A plaintext recovery configuration is never left after encryption and delivery.
-	text := fmt.Sprintf("Jardulik Companion: снимок сервиса\nСнято: %s\nВерсия: %s; устройство: %s; %s/%s\nДокумент принят Telegram: chat=%d, topic=%d, message=%d\nSHA-256 исходного ZIP: %s\nSHA-256 зашифрованного файла: %s\nФото в ZIP: %v; ожидают загрузки: %v; ошибки фото: %v; версии без полного TG-архива: %v.\nМанифест содержит исходные хэши и Telegram IDs. Это не проверка байтов на сервере Telegram.\n#Jardulik #бэкап #восстановление", displayTime(manifest.CapturedAt), Version, manifest.CaptureDevice, manifest.OS, manifest.Architecture, a.Config.BackupChatID, a.Config.BackupThreadID, sent.ID, sourceSHA, encryptedSHA, manifest.Coverage["media_embedded"], manifest.Coverage["pending_media"], manifest.Coverage["failed_media"], manifest.Coverage["versions_without_complete_telegram_archive"])
+	text := fmt.Sprintf("Jardulik Companion: снимок сервиса\nСнято: %s\nДокумент принят Telegram: chat=%d, topic=%d, message=%d\nSHA-256 исходного ZIP: %s\nSHA-256 зашифрованного файла: %s\nФото в ZIP: %v; ожидают загрузки: %v; ошибки фото: %v; версии без полного TG-архива: %v.\nМанифест содержит исходные хэши и Telegram IDs. Это не проверка байтов на сервере Telegram.\n#Jardulik #бэкап #восстановление", displayTime(manifest.CapturedAt), a.Config.BackupChatID, a.Config.BackupThreadID, sent.ID, sourceSHA, encryptedSHA, manifest.Coverage["media_embedded"], manifest.Coverage["pending_media"], manifest.Coverage["failed_media"], manifest.Coverage["versions_without_complete_telegram_archive"])
 	var companion SentMessage
 	err = a.groupCall(ctx, func() error {
 		var e error
@@ -1475,6 +2216,7 @@ func preflightServiceZIP(z *zip.Reader) (map[string]*zip.File, map[string]archiv
 		return nil, nil, fmt.Errorf("%w: too many entries", errArchiveBudget)
 	}
 	entries := map[string]*zip.File{}
+	mediaHashes := map[string]bool{}
 	var total uint64
 	for _, f := range z.File {
 		name := f.Name
@@ -1482,12 +2224,14 @@ func preflightServiceZIP(z *zip.Reader) (map[string]*zip.File, map[string]archiv
 			return nil, nil, errors.New("unsafe archive path or entry")
 		}
 		if name != "manifest.json" && name != "jardulik.sqlite" && name != "recovery-config.json" {
-			if !strings.HasPrefix(name, "media/") || len(strings.TrimPrefix(name, "media/")) != 64 {
-				return nil, nil, errors.New("unexpected archive entry")
+			sha, err := archiveMediaSHA(name)
+			if err != nil {
+				return nil, nil, err
 			}
-			if _, err := hex.DecodeString(strings.TrimPrefix(name, "media/")); err != nil {
-				return nil, nil, errors.New("invalid media filename")
+			if mediaHashes[sha] {
+				return nil, nil, errors.New("duplicate normalized media hash")
 			}
+			mediaHashes[sha] = true
 		}
 		if entries[name] != nil {
 			return nil, nil, errors.New("duplicate archive path")
@@ -1532,6 +2276,12 @@ func preflightServiceZIP(z *zip.Reader) (map[string]*zip.File, map[string]archiv
 			continue
 		}
 		e, ok := expected[name]
+		if strings.HasPrefix(name, "media/") {
+			sha, err := archiveMediaSHA(name)
+			if err != nil || e.SHA256 != sha {
+				return nil, nil, errors.New("media filename and content hash differ")
+			}
+		}
 		if !ok || e.ByteSize < 0 || uint64(e.ByteSize) != f.UncompressedSize64 || len(e.SHA256) != 64 {
 			return nil, nil, errors.New("manifest file metadata mismatch")
 		}
@@ -1567,7 +2317,12 @@ func restoreServiceZIP(z *zip.Reader, dest string) error {
 	sort.Strings(names)
 	for _, name := range names {
 		f := entries[name]
-		path := filepath.Join(dest, filepath.FromSlash(name))
+		target := name
+		if strings.HasPrefix(name, "media/") {
+			sha, _ := archiveMediaSHA(name)
+			target = "media/" + sha
+		}
+		path := filepath.Join(dest, filepath.FromSlash(target))
 		if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 			return err
 		}

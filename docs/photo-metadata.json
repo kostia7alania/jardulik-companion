@@ -1,0 +1,123 @@
+{
+  "report_version": 1,
+  "created_at_utc": "2026-11-07T23:21:16.013132+00:00",
+  "scope": "Read-only inspection of already cached Jardulik app media; counts refer to unique files, not people. No new upstream requests.",
+  "cache": {
+    "files": 388,
+    "formats": {
+      "WebP": 388
+    },
+    "bytes_total": 59970022,
+    "bytes_min": 3078,
+    "bytes_max": 510682,
+    "cache_files_at_start": 388,
+    "cache_files_at_end": 388,
+    "source_sha256_matches": 388,
+    "source_sha256_mismatches": 0,
+    "read_failures": 0,
+    "over_parser_limit": 0,
+    "files_with_container_parse_errors": 0,
+    "files_with_exif_parse_errors": 0,
+    "inspected_at_utc": "2026-11-07T23:19:42.032004+00:00",
+    "embedded_metadata_files": {
+      "exif": 316,
+      "icc": 74,
+      "xmp": 0,
+      "iptc": 0,
+      "comments": 0,
+      "gps_ifd": 2,
+      "gps_coordinates": 2,
+      "gps_valid_coordinate_pair": 2,
+      "gps_nonzero_coordinate_pair": 2,
+      "camera_make": 2,
+      "camera_model": 2,
+      "lens_model": 2,
+      "maker_notes": 2,
+      "camera_serial": 0,
+      "exif_datetime": 4,
+      "exif_orientation": 2,
+      "exif_resolution": 4,
+      "exif_software": 2,
+      "exif_artist_or_copyright": 0,
+      "exif_description_or_user_comment": 0
+    }
+  },
+  "gps_association_counts": {
+    "gps_valid_files": 2,
+    "distinct_profile_id_count": 1,
+    "roles_distinct_files": {
+      "photos": 1,
+      "miniPhotos": 1
+    },
+    "pixel_identity_of_full_and_thumbnail_not_tested": true
+  },
+  "local_verified_archive_crosscheck": {
+    "files": 2,
+    "files_data": [
+      {
+        "pillow_format": "WEBP",
+        "dimensions": [
+          900,
+          1200
+        ],
+        "pillow_exif_tag_count": 0,
+        "icc_profile_bytes": 456,
+        "exiftool_filetype": "Extended WEBP",
+        "exiftool_mimetype": "image/webp",
+        "metadata_flags": {
+          "icc": true
+        }
+      },
+      {
+        "pillow_format": "WEBP",
+        "dimensions": [
+          300,
+          400
+        ],
+        "pillow_exif_tag_count": 0,
+        "icc_profile_bytes": 456,
+        "exiftool_filetype": "Extended WEBP",
+        "exiftool_mimetype": "image/webp",
+        "metadata_flags": {
+          "icc": true
+        }
+      }
+    ],
+    "tools": [
+      "Python stdlib container/TIFF parser",
+      "existing ExifTool",
+      "existing Pillow"
+    ]
+  },
+  "method": {
+    "remote": "Python 3 stdlib: inspect complete RIFF/WebP chunks EXIF/XMP/ICCP; TIFF byte order, IFD0, ExifIFD, GPSIFD and linked IFDs; GPS validated as nonempty latitude/longitude DMS rationals with N/S/E/W refs, finite bounds and nonzero pair. JPEG APP0..APP15/COM and PNG chunks also supported but absent in this cache. No embedded values printed.",
+    "source_integrity": "Each cached whole file SHA-256 matched its 64-hex filename.",
+    "gps_association": "Read-only SQLite aggregate join media_jobs to versions; only distinct profile count and file-role counts returned.",
+    "parser_max_file_bytes": 67108864,
+    "cache_bytes_skipped": 0
+  },
+  "client_bundle": {
+    "path": "/private/tmp/jardulik-public-bundle.js",
+    "crop_helper": "vX uses canvas.drawImage then pX(canvas.toBlob), default image/jpeg quality0.92, maximum dimension1600; creates a new File.",
+    "webp_conversion": "UY calls /photos/finalize-convert-to-webp and VY wraps returned blob as image/webp.",
+    "exif_copy_string_hits": 0,
+    "evidence_offsets": {
+      "canvas_crop_helper": 4668882,
+      "photo_upload_helper": 4641669,
+      "webp_file_wrapper": 4644292
+    }
+  },
+  "conclusions": [
+    "Metadata is not removed unconditionally: cached files retain EXIF, ICC, and two files retain valid nonzero GPS coordinate pairs.",
+    "All388 unique cached media files are WebP by magic, including the two extensionless files previously described as JPEG.",
+    "The two GPS-bearing files are associated with one upstream profile and consist of one photos file and one miniPhotos file.",
+    "The two files in the inspected original-profile ZIP have no EXIF or GPS and each has a456-byte ICC profile."
+  ],
+  "limits": [
+    "Existing cache is a sample, not a statement about every account or photo in the service.",
+    "No original-upload-versus-download control was performed; the exact client/server stage that retained or removed metadata is unproven.",
+    "Static bundle code establishes available conversion paths, not that every historical upload used them.",
+    "File-level EXIF presence does not imply camera, GPS, or date fields are present; their counts are reported separately."
+  ],
+  "privacy": "Only aggregates, formats, dimensions of the two supplied archive images, public code references and tool names retained; no coordinates, people names, profile IDs, source-photo hashes, camera values, or tokens included."
+}

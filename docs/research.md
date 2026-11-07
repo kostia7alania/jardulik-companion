@@ -62,3 +62,15 @@ Google Autocomplete с `client=firefox&hl=ru` вернул пустые подс
 [Официальные forum docs](https://core.telegram.org/api/forum) не подтверждают заявленный предел в миллион тем. [createForumTopic](https://core.telegram.org/bots/api/methods/createforumtopic.md) требует `can_manage_topics`. [Bot FAQ](https://core.telegram.org/bots/faq) указывает лимиты всей группы, а не каждой темы. Архив использует одну очередь с интервалом не менее четырёх секунд и учитывает `retry_after`.
 
 Cloud Bot API отправляет документы до 50 MB, но [getFile](https://core.telegram.org/bots/api/methods/getfile.md) скачивает только до 20 MB. Наш служебный ZIP ограничен 18 МиБ и проходит те же бюджеты, что restore. Большие целые документы требуют отдельного пути восстановления, а не скрытого дробления. [deleteMessage](https://core.telegram.org/bots/api/methods/deletemessage.md) обычно ограничен 48 часами, поэтому автоматическое удаление старых архивов не обещается.
+
+## Проверка изображений и ID
+
+Read-only проверка 388 уникальных сохранённых файлов: все WebP, 316 содержат EXIF, 74 ICC, 4 дату EXIF, 2 валидные GPS-пары. Два GPS-файла относятся к одной анкете и ролям photos/miniPhotos; значения координат не выводились. Все 388 SHA совпали с именами файлов. [Агрегаты и метод](photo-metadata.json). Исходные загрузки до преобразования не проверены: определить точный этап сохранения/удаления EXIF нельзя.
+
+Jardulik ID используется как устойчивый ключ, но в проверенных getMe/getUsers/getUser нет поля регистрации. Последовательное распределение ID не доказано. first_seen является датой первого наблюдения нашим сервисом, а не датой регистрации.
+
+## Профиль HTTP-клиента
+
+По просьбе владельца явный JardulikCompanion UA заменён постоянным правдоподобным Telegram Android профилем: Android 16 / Vivo V2514 / Chrome 157 / Telegram 13.2.1. Это составленный профиль, не измерение с телефона владельца. Его можно заменить через JARDULIK_USER_AGENT; ротации между запросами нет. Origin/Referer/Accept-Language/Fetch Metadata согласованы с Mini App. TLS/HTTP2 остаются реализацией Go, новые транспортные зависимости не добавлены.
+
+Источники: [отчёт WebView 9 октября 2026](https://github.com/openclaw/openclaw/issues/167980), [реальный алгоритм Telegram](https://github.com/DrKLO/Telegram/blob/master/TMessagesProj/src/main/java/org/telegram/ui/web/BotWebViewContainer.java), [текущая версия Android-клиента](https://raw.githubusercontent.com/DrKLO/Telegram/master/gradle.properties), [Chrome Android 157, 5 ноября 2026](https://chromereleases.googleblog.com/2026/11/), [UA reduction](https://privacysandbox.google.com/blog/user-agent-reduction-webview-update), [JA3/JA4](https://developers.cloudflare.com/bots/additional-configurations/ja3-ja4-fingerprint/). Наличие JA3/JA4-фильтрации именно у Jardulik не установлено.

@@ -123,7 +123,7 @@ func (t *Telegram) Call(ctx context.Context, method string, payload, out any) er
 func (t *Telegram) Upload(ctx context.Context, method string, chat, thread int64, path, caption, field string) (SentMessage, error) {
 	return t.upload(ctx, method, chat, thread, path, caption, field, nil)
 }
-func (t *Telegram) upload(ctx context.Context, method string, chat, thread int64, path, caption, field string, keyboard any) (SentMessage, error) {
+func (t *Telegram) upload(ctx context.Context, method string, chat, thread int64, path, caption, field string, keyboard any, extra ...map[string]string) (SentMessage, error) {
 	var out SentMessage
 	var markup []byte
 	if keyboard != nil {
@@ -157,6 +157,14 @@ func (t *Telegram) upload(ctx context.Context, method string, chat, thread int64
 		if err := multipartWriter.WriteField("chat_id", strconv.FormatInt(chat, 10)); err != nil {
 			fail(err)
 			return
+		}
+		for _, fields := range extra {
+			for key, value := range fields {
+				if err := multipartWriter.WriteField(key, value); err != nil {
+					fail(err)
+					return
+				}
+			}
 		}
 		if thread > 0 {
 			if err := multipartWriter.WriteField("message_thread_id", strconv.FormatInt(thread, 10)); err != nil {
@@ -213,6 +221,26 @@ func (t *Telegram) SendPhotoCard(ctx context.Context, chat, thread int64, path, 
 }
 func (t *Telegram) SendDocumentCard(ctx context.Context, chat, thread int64, path, caption string, keyboard any) (SentMessage, error) {
 	return t.upload(ctx, "sendDocument", chat, thread, path, caption, "document", keyboard)
+}
+
+// EditDocument replaces the ZIP in its existing post, keeping topic ordering.
+// Unknown transport outcomes are returned for reconciliation, never retried.
+func (t *Telegram) EditDocument(ctx context.Context, chat, messageID int64, path, caption string) (SentMessage, error) {
+	if chat == 0 || messageID <= 0 {
+		return SentMessage{}, errors.New("invalid document edit target")
+	}
+	media, err := json.Marshal(map[string]string{"type": "document", "media": "attach://archive", "caption": caption})
+	if err != nil {
+		return SentMessage{}, err
+	}
+	m, err := t.upload(ctx, "editMessageMedia", chat, 0, path, "", "archive", nil, map[string]string{"message_id": strconv.FormatInt(messageID, 10), "media": string(media)})
+	if err != nil {
+		return m, err
+	}
+	if m.ID != messageID || m.Chat.ID != chat || m.Document == nil || m.Document.FileID == "" {
+		return m, errors.New("edited document receipt unconfirmed")
+	}
+	return m, nil
 }
 
 // SendAlbum uploads local photos once. A transport error leaves delivery unknown.

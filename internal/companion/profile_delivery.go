@@ -39,7 +39,7 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		seen[j.SHA] = true
 		photos = append(photos, j)
 	}
-	text := profileText(p)
+	text := s.cardText(ctx, owner, p)
 	buttons := profileButtons(p)
 	if len(photos) == 0 {
 		if len(jobs) > 0 {
@@ -60,6 +60,9 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		return []int64{m.ID}, nil
 	}
 	caption := profileCaption(text)
+	if len(photos) > 1 {
+		caption = albumProfileCaption(text, p.ID)
+	}
 	var ids []int64
 	for start := 0; start < len(photos); {
 		end := start
@@ -112,16 +115,11 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 			return ids, ctx.Err()
 		}
 	}
-	if len(ids) > 1 {
-		if err = s.TG.Call(ctx, "editMessageReplyMarkup", map[string]any{"chat_id": owner, "message_id": ids[0], "reply_markup": buttons}, nil); err != nil {
-			return ids, fmt.Errorf("album controls not confirmed: %w", err)
-		}
-	}
 	return ids, nil
 }
 
 func (s *Service) fullText(ctx context.Context, chat int64, p StoredProfile) {
-	text := profileText(p)
+	text := s.cardText(ctx, chat, p)
 	for text != "" {
 		part, rest := telegramPrefix(text, 3900)
 		if _, err := s.TG.SendText(ctx, chat, 0, part, nil); err != nil {
@@ -132,6 +130,20 @@ func (s *Service) fullText(ctx context.Context, chat int64, p StoredProfile) {
 			return
 		}
 	}
+}
+
+func (s *Service) cardText(ctx context.Context, owner int64, p StoredProfile) string {
+	text := profileText(p)
+	if owner != s.Config.OwnerID {
+		return text
+	}
+	var thread int64
+	if err := s.Store.DB.QueryRowContext(ctx, "SELECT thread_id FROM mirror_topics WHERE profile_id=?", p.ID).Scan(&thread); err == nil {
+		if link := forumTopicURL(s.Config.BackupChatID, thread); link != "" {
+			text += "\n📍 " + link
+		}
+	}
+	return text
 }
 
 // Operator archive callbacks are accepted only from the configured owner in
@@ -309,14 +321,90 @@ func (s *Service) runPrivateCardRepair(ctx context.Context) {
 					text = "Объединение личных карточек требует проверки. Старые сообщения сохранены, неопределённые отправки не повторяем."
 					slog.Warn("private card repair incomplete", "kind", safeError(err))
 				}
+				if state == "done" {
+					if err = s.RefreshCardCaptions(ctx); err != nil {
+						state = "uncertain"
+						text = "Обновление подписей требует проверки."
+					}
+				}
 				_ = s.Store.SetMeta(context.WithoutCancel(ctx), "private_card_repair", state)
-				_ = s.say(ctx, s.Config.OwnerID, text, nil)
+				if state != "done" {
+					_ = s.say(ctx, s.Config.OwnerID, text, nil)
+				}
 			}
 		}
 		if !sleep(ctx, 2*time.Second) {
 			return
 		}
 	}
+}
+
+func (s *Service) RefreshCardCaptions(ctx context.Context) error {
+	rows, err := s.Store.DB.QueryContext(ctx, "SELECT owner_id,version_id,message_ids FROM deliveries WHERE state='sent'")
+	if err != nil {
+		return err
+	}
+	type item struct {
+		owner, version int64
+		ids            string
+	}
+	var items []item
+	for rows.Next() {
+		var v item
+		if err = rows.Scan(&v.owner, &v.version, &v.ids); err != nil {
+			rows.Close()
+			return err
+		}
+		items = append(items, v)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, v := range items {
+		mu := s.userLock(v.owner)
+		mu.Lock()
+		err = func() error {
+			var ids []int64
+			if json.Unmarshal([]byte(v.ids), &ids) != nil || len(ids) == 0 || ids[0] <= 0 {
+				return errors.New("invalid card receipt")
+			}
+			p, err := s.Store.Version(ctx, v.owner, v.version)
+			if err != nil {
+				return err
+			}
+			text := s.cardText(ctx, v.owner, p)
+			caption := profileCaption(text)
+			payload := map[string]any{"chat_id": v.owner, "message_id": ids[0], "caption": caption}
+			if len(ids) > 1 {
+				payload["caption"] = albumProfileCaption(text, p.ID)
+			} else {
+				payload["reply_markup"] = profileButtons(p)
+			}
+			var out SentMessage
+			err = s.TG.Call(ctx, "editMessageCaption", payload, &out)
+			var te *TelegramError
+			if errors.As(err, &te) && te.Code == 400 && strings.Contains(strings.ToLower(te.Description), "message is not modified") {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if out.ID != ids[0] || out.Chat.ID != v.owner {
+				return errors.New("caption edit unconfirmed")
+			}
+			return nil
+		}()
+		mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if !sleep(ctx, 1100*time.Millisecond) {
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 type privateCardRepair struct {

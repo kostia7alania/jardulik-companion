@@ -312,7 +312,7 @@ func TestServiceZIPInventoryComesFromSnapshot(t *testing.T) {
 	defer z.Close()
 	found := false
 	for _, f := range z.File {
-		if f.Name == "media/"+sha {
+		if f.Name == archiveMediaName(sha, "image/jpeg") {
 			r, e := f.Open()
 			if e != nil {
 				t.Fatal(e)
@@ -415,7 +415,7 @@ func TestServiceZIPBlocksDeletionUntilFilesAreCopied(t *testing.T) {
 	defer z.Close()
 	found := false
 	for _, f := range z.File {
-		if f.Name == "media/"+sha {
+		if f.Name == archiveMediaName(sha, "image/jpeg") {
 			r, e := f.Open()
 			if e != nil {
 				t.Fatal(e)
@@ -573,7 +573,14 @@ func TestUncertainTopicCreationIsNotRetried(t *testing.T) {
 	if err := a.init(ctx); err != nil {
 		t.Fatal(err)
 	}
-	p := StoredProfile{ID: 99, VersionID: 1, Profile: Profile{"name": "Пример"}}
+	versions, err := s.Archive(ctx, 123, []Profile{{"userId": 99, "name": "Пример"}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.Version(ctx, 123, versions[0])
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := a.topic(ctx, p); err == nil {
 		t.Fatal("network ambiguity accepted")
 	}
@@ -736,6 +743,9 @@ func archivePresentationFixture(t *testing.T) (Config, *Store, *Archiver, Stored
 	if _, err = s.DB.ExecContext(ctx, "INSERT INTO mirror_topics(profile_id,thread_id) VALUES(?,55)", p.ID); err != nil {
 		t.Fatal(err)
 	}
+	if err = s.SetMeta(ctx, fmt.Sprintf("topic_title:%d", p.ID), truncateRunes("💁‍♀️"+profileHeading(p.Profile), 128)); err != nil {
+		t.Fatal(err)
+	}
 	return c, s, a, p, jobs
 }
 
@@ -749,7 +759,7 @@ func TestArchiveProfileUsesOneCaptionedAlbumAfterWholeZIP(t *testing.T) {
 			if call.fields["message_thread_id"] != "55" {
 				t.Fatal("source ZIP was posted outside its profile topic")
 			}
-			if !strings.Contains(call.fields["caption"], "SHA-256") || !strings.Contains(call.fields["caption"], "Устройство:") {
+			if !strings.Contains(call.fields["caption"], "SHA-256") || strings.Contains(call.fields["caption"], "Устройство:") {
 				t.Fatal("source provenance missing")
 			}
 			raw := []byte(call.fields["document"])
@@ -776,7 +786,7 @@ func TestArchiveProfileUsesOneCaptionedAlbumAfterWholeZIP(t *testing.T) {
 				t.Fatal("source role/position inventory lost")
 			}
 			for _, j := range jobs {
-				if !found["media/"+j.SHA] {
+				if !found[archiveMediaName(j.SHA, j.MIME)] {
 					t.Fatalf("original %s omitted from ZIP", j.Role)
 				}
 			}
@@ -796,6 +806,7 @@ func TestArchiveProfileUsesOneCaptionedAlbumAfterWholeZIP(t *testing.T) {
 			}
 			return `{"ok":true,"result":[{"message_id":101,"chat":{"id":-100123}},{"message_id":102,"chat":{"id":-100123}}]}`, nil
 		case "editMessageReplyMarkup":
+			t.Fatal("archive album controls must be on ZIP document")
 			if call.json["message_id"] != float64(101) {
 				t.Fatal("buttons attached to wrong album item")
 			}
@@ -808,7 +819,7 @@ func TestArchiveProfileUsesOneCaptionedAlbumAfterWholeZIP(t *testing.T) {
 	if err := a.mirrorVersion(context.Background(), 123, p.VersionID); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 3 {
+	if len(calls) != 2 {
 		t.Fatalf("profile was split into extra posts: %d", len(calls))
 	}
 	var ids string
@@ -866,7 +877,7 @@ func TestRepairProfilePostsRetainsZIPBeforeReplacingAndDeletingLegacy(t *testing
 		case "editMessageReplyMarkup":
 			return `{"ok":true,"result":{"message_id":101}}`, nil
 		case "deleteMessage":
-			if len(methods) < 4 {
+			if len(methods) < 3 {
 				t.Fatal("deleted before confirming replacement")
 			}
 			deleted = append(deleted, int64(call.json["message_id"].(float64)))
@@ -896,7 +907,7 @@ func TestRepairProfilePostsRetainsZIPBeforeReplacingAndDeletingLegacy(t *testing
 }
 
 func TestRepairProfilePostsUnknownOutcomeNeverDeletesOrReplays(t *testing.T) {
-	for _, uncertainAt := range []string{"editMessageCaption", "sendMediaGroup", "editMessageReplyMarkup", "deleteMessage"} {
+	for _, uncertainAt := range []string{"editMessageCaption", "sendMediaGroup", "deleteMessage"} {
 		t.Run(uncertainAt, func(t *testing.T) {
 			c, s, a, p, jobs := archivePresentationFixture(t)
 			archiveLegacyPresentation(t, s, a, p, jobs)
@@ -1141,5 +1152,742 @@ func TestQueuedProfileRepairUnknownAndCancelledRequestsCannotReset(t *testing.T)
 				t.Fatalf("uncertain repair repeated: %v calls=%d", err, calls)
 			}
 		})
+	}
+}
+
+func archiveTestRenameMedia(t *testing.T, input []byte, legacy bool, alias bool) []byte {
+	t.Helper()
+	z, err := zip.NewReader(bytes.NewReader(input), int64(len(input)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := map[string][]byte{}
+	var manifest archiveManifest
+	for _, f := range z.File {
+		in, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(in)
+		in.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data[f.Name] = b
+		if f.Name == "manifest.json" {
+			if err = json.Unmarshal(b, &manifest); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for i := range manifest.Files {
+		f := &manifest.Files[i]
+		if !strings.HasPrefix(f.Name, "media/") {
+			continue
+		}
+		sha, err := archiveMediaSHA(f.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if legacy {
+			data["media/"+sha] = data[f.Name]
+			delete(data, f.Name)
+			f.Name = "media/" + sha
+		}
+	}
+	if alias {
+		for name, b := range data {
+			if strings.HasPrefix(name, "media/") {
+				sha, _ := archiveMediaSHA(name)
+				other := "media/" + sha + ".png"
+				if other == name {
+					other = "media/" + sha + ".jpg"
+				}
+				data[other] = b
+				manifest.Files = append(manifest.Files, archiveFile{Name: other, SHA256: sha, ByteSize: int64(len(b))})
+				break
+			}
+		}
+	}
+	data["manifest.json"], err = json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	for name, b := range data {
+		if _, err = addZipBytes(writer, name, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func archiveZIPRepairFixture(t *testing.T) (Config, *Store, *Archiver, StoredProfile, []byte, string) {
+	t.Helper()
+	c, s, a, p, jobs := archivePresentationFixture(t)
+	oldSHA := archiveLegacyPresentation(t, s, a, p, jobs)
+	path, _, _, err := a.profileZIP(context.Background(), p, 123, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := archiveTestInjectDevice(t, archiveTestRenameMedia(t, input, true, false))
+	path = filepath.Join(c.DataDir, "archive-staging", "original-without-extensions.zip")
+	if err = os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	sha := digest(original)
+	if _, err = s.DB.Exec("UPDATE archive_versions SET source_sha=? WHERE version_id=?", sha, p.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.DB.Exec("UPDATE archive_receipts SET source_sha=?,filename=?,byte_size=?,returned_file_size=? WHERE source_sha=?", sha, filepath.Base(path), len(original), len(original), oldSHA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.DB.Exec("UPDATE backup_files SET source_sha=?,filename=?,size=? WHERE source_sha=?", sha, filepath.Base(path), len(original), oldSHA); err != nil {
+		t.Fatal(err)
+	}
+	return c, s, a, p, original, sha
+}
+
+func TestServiceRestoreAcceptsExtensionsAndLegacyButRejectsSHAAliases(t *testing.T) {
+	c, s, a, _, _ := archivePresentationFixture(t)
+	path, _, err := a.serviceZIP(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			b := input
+			if legacy {
+				b = archiveTestRenameMedia(t, input, true, false)
+			}
+			z, err := zip.NewReader(bytes.NewReader(b), int64(len(b)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			dest := filepath.Join(t.TempDir(), "restored")
+			if err = restoreServiceZIP(z, dest); err != nil {
+				t.Fatal(err)
+			}
+			var sha string
+			if err = s.DB.QueryRow("SELECT sha FROM media LIMIT 1").Scan(&sha); err != nil {
+				t.Fatal(err)
+			}
+			source, err := os.ReadFile(filepath.Join(c.DataDir, "media", sha))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(filepath.Join(dest, "media", sha))
+			if err != nil || !bytes.Equal(got, source) {
+				t.Fatal("extension was not normalized to the unchanged internal source")
+			}
+		})
+	}
+	b := archiveTestRenameMedia(t, input, false, true)
+	z, err := zip.NewReader(bytes.NewReader(b), int64(len(b)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "must-not-exist")
+	if err = restoreServiceZIP(z, dest); err == nil {
+		t.Fatal("normalized SHA alias was accepted")
+	}
+	if _, err = os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatal("alias archive wrote destination before rejection")
+	}
+}
+
+func TestZIPRepairEditsSameDocumentPreservesOriginalAndReceipts(t *testing.T) {
+	c, s, a, p, original, oldSHA := archiveZIPRepairFixture(t)
+	var replacement []byte
+	calls := 0
+	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+		calls++
+		if call.method != "editMessageMedia" || call.fields["message_id"] != "11" {
+			t.Fatalf("ZIP repair reposted/edited unrelated content: %s %+v", call.method, call.fields)
+		}
+		replacement = []byte(call.fields["archive"])
+		if bytes.Contains(replacement, []byte("PRIVATE-DEVICE-SENTINEL")) || strings.Contains(call.fields["media"], "PRIVATE-DEVICE-SENTINEL") || strings.Contains(call.fields["media"], "Устройство") {
+			t.Fatal("operator device metadata leaked into replacement artifact/caption")
+		}
+		z, err := zip.NewReader(bytes.NewReader(replacement), int64(len(replacement)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = preflightProfileMediaZIP(context.Background(), z, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range z.File {
+			name := file.Name
+			if strings.HasPrefix(name, "media/") && !strings.HasSuffix(name, ".jpg") {
+				t.Fatalf("source photo still has no ordinary extension: %s", name)
+			}
+		}
+		return fmt.Sprintf(`{"ok":true,"result":{"message_id":11,"chat":{"id":-100123},"document":{"file_id":"new-zip","file_unique_id":"new-unique","file_size":%d}}}`, len(replacement)), nil
+	})
+	if err := a.RequestZIPRepair(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.processOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || s.Meta(context.Background(), "archive_zip_repair_requested") != "done" {
+		t.Fatalf("ZIP queue failed/reposted: calls=%d", calls)
+	}
+	oldCopy, err := os.ReadFile(filepath.Join(c.DataDir, "archive-originals", oldSHA+".zip"))
+	if err != nil || !bytes.Equal(oldCopy, original) {
+		t.Fatal("exact original ZIP was not retained")
+	}
+	newSHA := digest(replacement)
+	var recordedSHA, state, oldName, newName string
+	var oldID, newID int64
+	if err = s.DB.QueryRow("SELECT source_sha FROM archive_versions WHERE version_id=?", p.VersionID).Scan(&recordedSHA); err != nil || recordedSHA != newSHA || newSHA == oldSHA {
+		t.Fatalf("active source receipt not promoted: %s %v", recordedSHA, err)
+	}
+	if err = s.DB.QueryRow("SELECT state,old_filename,new_filename,old_message_id,new_message_id FROM archive_zip_repairs WHERE version_id=?", p.VersionID).Scan(&state, &oldName, &newName, &oldID, &newID); err != nil || state != "sent" || oldID != 11 || newID != 11 || oldName == newName {
+		t.Fatalf("replacement audit missing: %s %s %s %d/%d %v", state, oldName, newName, oldID, newID, err)
+	}
+	for _, sha := range []string{oldSHA, newSHA} {
+		var count int
+		if err = s.DB.QueryRow("SELECT COUNT(*) FROM archive_receipts WHERE source_sha=?", sha).Scan(&count); err != nil || count != 1 {
+			t.Fatal("historical/new receipt was lost")
+		}
+	}
+	before := calls
+	if err = a.processOne(context.Background()); err != nil || calls != before {
+		t.Fatalf("ZIP repair replayed: %v calls=%d", err, calls)
+	}
+}
+
+func TestZIPRepairUnknownEditDoesNotPromoteOrRetry(t *testing.T) {
+	c, s, a, p, _, oldSHA := archiveZIPRepairFixture(t)
+	calls := 0
+	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+		calls++
+		if call.method != "editMessageMedia" {
+			t.Fatalf("unexpected ZIP operation %s", call.method)
+		}
+		return "", errors.New("edit response interrupted")
+	})
+	if err := a.RequestZIPRepair(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.processOne(context.Background()); err == nil {
+		t.Fatal("unknown edit reported success")
+	}
+	var sha, state string
+	if err := s.DB.QueryRow("SELECT source_sha FROM archive_versions WHERE version_id=?", p.VersionID).Scan(&sha); err != nil || sha != oldSHA {
+		t.Fatal("unconfirmed ZIP edit promoted")
+	}
+	if err := s.DB.QueryRow("SELECT state FROM archive_zip_repairs WHERE version_id=?", p.VersionID).Scan(&state); err != nil || state != "uncertain" {
+		t.Fatal("ZIP uncertainty not durable")
+	}
+	if err := a.RequestZIPRepair(context.Background()); err == nil {
+		t.Fatal("unknown ZIP request reset")
+	}
+	if err := a.processOne(context.Background()); err != nil || calls != 1 {
+		t.Fatalf("unknown ZIP request replayed: %v calls=%d", err, calls)
+	}
+}
+
+func TestReconcileKnownAlbumsNeverReuploadsAndKeepsZIP(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			c, s, a, p, jobs := archivePresentationFixture(t)
+			archiveLegacyPresentation(t, s, a, p, jobs)
+			if legacy {
+				if _, err := s.DB.Exec("INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids,error) VALUES(?,'uncertain','[11,12,13,14,15]','[101,102]','telegram_400')", p.VersionID); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := s.DB.Exec("UPDATE archive_versions SET state='uncertain',error='source_zip_sent_card_unconfirmed',message_ids='[101,102]' WHERE version_id=?", p.VersionID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var edits, deletes []int64
+			a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+				id := int64(call.json["message_id"].(float64))
+				switch call.method {
+				case "editMessageCaption":
+					edits = append(edits, id)
+					if id == 11 && call.json["reply_markup"] == nil {
+						t.Fatal("archive controls not placed on ZIP")
+					}
+					if id == 101 && call.json["reply_markup"] != nil {
+						t.Fatal("album markup retried")
+					}
+					return `{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}`, nil
+				case "deleteMessage":
+					if id == 11 {
+						t.Fatal("source ZIP deleted")
+					}
+					deletes = append(deletes, id)
+					return `{"ok":true,"result":true}`, nil
+				default:
+					t.Fatalf("known album was uploaded again: %s", call.method)
+				}
+				return "", nil
+			})
+			if err := a.ReconcileCaptionedAlbums(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if fmt.Sprint(edits) != "[11 101]" {
+				t.Fatalf("edited unknown messages: %v", edits)
+			}
+			want := "[]"
+			if legacy {
+				want = "[12 13 14 15]"
+			}
+			if fmt.Sprint(deletes) != want {
+				t.Fatalf("wrong cleanup inventory: %v", deletes)
+			}
+			var state, ids string
+			if err := s.DB.QueryRow("SELECT state,message_ids FROM archive_versions WHERE version_id=?", p.VersionID).Scan(&state, &ids); err != nil || state != "sent" || ids != "[101,102]" {
+				t.Fatalf("known album not reconciled: %s %s %v", state, ids, err)
+			}
+			if err := a.ReconcileCaptionedAlbums(context.Background()); err != nil || len(edits) != 2 {
+				t.Fatalf("known album reconciliation replayed: %v", err)
+			}
+		})
+	}
+}
+
+func TestZIPRepairWaitsForProfileMaintenanceAndSkipsExtendedSource(t *testing.T) {
+	c, s, a, p, jobs := archivePresentationFixture(t)
+	oldSHA := archiveLegacyPresentation(t, s, a, p, jobs)
+	path, sha, _, err := a.profileZIP(context.Background(), p, 123, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.DB.Exec("UPDATE archive_versions SET source_sha=? WHERE version_id=?", sha, p.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.DB.Exec("UPDATE archive_receipts SET source_sha=?,filename=?,byte_size=?,returned_file_size=? WHERE source_sha=?", sha, filepath.Base(path), info.Size(), info.Size(), oldSHA); err != nil {
+		t.Fatal(err)
+	}
+	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+		t.Fatalf("already extended ZIP was replaced: %s", call.method)
+		return "", nil
+	})
+	if err = s.SetMeta(context.Background(), "archive_repair_requested", "uncertain"); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.RequestZIPRepair(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.processOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if state := s.Meta(context.Background(), "archive_zip_repair_requested"); state != "pending" {
+		t.Fatalf("ZIP maintenance bypassed unresolved profile repair: %s", state)
+	}
+	if err = s.SetMeta(context.Background(), "archive_repair_requested", "done"); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.processOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	if err = s.DB.QueryRow("SELECT state FROM archive_zip_repairs WHERE version_id=?", p.VersionID).Scan(&state); err != nil || state != "skipped" {
+		t.Fatalf("already extended source was not skipped: %s %v", state, err)
+	}
+}
+
+func TestKnownAlbumReconciliationUnknownDeleteNeverReplays(t *testing.T) {
+	c, s, a, p, jobs := archivePresentationFixture(t)
+	archiveLegacyPresentation(t, s, a, p, jobs)
+	if _, err := s.DB.Exec("INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids,error) VALUES(?,'uncertain','[11,12,13,14,15]','[101,102]','telegram_400')", p.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+		calls++
+		if call.method == "editMessageCaption" {
+			return fmt.Sprintf(`{"ok":true,"result":{"message_id":%d}}`, int64(call.json["message_id"].(float64))), nil
+		}
+		if call.method != "deleteMessage" {
+			t.Fatalf("reconciliation uploaded data: %s", call.method)
+		}
+		return "", errors.New("deletion response interrupted")
+	})
+	if err := a.ReconcileCaptionedAlbums(context.Background()); err == nil {
+		t.Fatal("unknown deletion reported success")
+	}
+	previous := calls
+	if err := a.ReconcileCaptionedAlbums(context.Background()); err == nil || !strings.Contains(err.Error(), "require operator reconciliation") || calls != previous {
+		t.Fatalf("unknown deletion replayed or unresolved result omitted: %v calls=%d", err, calls)
+	}
+	var state, detail string
+	if err := s.DB.QueryRow("SELECT state,error FROM archive_profile_repairs WHERE version_id=?", p.VersionID).Scan(&state, &detail); err != nil || state != "uncertain" || detail != "known_album_reconciliation_unconfirmed" {
+		t.Fatalf("reconciliation uncertainty missing: %s %s %v", state, detail, err)
+	}
+}
+
+func archiveTestInjectDevice(t *testing.T, input []byte) []byte {
+	t.Helper()
+	z, err := zip.NewReader(bytes.NewReader(input), int64(len(input)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	writer := zip.NewWriter(&output)
+	for _, file := range z.File {
+		in, err := file.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(in)
+		in.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if file.Name == "manifest.json" {
+			var manifest map[string]any
+			if err = json.Unmarshal(data, &manifest); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"capture_device_ref", "os", "os_release", "kernel_release", "hardware_model", "architecture"} {
+				manifest[key] = "PRIVATE-DEVICE-SENTINEL"
+			}
+			manifest["observer_id"] = 123
+			data, err = json.Marshal(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err = addZipBytes(writer, file.Name, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func TestNewManifestsOmitDeviceAndOldExtendedZIPIsRewrittenPrivately(t *testing.T) {
+	c, _, a, p, jobs := archivePresentationFixture(t)
+	ctx := context.Background()
+	profilePath, _, _, err := a.profileZIP(ctx, p, 123, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servicePath, _, err := a.serviceZIP(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{profilePath, servicePath} {
+		z, err := zip.OpenReader(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range z.File {
+			if file.Name != "manifest.json" {
+				continue
+			}
+			in, err := file.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var manifest map[string]json.RawMessage
+			if err = json.NewDecoder(in).Decode(&manifest); err != nil {
+				t.Fatal(err)
+			}
+			in.Close()
+			for _, key := range []string{"capture_device_ref", "os", "os_release", "kernel_release", "hardware_model", "architecture", "observer_id"} {
+				if _, present := manifest[key]; present {
+					t.Fatalf("new manifest exposes device key %s", key)
+				}
+			}
+		}
+		z.Close()
+	}
+	input, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := archiveTestInjectDevice(t, input)
+	oldPath := filepath.Join(c.DataDir, "old-with-device.zip")
+	if err = os.WriteFile(oldPath, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	newPath, _, manifest, changed, err := a.repackProfileZIP(ctx, oldPath, p.ID, p.VersionID, 123, jobs)
+	if err != nil || !changed || manifest.CaptureDevice != "" || manifest.OS != "" || manifest.Architecture != "" || manifest.ObserverID != 0 {
+		t.Fatalf("already extended legacy device manifest was not cleaned: %v %t %+v", err, changed, manifest)
+	}
+	replacement, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z, err := zip.NewReader(bytes.NewReader(replacement), int64(len(replacement)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := zip.NewReader(bytes.NewReader(original), int64(len(original)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFiles := map[string][]byte{}
+	for _, file := range old.File {
+		in, err := file.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		oldFiles[file.Name], err = io.ReadAll(in)
+		in.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range z.File {
+		in, err := file.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(in)
+		in.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if file.Name == "manifest.json" {
+			if bytes.Contains(data, []byte("PRIVATE-DEVICE-SENTINEL")) {
+				t.Fatal("old device data remains in repacked manifest")
+			}
+			continue
+		}
+		if !bytes.Equal(data, oldFiles[file.Name]) {
+			t.Fatalf("privacy rewrite modified source bytes: %s", file.Name)
+		}
+	}
+	retained, err := os.ReadFile(oldPath)
+	if err != nil || !bytes.Equal(retained, original) {
+		t.Fatal("original private ZIP was changed during privacy rewrite")
+	}
+}
+
+func TestArchiveCaptionKeepsTopicLinkAtEndWithinUTF16Budget(t *testing.T) {
+	_, _, a, p, _ := archivePresentationFixture(t)
+	p.Profile["description"] = strings.Repeat("🙂", 3000)
+	link := forumTopicURL(a.Config.BackupChatID, 55)
+	for _, limit := range []int{1024, 4096} {
+		caption := a.profileCardText(p, 0, 55, limit, limit == 4096)
+		if textUnits(caption) > limit || !strings.HasSuffix(caption, "📍 "+link) {
+			t.Fatalf("caption lost final topic link or exceeded budget: units=%d limit=%d", textUnits(caption), limit)
+		}
+	}
+}
+
+func TestZIPRepairRefreshesConfirmedCaptionWithoutReupload(t *testing.T) {
+	c, s, a, p, _, _ := archiveZIPRepairFixture(t)
+	if _, err := s.DB.Exec("UPDATE archive_versions SET message_ids='[101,102]' WHERE version_id=?", p.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec("INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids) VALUES(?,'sent','[11,12,13,14,15]','[101,102]')", p.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	var methods []string
+	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+		methods = append(methods, call.method)
+		switch call.method {
+		case "editMessageMedia":
+			return fmt.Sprintf(`{"ok":true,"result":{"message_id":11,"chat":{"id":-100123},"document":{"file_id":"new-zip","file_unique_id":"new-unique","file_size":%d}}}`, len(call.fields["archive"])), nil
+		case "editMessageCaption":
+			if call.json["message_id"] != float64(101) || !strings.HasSuffix(call.json["caption"].(string), "📍 "+forumTopicURL(c.BackupChatID, 55)) {
+				t.Fatal("confirmed card caption/link was not refreshed in place")
+			}
+			return `{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}`, nil
+		default:
+			t.Fatalf("ZIP maintenance reposted profile photos: %s", call.method)
+		}
+		return "", nil
+	})
+	if err := a.RequestZIPRepair(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.processOne(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(methods) != "[editMessageMedia editMessageCaption]" {
+		t.Fatalf("unexpected maintenance sequence: %v", methods)
+	}
+}
+
+func TestProfileMetadataPrivacyFollowsObserverAccount(t *testing.T) {
+	_, s, a, _, _ := archivePresentationFixture(t)
+	ctx := context.Background()
+	other := int64(456)
+	if err := s.User(ctx, other, "test"); err != nil {
+		t.Fatal(err)
+	}
+	raw := Profile{"userId": 999, "name": "Другой наблюдатель", "description": "Точные исходные данные"}
+	versions, err := s.Archive(ctx, other, []Profile{raw}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.Version(ctx, other, versions[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := s.MediaJobs(ctx, other, p.VersionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, _, manifest, err := a.profileZIP(ctx, p, other, jobs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, _ := os.Hostname()
+	if manifest.ObserverID != other || manifest.CaptureDevice == "" || (host != "" && manifest.CaptureDevice != host) || manifest.OS != runtime.GOOS || manifest.Architecture != runtime.GOARCH {
+		t.Fatalf("other observer's capture-server metadata missing: %+v", manifest)
+	}
+	z, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer z.Close()
+	var beforeRaw []byte
+	for _, file := range z.File {
+		if file.Name == "raw.json" {
+			in, err := file.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeRaw, err = io.ReadAll(in)
+			in.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// Repacking an already extended other-tenant source must keep historical
+	// capture-server facts rather than replace them with this machine's facts.
+	_, _, kept, changed, err := a.repackProfileZIP(ctx, path, p.ID, p.VersionID, other, jobs)
+	if err != nil || changed || kept.ObserverID != other || kept.CaptureDevice != manifest.CaptureDevice || kept.OSRelease != manifest.OSRelease || kept.Hardware != manifest.Hardware {
+		t.Fatalf("other observer's historical metadata changed: changed=%t err=%v %+v", changed, err, kept)
+	}
+	expected, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeRaw, expected) {
+		t.Fatal("conditional metadata export modified raw profile JSON")
+	}
+	primary := a.profileManifest(a.Config.OwnerID)
+	if primary.ObserverID != 0 || primary.CaptureDevice != "" || primary.OS != "" || primary.OSRelease != "" || primary.Kernel != "" || primary.Hardware != "" || primary.Architecture != "" {
+		t.Fatalf("primary observer export leaks capture metadata: %+v", primary)
+	}
+	service := baseManifest()
+	if service.ObserverID != 0 || service.CaptureDevice != "" || service.OS != "" || service.Architecture != "" {
+		t.Fatal("service backup reintroduced operator metadata")
+	}
+}
+
+func TestArchiveTopicUsesCurrentHeadingAndRenamesOnlyWhenChanged(t *testing.T) {
+	c, s, a, historical, _ := archivePresentationFixture(t)
+	ctx := context.Background()
+	if _, err := s.DB.Exec("DELETE FROM meta WHERE key=?", fmt.Sprintf("topic_title:%d", historical.ID)); err != nil {
+		t.Fatal(err)
+	}
+	latest := Profile{"userId": historical.ID, "name": "Милана", "surName": "Примерова", "age": 23, "height": 171}
+	if _, err := s.Archive(ctx, 123, []Profile{latest}, "newer"); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+		if call.method != "editForumTopic" || call.json["message_thread_id"] != float64(55) {
+			t.Fatalf("rename created unrelated content: %s %+v", call.method, call.json)
+		}
+		names = append(names, call.json["name"].(string))
+		return `{"ok":true,"result":true}`, nil
+	})
+	for i := 0; i < 2; i++ {
+		if thread, err := a.topic(ctx, historical); err != nil || thread != 55 {
+			t.Fatalf("topic lookup failed: %d %v", thread, err)
+		}
+	}
+	if len(names) != 1 || names[0] != "💁‍♀️Милана Примерова, 23/171" {
+		t.Fatalf("topic used stale profile or renamed repeatedly: %v", names)
+	}
+	latest["age"] = 24
+	if _, err := s.Archive(ctx, 123, []Profile{latest}, "newest"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.topic(ctx, historical); err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 || names[1] != "💁‍♀️Милана Примерова, 24/171" {
+		t.Fatalf("changed latest title was not applied once: %v", names)
+	}
+}
+
+func TestArchiveNewTopicHasHeadingAndRecordsOnlyConfirmedTitle(t *testing.T) {
+	c, s, a, p, _ := archivePresentationFixture(t)
+	if _, err := s.DB.Exec("DELETE FROM mirror_topics WHERE profile_id=?", p.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec("DELETE FROM meta WHERE key=?", fmt.Sprintf("topic_title:%d", p.ID)); err != nil {
+		t.Fatal(err)
+	}
+	// Many supplementary Unicode symbols exercise Telegram's UTF-16 title limit.
+	latest := Profile{"userId": p.ID, "name": strings.Repeat("🙂", 100), "age": 23, "height": 171}
+	if _, err := s.Archive(context.Background(), 123, []Profile{latest}, "latest"); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	want := truncateRunes("💁‍♀️"+profileHeading(latest), 128)
+	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+		calls++
+		if call.method != "createForumTopic" || call.json["name"] != want || textUnits(call.json["name"].(string)) > 128 {
+			t.Fatalf("new topic has wrong heading: %s %+v", call.method, call.json)
+		}
+		return `{"ok":true,"result":{"message_thread_id":56}}`, nil
+	})
+	for i := 0; i < 2; i++ {
+		if thread, err := a.topic(context.Background(), p); err != nil || thread != 56 {
+			t.Fatalf("new topic failed: %d %v", thread, err)
+		}
+	}
+	if calls != 1 || s.Meta(context.Background(), fmt.Sprintf("topic_title:%d", p.ID)) != want {
+		t.Fatal("confirmed new title was not remembered")
+	}
+}
+
+func TestUnknownTopicRenameDoesNotPersistTitleOrReplayVersion(t *testing.T) {
+	c, s, a, p, _ := archivePresentationFixture(t)
+	if _, err := s.DB.Exec("DELETE FROM meta WHERE key=?", fmt.Sprintf("topic_title:%d", p.ID)); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+		calls++
+		if call.method != "editForumTopic" {
+			t.Fatalf("unexpected effect after unknown title edit: %s", call.method)
+		}
+		return "", errors.New("rename response interrupted")
+	})
+	if err := a.mirrorVersion(context.Background(), 123, p.VersionID); err == nil {
+		t.Fatal("unknown title edit reported success")
+	}
+	if s.Meta(context.Background(), fmt.Sprintf("topic_title:%d", p.ID)) != "" {
+		t.Fatal("unconfirmed title was remembered")
+	}
+	if err := a.processOne(context.Background()); err != nil || calls != 1 {
+		t.Fatalf("unknown title edit replayed: %v calls=%d", err, calls)
 	}
 }

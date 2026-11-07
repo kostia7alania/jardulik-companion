@@ -152,6 +152,180 @@ func TestRestoreMediaRecoversWholeProfileZIPAndLeavesSQLiteUnchanged(t *testing.
 	}
 }
 
+func TestRestoreMediaAcceptsOmittedObserverAndLegacyIdentity(t *testing.T) {
+	for _, observer := range []int64{0, 123, -1} {
+		t.Run(fmt.Sprint(observer), func(t *testing.T) {
+			f := newRestoreMediaFixture(t)
+			z, err := zip.NewReader(bytes.NewReader(f.zip), int64(len(f.zip)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			w := zip.NewWriter(&out)
+			for _, entry := range z.File {
+				in, err := entry.Open()
+				if err != nil {
+					t.Fatal(err)
+				}
+				b, err := io.ReadAll(in)
+				in.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if entry.Name == "manifest.json" {
+					var manifest map[string]any
+					if err = json.Unmarshal(b, &manifest); err != nil {
+						t.Fatal(err)
+					}
+					delete(manifest, "observer_id")
+					if observer != 0 {
+						manifest["observer_id"] = observer
+					}
+					b, err = json.Marshal(manifest)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				writer, err := w.Create(entry.Name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = writer.Write(b); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err = w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			f.trustZIP(t, out.Bytes())
+			result, err := RestoreMedia(context.Background(), f.tg, f.dest)
+			if observer < 0 {
+				if err == nil || result.ExpectedMediaComplete || result.Missing != 1 {
+					t.Fatalf("negative observer accepted: %+v %v", result, err)
+				}
+				assertNoRecoveredMedia(t, f)
+			} else if err != nil || !result.ExpectedMediaComplete || result.Restored != 1 {
+				t.Fatalf("privacy or legacy archive rejected: %+v %v", result, err)
+			}
+		})
+	}
+}
+
+func rewriteRestoreMediaNames(t *testing.T, f *restoreMediaFixture, extension string, aliases ...string) []byte {
+	t.Helper()
+	z, err := zip.NewReader(bytes.NewReader(f.zip), int64(len(f.zip)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := map[string][]byte{}
+	for _, entry := range z.File {
+		in, err := entry.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents[entry.Name], err = io.ReadAll(in)
+		in.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var manifest archiveManifest
+	if err = json.Unmarshal(contents["manifest.json"], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	newName := "media/" + f.sha + extension
+	for i := range manifest.Files {
+		if strings.HasPrefix(manifest.Files[i].Name, "media/") {
+			manifest.Files[i].Name = newName
+		}
+	}
+	var out bytes.Buffer
+	w := zip.NewWriter(&out)
+	write := func(name string, data []byte) {
+		t.Helper()
+		entry, err := w.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = entry.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, entry := range z.File {
+		if entry.Name == "manifest.json" {
+			continue
+		}
+		name := entry.Name
+		if strings.HasPrefix(name, "media/") {
+			name = newName
+		}
+		write(name, contents[entry.Name])
+	}
+	for _, alias := range aliases {
+		name := "media/" + f.sha + alias
+		write(name, f.photo)
+		manifest.Files = append(manifest.Files, archiveFile{Name: name, SHA256: f.sha, ByteSize: int64(len(f.photo))})
+	}
+	b, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	write("manifest.json", b)
+	if err = w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+func TestRestoreMediaSupportsLegacyAndExtendedArchiveNames(t *testing.T) {
+	for _, extension := range []string{"", ".jpg", ".webp"} {
+		t.Run("extension="+extension, func(t *testing.T) {
+			f := newRestoreMediaFixture(t)
+			f.trustZIP(t, rewriteRestoreMediaNames(t, f, extension))
+			result, err := RestoreMedia(context.Background(), f.tg, f.dest)
+			if err != nil || result.Restored != 1 || result.Verified != 1 || result.Missing != 0 || !result.ExpectedMediaComplete {
+				t.Fatalf("archive compatibility failed: %+v %v", result, err)
+			}
+			got, err := os.ReadFile(filepath.Join(f.dest, "media", f.sha))
+			if err != nil || !bytes.Equal(got, f.photo) {
+				t.Fatalf("canonical media file changed: %v", err)
+			}
+			entries, err := os.ReadDir(filepath.Join(f.dest, "media"))
+			if err != nil || len(entries) != 1 || entries[0].Name() != f.sha {
+				t.Fatal("archive extension leaked into the application's canonical media paths")
+			}
+		})
+	}
+}
+
+func TestRestoreMediaRejectsNormalizedSHAArchiveAliases(t *testing.T) {
+	for _, tc := range []struct{ original, alias string }{{"", ".jpg"}, {".jpg", ".webp"}} {
+		t.Run(tc.original+"+"+tc.alias, func(t *testing.T) {
+			f := newRestoreMediaFixture(t)
+			f.trustZIP(t, rewriteRestoreMediaNames(t, f, tc.original, tc.alias))
+			result, err := RestoreMedia(context.Background(), f.tg, f.dest)
+			if err == nil || !strings.Contains(err.Error(), "duplicate normalized profile media SHA") || result.Restored != 0 || result.Missing != 1 || result.ExpectedMediaComplete {
+				t.Fatalf("media aliases were accepted: %+v %v", result, err)
+			}
+			assertNoRecoveredMedia(t, f)
+		})
+	}
+}
+
+func TestRestoreMediaRejectsUnsupportedArchiveExtensions(t *testing.T) {
+	for _, extension := range []string{".exe", ".jpg.exe"} {
+		t.Run(extension, func(t *testing.T) {
+			f := newRestoreMediaFixture(t)
+			f.trustZIP(t, rewriteRestoreMediaNames(t, f, extension))
+			result, err := RestoreMedia(context.Background(), f.tg, f.dest)
+			if err == nil || result.Restored != 0 || result.Missing != 1 || result.ExpectedMediaComplete {
+				t.Fatalf("unsupported archive extension accepted: %+v %v", result, err)
+			}
+			assertNoRecoveredMedia(t, f)
+		})
+	}
+}
+
 func TestRestoreMediaRejectsCorruptedWholeDocumentBeforeExtraction(t *testing.T) {
 	f := newRestoreMediaFixture(t)
 	f.zip[len(f.zip)-1] ^= 1 // Receipt still identifies the original whole ZIP.
@@ -300,6 +474,104 @@ func TestRestoreMediaReportsMissingAndUnsupportedReceipts(t *testing.T) {
 				t.Fatal("unsupported receipt caused an unnecessary download")
 			}
 			assertNoRecoveredMedia(t, f)
+		})
+	}
+}
+
+func TestRestoreMediaUsesReplacementAfterUnavailableHistoricalCopy(t *testing.T) {
+	for _, failure := range []string{"getFile", "download", "oversized-receipt", "oversized-getFile"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newRestoreMediaFixture(t)
+			old := f.manifest.Receipts[0]
+			old.FileID, old.MessageID = "historical-copy", 41
+			if failure == "oversized-receipt" {
+				old.SourceSHA = digest([]byte("old oversized whole ZIP"))
+				old.Size, old.ReturnedSize = restoreDownloadLimit+1, restoreDownloadLimit+1
+			}
+			f.manifest.Receipts = append([]archiveReceipt{old}, f.manifest.Receipts...)
+			f.saveManifest(t)
+			base := f.tg.HTTP.Transport
+			f.tg.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+				body := ""
+				status := 200
+				if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/getFile") {
+					b, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					r.Body = io.NopCloser(bytes.NewReader(b))
+					var input map[string]string
+					if err = json.Unmarshal(b, &input); err != nil {
+						t.Fatal(err)
+					}
+					if input["file_id"] == "historical-copy" {
+						switch failure {
+						case "getFile":
+							body = `{"ok":false,"error_code":400,"description":"historical file unavailable"}`
+						case "download":
+							body = fmt.Sprintf(`{"ok":true,"result":{"file_path":"documents/historical.zip","file_size":%d}}`, old.Size)
+						case "oversized-getFile":
+							body = fmt.Sprintf(`{"ok":true,"result":{"file_path":"documents/historical.zip","file_size":%d}}`, restoreDownloadLimit+1)
+						default:
+							t.Fatal("unsupported receipt reached Telegram")
+						}
+					}
+				} else if strings.HasSuffix(r.URL.Path, "/documents/historical.zip") {
+					status, body = 404, "copy unavailable"
+				}
+				if body != "" {
+					return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: r}, nil
+				}
+				return base.RoundTrip(r)
+			})
+			result, err := RestoreMedia(context.Background(), f.tg, f.dest)
+			if err != nil || !result.ExpectedMediaComplete || result.Missing != 0 || result.Verified != result.Expected || result.Restored != 1 || len(result.SupportGaps) == 0 {
+				t.Fatalf("replacement was incorrectly treated as incomplete: %+v %v", result, err)
+			}
+			b, err := os.ReadFile(filepath.Join(f.dest, "media", f.sha))
+			if err != nil || !bytes.Equal(b, f.photo) {
+				t.Fatal("replacement did not preserve the original media")
+			}
+		})
+	}
+}
+
+func TestRestoreMediaKeepsIntegrityFailureAfterSuccessfulReplacement(t *testing.T) {
+	for _, failure := range []string{"source-hash", "local-rename"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newRestoreMediaFixture(t)
+			old := f.manifest.Receipts[0]
+			old.FileID, old.MessageID = "failed-copy", 41
+			f.manifest.Receipts = append([]archiveReceipt{old}, f.manifest.Receipts...)
+			f.saveManifest(t)
+			base := f.tg.HTTP.Transport
+			first := true
+			blocked := filepath.Join(f.dest, "media", f.sha)
+			f.tg.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+				response, err := base.RoundTrip(r)
+				if err == nil && r.Method == http.MethodGet {
+					if first {
+						first = false
+						if failure == "source-hash" {
+							response.Body.Close()
+							b := bytes.Clone(f.zip)
+							b[len(b)-1] ^= 1
+							response.Body = io.NopCloser(bytes.NewReader(b))
+						} else if err = os.Mkdir(blocked, 0700); err != nil {
+							t.Fatal(err)
+						}
+					} else if failure == "local-rename" {
+						if err = os.Remove(blocked); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				return response, err
+			})
+			result, err := RestoreMedia(context.Background(), f.tg, f.dest)
+			if err == nil || result.ExpectedMediaComplete || result.Missing != 0 || result.Verified != result.Expected || result.Restored != 1 || len(result.SupportGaps) == 0 {
+				t.Fatalf("successful replacement hid an integrity/write failure: %+v %v", result, err)
+			}
 		})
 	}
 }
