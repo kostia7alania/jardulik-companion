@@ -1,0 +1,35 @@
+[Unit]
+Description=Jardulik Companion Telegram bot
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=jardulik
+Group=jardulik
+WorkingDirectory=/var/lib/jardulik-companion
+EnvironmentFile=/etc/jardulik-companion.env
+Environment=GOMEMLIMIT=64MiB
+Environment=GOMAXPROCS=1
+ExecStart=/opt/jardulik-companion/current/jardulik serve
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/jardulik-companion
+MemoryHigh=96M
+MemoryMax=128M
+TasksMax=32
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jardulik-companion
+
+[Install]
+WantedBy=multi-user.target

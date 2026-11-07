@@ -1,0 +1,29 @@
+[Unit]
+Description=Back up Jardulik Companion to private Telegram storage
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/jardulik-companion.env
+
+[Service]
+Type=oneshot
+User=jardulik
+Group=jardulik
+WorkingDirectory=/var/lib/jardulik-companion
+EnvironmentFile=/etc/jardulik-companion.env
+Environment=GOMEMLIMIT=64MiB
+Environment=GOMAXPROCS=1
+ExecStart=/opt/jardulik-companion/current/jardulik backup
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/jardulik-companion
+MemoryHigh=96M
+MemoryMax=128M
+TasksMax=32
+CPUQuota=50%
+TimeoutStartSec=4h
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jardulik-companion-backup

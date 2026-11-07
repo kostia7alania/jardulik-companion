@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+dist/
+data/
+backups/
+*.sqlite*
+*.db*
+*.key
+*.enc
+.DS_Store

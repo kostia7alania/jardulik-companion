@@ -1,0 +1,21 @@
+keyword,cluster,intent,priority,target_page,monthly_volume,kd,cpc,country,period,verification_status
+jardulik companion,brand,navigational,P0,/,,,,RU,unknown,candidate_not_measured
+jardulik помощник,brand,commercial,P0,/,,,,RU,unknown,candidate_not_measured
+jardulik анкеты в телеграме,profiles,commercial,P0,/,,,,RU,unknown,candidate_not_measured
+архив анкет jardulik,archive,commercial,P0,/#possibilities,,,,RU,unknown,candidate_not_measured
+сохранить анкету jardulik,archive,informational,P0,/#possibilities,,,,RU,unknown,candidate_not_measured
+история анкет jardulik,history,commercial,P0,/#possibilities,,,,RU,unknown,candidate_not_measured
+как подключить jardulik companion,onboarding,informational,P0,/guide.html,,,,RU,unknown,candidate_not_measured
+jardulik бот,brand,navigational,P1,/#questions,,,,RU,unknown,candidate_not_measured
+jærdulik бот,brand,navigational,P1,/#questions,,,,RU,unknown,candidate_not_measured
+фотографии jardulik в телеграме,profiles,informational,P1,/#possibilities,,,,RU,unknown,candidate_not_measured
+избранное jardulik,favorites,informational,P1,/#possibilities,,,,RU,unknown,candidate_not_measured
+jardulik без открытого приложения,onboarding,informational,P1,/#questions,,,,RU,unknown,candidate_not_measured
+jardulik telegram web,onboarding,informational,P1,/guide.html,,,,RU,unknown,candidate_not_measured
+jardulik премиум ограничения,limits,informational,P1,/#questions,,,,RU,unknown,candidate_not_measured
+бот для сохранения анкет,archive,commercial,P1,/#possibilities,,,,RU,unknown,candidate_not_measured
+история изменений анкеты,history,informational,P1,/#possibilities,,,,RU,unknown,candidate_not_measured
+jardulik initdata,onboarding,technical,P2,/guide.html,,,,RU,unknown,candidate_not_measured
+автолайки jardulik,automation,commercial,P2,/#questions,,,,RU,unknown,candidate_not_measured
+автолайки знакомства телеграм,automation,commercial,P2,future,,,,RU,unknown,candidate_not_measured
+осетинские знакомства в телеграм,context,navigational,P3,/,,,,RU,unknown,candidate_not_measured
