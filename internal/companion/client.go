@@ -113,20 +113,32 @@ func (c *Client) Login(ctx context.Context, owner int64, raw string) error {
 	if err != nil {
 		return err
 	}
-	var response struct {
-		Token, RefreshToken string
-		UserID              int64 `json:"userId"`
-		Code                int   `json:"code"`
+	session, err := decodeLoginResponse(b)
+	if err != nil {
+		return err
 	}
-	if err = json.Unmarshal(b, &response); err != nil || response.Token == "" || response.RefreshToken == "" || response.UserID <= 0 || response.Code != 200 {
-		return errors.New("Jardulik не подтвердил вход: закончи регистрацию или проверку в официальном приложении")
-	}
-	session := Session{Token: response.Token, Refresh: response.RefreshToken, UserID: response.UserID, Expires: tokenExpiry(response.Token)}
 	if err = c.Store.SaveSession(ctx, owner, session); err != nil {
 		return err
 	}
 	c.Store.Event(ctx, owner, "connect_success")
 	return nil
+}
+
+func decodeLoginResponse(b []byte) (Session, error) {
+	var response struct {
+		Token, RefreshToken string
+		UserID              int64 `json:"userId"`
+		Code                int   `json:"code"`
+		IsReged             *bool `json:"isReged"`
+	}
+	err := json.Unmarshal(b, &response)
+	// The live API returns 201 + isReged=true + "Login successful" for an
+	// existing registered account. Other onboarding/moderation codes stay blocked.
+	allowed := response.Code == 200 || (response.Code == 201 && response.IsReged != nil && *response.IsReged)
+	if err != nil || response.Token == "" || response.RefreshToken == "" || response.UserID <= 0 || !allowed || (response.IsReged != nil && !*response.IsReged) {
+		return Session{}, errors.New("Jardulik не подтвердил вход: закончи регистрацию или проверку в официальном приложении")
+	}
+	return Session{Token: response.Token, Refresh: response.RefreshToken, UserID: response.UserID, Expires: tokenExpiry(response.Token)}, nil
 }
 
 func (c *Client) refreshLocked(ctx context.Context, owner int64, s Session) (Session, error) {

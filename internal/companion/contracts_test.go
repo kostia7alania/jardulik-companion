@@ -97,6 +97,27 @@ func TestSignedIdentityAndAge(t *testing.T) {
 	}
 }
 
+func TestLiveRegisteredLoginResponse(t *testing.T) {
+	for _, code := range []int{200, 201} {
+		packet := fmt.Sprintf(`{"code":%d,"isReged":true,"message":"Login successful","token":"access","refreshToken":"refresh","userId":5696}`, code)
+		s, err := decodeLoginResponse([]byte(packet))
+		if err != nil || s.UserID != 5696 || s.Token != "access" || s.Refresh != "refresh" {
+			t.Fatalf("registered login code %d rejected: %v", code, err)
+		}
+	}
+	for _, packet := range []string{
+		`{"code":201,"token":"access","refreshToken":"refresh","userId":5696}`,
+		`{"code":201,"isReged":false,"token":"access","refreshToken":"refresh","userId":5696}`,
+		`{"code":405,"isReged":true,"token":"access","refreshToken":"refresh","userId":5696}`,
+		`{"code":401,"isReged":true,"token":"access","refreshToken":"refresh","userId":5696}`,
+		`{"code":200,"isReged":true,"token":"access","userId":5696}`,
+	} {
+		if _, err := decodeLoginResponse([]byte(packet)); err == nil {
+			t.Fatal("accepted incomplete, unregistered or restricted login")
+		}
+	}
+}
+
 func TestTenantIsolationAndCompleteBatch(t *testing.T) {
 	s, _ := testStore(t)
 	ctx := context.Background()
