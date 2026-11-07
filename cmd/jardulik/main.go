@@ -35,6 +35,16 @@ func run() error {
 		}
 		return companion.RestoreArchive(os.Args[2], os.Args[3], c.BackupKey)
 	}
+	if command == "restore-media" {
+		if len(os.Args) != 3 {
+			return errors.New("usage: jardulik restore-media <restored-directory>")
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		result, err := companion.RestoreMedia(ctx, companion.NewTelegram(c), os.Args[2])
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return err
+	}
 	s, err := companion.NewService(c)
 	if err != nil {
 		return err
@@ -100,8 +110,17 @@ func run() error {
 		}
 		fmt.Println("Backup requested; delivery is confirmed separately in /status and the private backup topic.")
 		return nil
+	case "repair-posts":
+		if err = s.Archiver.RequestProfileRepair(ctx); err != nil {
+			return err
+		}
+		if err = s.RequestPrivateCardRepair(ctx); err != nil {
+			return err
+		}
+		fmt.Println("Profile post repair requested. Completion is recorded separately; original ZIP documents are retained.")
+		return nil
 	default:
-		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, restore, version")
+		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, restore, restore-media, repair-posts (service stopped), version")
 	}
 }
 func main() {

@@ -69,9 +69,10 @@ func (s *Service) Run(ctx context.Context) error {
 		return err
 	}
 	var background sync.WaitGroup
-	background.Add(2)
+	background.Add(3)
 	go func() { defer background.Done(); s.Media.Run(ctx) }()
 	go func() { defer background.Done(); s.Archiver.Run(ctx) }()
+	go func() { defer background.Done(); s.runPrivateCardRepair(ctx) }()
 	queues := make([]chan Update, 4)
 	var workers sync.WaitGroup
 	for i := range queues {
@@ -198,6 +199,12 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 	} else {
 		return
 	}
+	if u.Callback != nil && owner == s.Config.OwnerID && m.Chat.ID == s.Config.BackupChatID && s.Config.BackupChatID != 0 {
+		if strings.HasPrefix(u.Callback.Data, "av:") || strings.HasPrefix(u.Callback.Data, "az:") {
+			s.archiveCallback(ctx, *u.Callback)
+		}
+		return
+	}
 	if m.Chat.Type != "private" || m.Chat.ID != owner {
 		return
 	}
@@ -225,6 +232,10 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 				if p, err := s.Store.Profile(ctx, owner, id); err == nil {
 					_ = s.Deliver(ctx, owner, p)
 				}
+			case "t":
+				if p, err := s.Store.Profile(ctx, owner, id); err == nil {
+					s.fullText(ctx, owner, p)
+				}
 			}
 		} else if u.Callback.Data == "next" {
 			s.next(ctx, owner)
@@ -244,7 +255,7 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		}
 		_, _ = s.Store.DB.ExecContext(ctx, "UPDATE users SET source=CASE WHEN source='' THEN ? ELSE source END WHERE id=?", source, owner)
 		s.Store.Event(ctx, owner, "start")
-		_ = s.say(ctx, owner, "Jardulik Companion\n\nАнкеты, фотографии, избранное и история в этом чате. Это независимый помощник.\n\nДля первого подключения нужен URL Jardulik из Telegram Web. Пароль, коды входа и Telegram-сессия не нужны. /connect покажет инструкцию.\n\nСохраняем все анкеты и фотографии, которые Jardulik вернул твоему аккаунту. Оператор имеет доступ к архиву для работы сервиса и модерации; бэкап находится в закрытой Telegram-группе. Другие пользователи твои действия и заметки не видят.\n\nАвтолайки сейчас выключены. /disconnect останавливает доступ к Jardulik, /delete удаляет твои данные из рабочей базы.\n\nПолитика: https://kostia7alania.github.io/jardulik-companion-site/privacy.html", nil)
+		_ = s.say(ctx, owner, "Jardulik Companion\n\nАнкеты, фотографии, избранное и история в этом чате. Это независимый помощник.\n\nДля первого подключения нужен URL Jardulik из Telegram Web. Пароль, коды входа и Telegram-сессия не нужны. /connect покажет инструкцию.\n\nСохраняем все анкеты и фотографии, которые Jardulik вернул твоему аккаунту. Оператор имеет доступ к архиву для работы сервиса и модерации; бэкап находится в закрытой Telegram-группе. Другие пользователи твои действия и заметки не видят.\n\nАвтолайки сейчас выключены. /disconnect останавливает доступ к Jardulik, /delete удаляет твои данные из рабочей базы.\n\nПолитика: https://kostia7alania.ru/jardulik-companion-site/privacy.html", nil)
 	case "/help":
 		_ = s.say(ctx, owner, connectHelp+"\n/next /status /favorites /history /pause /disconnect /delete\nСвязаться с оператором: /support текст", nil)
 	case "/support":
@@ -294,6 +305,13 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 			s.history(ctx, owner, id)
 		} else {
 			s.list(ctx, owner, false)
+		}
+	case "/text":
+		if len(fields) > 1 {
+			id, _ := strconv.ParseInt(fields[1], 10, 64)
+			if p, err := s.Store.Profile(ctx, owner, id); err == nil {
+				s.fullText(ctx, owner, p)
+			}
 		}
 	case "/pause":
 		s.Store.Pause(ctx, owner, true)
@@ -384,9 +402,7 @@ func accountSummary(p Profile) string {
 	}
 	end := p.String("orderEndDate")
 	if end != "" {
-		if t, err := time.Parse(time.RFC3339, end); err == nil {
-			end = t.In(time.FixedZone("МСК", 3*3600)).Format("02.01.2006 15:04 МСК")
-		}
+		end = displayTime(end)
 	}
 	result := fmt.Sprintf("Jardulik ID %d, %s", p.ID(), tier)
 	if end != "" {
@@ -463,11 +479,13 @@ func profileText(p StoredProfile) string {
 	}
 	fmt.Fprintf(&b, "\nJardulik #%d\n", p.ID)
 	for _, f := range []struct{ Key, Label string }{{"surName", "Фамилия"}, {"country", "Страна"}, {"city", "Город"}, {"height", "Рост"}, {"goal", "Цель"}, {"worldview", "Мировоззрение"}, {"children", "Дети"}, {"profession", "Занятие"}, {"familyNames", "Родственные фамилии"}, {"languages", "Языки"}, {"description", "О себе"}} {
-		if val := v.String(f.Key); val != "" && val != "null" {
+		if val := profileValue(v, f.Key); val != "" {
 			fmt.Fprintf(&b, "\n%s: %s", f.Label, val)
 		}
 	}
-	fmt.Fprintf(&b, "\n\nСнимок: %s UTC\nИстория: /history %d", p.LastSeen, p.ID)
+	if p.LastSeen != "" {
+		fmt.Fprintf(&b, "\n\n%s", displayTime(p.LastSeen))
+	}
 	return b.String()
 }
 func (s *Service) Deliver(ctx context.Context, owner int64, p StoredProfile) error {
@@ -486,59 +504,12 @@ func (s *Service) Deliver(ctx context.Context, owner int64, p StoredProfile) err
 		b, _ := json.Marshal(ids)
 		_, _ = s.Store.DB.ExecContext(context.WithoutCancel(ctx), "UPDATE deliveries SET state=?,message_ids=? WHERE id=?", state, string(b), deliveryID)
 	}()
-	jobs, err := s.Store.MediaJobs(ctx, owner, p.VersionID)
+	ids, err = s.sendProfileCard(ctx, owner, p)
 	if err != nil {
 		return err
 	}
-	hasFull := false
-	for _, j := range jobs {
-		if j.Role == "photos" && j.State == "complete" {
-			hasFull = true
-		}
-	}
-	for _, j := range jobs {
-		if j.State != "complete" || (hasFull && j.Role != "photos") {
-			continue
-		}
-		var msg SentMessage
-		var err error
-		if j.Size > 9<<20 {
-			msg, err = s.TG.SendDocument(ctx, owner, 0, j.Path, fmt.Sprintf("Фото анкеты #%d", p.ID))
-		} else {
-			msg, err = s.TG.SendPhoto(ctx, owner, 0, j.Path, "")
-			var rejected *TelegramError
-			if errors.As(err, &rejected) && rejected.Code == 400 {
-				msg, err = s.TG.SendDocument(ctx, owner, 0, j.Path, fmt.Sprintf("Исходное фото анкеты #%d", p.ID))
-			}
-		}
-		if err != nil {
-			return err
-		}
-		ids = append(ids, msg.ID)
-		if !sleep(ctx, 1100*time.Millisecond) {
-			return ctx.Err()
-		}
-	}
-	buttons := map[string]any{"inline_keyboard": [][]map[string]string{{{"text": "В избранное", "callback_data": fmt.Sprintf("f:%d", p.ID)}, {"text": "История", "callback_data": fmt.Sprintf("h:%d", p.ID)}}, {{"text": "Следующая анкета", "callback_data": "next"}}}}
-	text := profileText(p)
-	runes := []rune(text)
-	for len(runes) > 0 {
-		n := min(len(runes), 3500)
-		var keyboard any
-		if n == len(runes) {
-			keyboard = buttons
-		}
-		msg, err := s.TG.SendText(ctx, owner, 0, string(runes[:n]), keyboard)
-		if err != nil {
-			return err
-		}
-		ids = append(ids, msg.ID)
-		runes = runes[n:]
-		if len(runes) > 0 && !sleep(ctx, time.Second) {
-			return ctx.Err()
-		}
-	}
 	state = "sent"
+	_ = s.Store.SetMeta(ctx, fmt.Sprintf("card_layout:%d", deliveryID), "v2")
 	s.Store.Delivered(ctx, owner, p.ID)
 	s.Store.Event(ctx, owner, "card_delivered")
 	return nil
@@ -567,7 +538,7 @@ func (s *Service) history(ctx context.Context, owner, id int64) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Анкета #%d: %s\nВерсий в этой выборке: %d\n", id, a[0].Profile.String("name"), len(a))
 	for i, p := range a {
-		fmt.Fprintf(&b, "\n%s UTC", p.LastSeen)
+		fmt.Fprintf(&b, "\n%s", displayTime(p.LastSeen))
 		if i+1 < len(a) {
 			var changed []string
 			for _, key := range []string{"name", "age", "city", "description", "familyNames", "height", "goal", "worldview", "profession", "children", "photos", "miniPhotos"} {

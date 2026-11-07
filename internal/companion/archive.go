@@ -58,6 +58,11 @@ CREATE TABLE IF NOT EXISTS archive_versions (
  message_ids TEXT NOT NULL DEFAULT '[]', source_sha TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS archive_profile_repairs (
+ version_id INTEGER PRIMARY KEY, state TEXT NOT NULL, old_message_ids TEXT NOT NULL,
+ new_message_ids TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT '',
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS archive_backups (
  id INTEGER PRIMARY KEY, requested_at TEXT NOT NULL, state TEXT NOT NULL, path TEXT NOT NULL DEFAULT '',
  source_sha TEXT NOT NULL DEFAULT '', encrypted_sha TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
@@ -120,9 +125,9 @@ func (a *Archiver) BackupStatus(ctx context.Context) string {
 		return "Бэкап ещё не запрашивался"
 	}
 	if detail != "" {
-		return fmt.Sprintf("Бэкап: %s, %s (%s)", state, created, detail)
+		return fmt.Sprintf("Бэкап: %s, %s (%s)", state, displayTime(created), detail)
 	}
-	return fmt.Sprintf("Бэкап: %s, %s", state, created)
+	return fmt.Sprintf("Бэкап: %s, %s", state, displayTime(created))
 }
 
 func (a *Archiver) Run(ctx context.Context) {
@@ -143,6 +148,7 @@ func (a *Archiver) Run(ctx context.Context) {
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_topic_jobs SET state='uncertain',error='worker_restarted_during_request' WHERE state='processing'")
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='uncertain',error='worker_restarted_during_request' WHERE state='processing'")
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_backups SET state='uncertain',error='worker_restarted_during_request' WHERE state='processing'")
+	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE meta SET value='uncertain' WHERE key='archive_repair_requested' AND value='processing'")
 	for ctx.Err() == nil {
 		a.mu.Lock()
 		err = a.processOne(ctx)
@@ -227,6 +233,9 @@ func (a *Archiver) groupCall(ctx context.Context, call func() error) error {
 }
 
 func (a *Archiver) processOne(ctx context.Context) error {
+	if handled, err := a.processQueuedRepair(ctx); handled || err != nil {
+		return err
+	}
 	if a.Config.BackupChatID == 0 || a.Config.BackupThreadID <= 0 {
 		return nil
 	}
@@ -628,23 +637,179 @@ func (a *Archiver) receipt(ctx context.Context, sourceSHA, kind, path, encrypted
 	return err
 }
 
-func moderationText(p StoredProfile, sha string, missing int) string {
-	var lines []string
-	lines = append(lines, fmt.Sprintf("Jardulik: %s, анкета %d, версия %d", p.Profile.String("name"), p.ID, p.VersionID))
-	for _, key := range []string{"age", "country", "city", "height", "goal", "worldview", "children", "profession", "familyNames", "languages"} {
-		if v := p.Profile.String(key); v != "" {
-			lines = append(lines, key+": "+truncateRunes(v, 300))
+func moderationText(p StoredProfile, _ string, missing int) string {
+	text := profileText(p) + fmt.Sprintf("\nВерсия архива: %d", p.VersionID)
+	if missing > 0 {
+		text += fmt.Sprintf("\nНедоступных исходных фото: %d. Подробности в ZIP.", missing)
+	}
+	return text
+}
+
+func archiveProfileKeyboard(version int64) any {
+	return map[string]any{"inline_keyboard": [][]map[string]string{{
+		{"text": "Полный текст", "callback_data": fmt.Sprintf("av:%d", version)},
+		{"text": "Исходные файлы ZIP", "callback_data": fmt.Sprintf("az:%d", version)},
+	}}}
+}
+
+// Each profile topic keeps its whole original ZIP followed by the visible card.
+// Telegram limits albums to ten files, so larger profiles use consecutive groups.
+func (a *Archiver) sendProfileCard(ctx context.Context, p StoredProfile, jobs []MediaJob, thread int64, save func([]int64) error) ([]int64, error) {
+	missing := 0
+	hasFull := false
+	for _, j := range jobs {
+		if j.State != "complete" || j.SHA == "" {
+			missing++
+		}
+		if j.Role == "photos" && j.State == "complete" && j.SHA != "" {
+			hasFull = true
 		}
 	}
-	if text := p.Profile.String("description"); text != "" {
-		lines = append(lines, "", truncateRunes(text, 1800))
+	selected := make([]MediaJob, 0, len(jobs))
+	for _, j := range jobs {
+		if j.State != "complete" || j.SHA == "" || (hasFull && j.Role != "photos") || (!hasFull && j.Role != "miniPhotos") {
+			continue
+		}
+		selected = append(selected, j)
 	}
-	lines = append(lines, "", "Наблюдение: "+p.LastSeen, "Источник: Jardulik API; отсутствие в выдаче не доказывает удаление.", "ZIP с исходными файлами: SHA-256 "+sha)
-	if missing > 0 {
-		lines = append(lines, fmt.Sprintf("Исходные фото не полностью доступны: %d. Пробелы указаны в манифесте.", missing))
+	// Reject a known local limitation before creating part of the replacement.
+	for _, j := range selected {
+		path, err := a.mediaSourcePath(j.SHA)
+		if err != nil {
+			return nil, err
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, errors.New("profile photo is not a readable local file; original retained in ZIP")
+		}
+		if info.Size() > 9<<20 {
+			return nil, errors.New("photo exceeds Telegram preview upload budget; original retained in profile ZIP")
+		}
 	}
-	lines = append(lines, "#Jardulik #анкеты #архив")
-	return truncateRunes(strings.Join(lines, "\n"), 3950)
+	sort.SliceStable(selected, func(i, j int) bool { return selected[i].Position < selected[j].Position })
+	text := moderationText(p, "", missing)
+	caption := profileCaption(text)
+	keyboard := archiveProfileKeyboard(p.VersionID)
+	var ids []int64
+	record := func(messages []SentMessage) error {
+		for _, m := range messages {
+			if m.ID <= 0 {
+				return errors.New("profile card accepted without message id")
+			}
+			ids = append(ids, m.ID)
+		}
+		return save(ids)
+	}
+	if len(selected) == 0 {
+		body := text + "\nФото пока недоступны."
+		if prefix, rest := telegramPrefix(body, 4096); rest != "" {
+			const tail = "\n\nПолный текст по кнопке."
+			body = truncateRunes(prefix, 4096-len([]rune(tail))) + tail
+		}
+		var m SentMessage
+		err := a.groupCall(ctx, func() (err error) {
+			m, err = a.TG.SendText(ctx, a.Config.BackupChatID, thread, body, keyboard)
+			return err
+		})
+		if err != nil {
+			return ids, err
+		}
+		err = record([]SentMessage{m})
+		return ids, err
+	}
+	first := true
+	for i := 0; i < len(selected); {
+		end := i
+		for end < len(selected) && end-i < 10 && selected[end].Size <= 9<<20 {
+			end++
+		}
+		if end-i >= 2 {
+			paths := make([]string, 0, end-i)
+			for _, j := range selected[i:end] {
+				path, err := a.mediaSourcePath(j.SHA)
+				if err != nil {
+					return ids, err
+				}
+				paths = append(paths, path)
+			}
+			groupCaption := ""
+			if first {
+				groupCaption = caption
+			}
+			var album []SentMessage
+			err := a.groupCall(ctx, func() (err error) {
+				album, err = a.TG.SendAlbum(ctx, a.Config.BackupChatID, thread, paths, groupCaption)
+				return err
+			})
+			if err == nil {
+				if len(album) != len(paths) {
+					return ids, errors.New("profile album returned an incomplete message inventory")
+				}
+				if err = record(album); err != nil {
+					return ids, err
+				}
+				if first {
+					var accepted SentMessage
+					err = a.groupCall(ctx, func() error {
+						return a.TG.Call(ctx, "editMessageReplyMarkup", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": ids[0], "reply_markup": keyboard}, &accepted)
+					})
+					if err != nil {
+						return ids, err
+					}
+					if accepted.ID != ids[0] {
+						return ids, errors.New("profile keyboard edit unconfirmed")
+					}
+				}
+				first = false
+				i = end
+				continue
+			}
+			if len(album) > 0 {
+				var known []SentMessage
+				for _, m := range album {
+					if m.ID > 0 && m.Chat.ID == a.Config.BackupChatID {
+						known = append(known, m)
+					}
+				}
+				if len(known) > 0 {
+					if saveErr := record(known); saveErr != nil {
+						return ids, errors.Join(err, saveErr)
+					}
+				}
+				return ids, err
+			}
+			return ids, err
+		}
+
+		j := selected[i]
+		path, err := a.mediaSourcePath(j.SHA)
+		if err != nil {
+			return ids, err
+		}
+		thisCaption := ""
+		var buttons any
+		if first {
+			thisCaption = caption
+			buttons = keyboard
+		}
+		var m SentMessage
+		if j.Size > 9<<20 {
+			return ids, errors.New("photo exceeds Telegram preview upload budget; original retained in profile ZIP")
+		}
+		err = a.groupCall(ctx, func() (err error) {
+			m, err = a.TG.SendPhotoCard(ctx, a.Config.BackupChatID, thread, path, thisCaption, buttons)
+			return err
+		})
+		if err != nil {
+			return ids, err
+		}
+		if err = record([]SentMessage{m}); err != nil {
+			return ids, err
+		}
+		first = false
+		i++
+	}
+	return ids, nil
 }
 
 func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) error {
@@ -697,7 +862,7 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 	var document SentMessage
 	err = a.groupCall(ctx, func() error {
 		var e error
-		document, e = a.TG.SendDocument(ctx, a.Config.BackupChatID, thread, path, fmt.Sprintf("Jardulik %d, версия %d. Целый исходный архив. SHA-256 %s", p.ID, p.VersionID, sha))
+		document, e = a.TG.SendDocument(ctx, a.Config.BackupChatID, thread, path, fmt.Sprintf("Jardulik %d, версия %d. Целый исходный архив.\nSHA-256 %s\nУстройство: %s\nИсточник: Jardulik API; снимок %s", p.ID, p.VersionID, sha, manifest.CaptureDevice, displayTime(p.LastSeen)))
 		return e
 	})
 	if err == nil {
@@ -711,74 +876,27 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 		_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=?", state, archiveErrorCode(err), version)
 		return err
 	}
-	ids := []int64{document.ID}
-	saveIDs := func() {
+	saveIDs := func(ids []int64) error {
 		b, _ := json.Marshal(ids)
-		_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET message_ids=? WHERE version_id=?", string(b), version)
-	}
-	saveIDs()
-	missing := 0
-	for _, j := range jobs {
-		if j.State != "complete" {
-			missing++
-		}
-	}
-	var post SentMessage
-	err = a.groupCall(ctx, func() error {
-		var e error
-		post, e = a.TG.SendText(ctx, a.Config.BackupChatID, thread, moderationText(p, sha, missing), nil)
+		_, e := a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET message_ids=? WHERE version_id=?", string(b), version)
 		return e
-	})
+	}
+	ids, err := a.sendProfileCard(ctx, p, jobs, thread, saveIDs)
 	if err != nil {
-		_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='uncertain',error='document_sent_metadata_unconfirmed' WHERE version_id=?", version)
+		_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='uncertain',error='source_zip_sent_card_unconfirmed',updated_at=CURRENT_TIMESTAMP WHERE version_id=?", version)
 		return err
 	}
-	ids = append(ids, post.ID)
-	saveIDs()
-	seen := map[string]bool{}
-	previews := 0
-	previewErrors := 0
+	missing := 0
 	for _, j := range jobs {
-		if previews >= 3 {
-			break
+		if j.State != "complete" || j.SHA == "" {
+			missing++
 		}
-		if j.State != "complete" || seen[j.SHA] || j.Size >= 9<<20 {
-			continue
-		}
-		if j.Role != "photos" && len(p.Profile.Photos("photos")) > 0 {
-			continue
-		}
-		seen[j.SHA] = true
-		mediaPath, e := a.mediaSourcePath(j.SHA)
-		if e != nil {
-			return e
-		}
-		var preview SentMessage
-		err = a.groupCall(ctx, func() error {
-			var e error
-			preview, e = a.TG.SendPhoto(ctx, a.Config.BackupChatID, thread, mediaPath, "Превью; точные исходные байты находятся в ZIP.")
-			return e
-		})
-		if err != nil {
-			previewErrors++
-			var te *TelegramError
-			if !errors.As(err, &te) {
-				break
-			}
-			continue
-		}
-		ids = append(ids, preview.ID)
-		previews++
-		saveIDs()
 	}
 	state := "sent"
 	detail := ""
 	if missing > 0 {
 		state = "partial"
 		detail = "source_media_missing"
-	}
-	if previewErrors > 0 {
-		detail = "source_zip_sent_preview_incomplete"
 	}
 	idsJSON, _ := json.Marshal(ids)
 	tx, err := a.Store.DB.BeginTx(ctx, nil)
@@ -792,11 +910,262 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO mirror_posts(fingerprint,profile_id,thread_id,message_ids) VALUES(?,?,?,?)", fp, p.ID, thread, string(idsJSON)); err != nil {
 		return err
 	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids) VALUES(?,'sent','[]',?)", version, string(idsJSON)); err != nil {
+		return err
+	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	_ = manifest // The complete manifest is retained inside the uploaded ZIP.
 	return os.Remove(path)
+}
+
+// RequestProfileRepair queues one maintenance pass for the existing worker.
+// A completed request may be queued again; unresolved outcomes need an operator.
+func (a *Archiver) RequestProfileRepair(ctx context.Context) error {
+	if err := a.init(ctx); err != nil {
+		return err
+	}
+	var unresolved int
+	if err := a.Store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM archive_profile_repairs WHERE state<>'sent'").Scan(&unresolved); err != nil {
+		return err
+	}
+	if unresolved > 0 {
+		return errors.New("profile repairs require operator reconciliation before another request")
+	}
+	result, err := a.Store.DB.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES('archive_repair_requested','pending') ON CONFLICT(key) DO UPDATE SET value='pending' WHERE value='done'")
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	var state string
+	if err = a.Store.DB.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='archive_repair_requested'").Scan(&state); err != nil {
+		return err
+	}
+	if state == "pending" {
+		return nil
+	}
+	return fmt.Errorf("profile repair request is %s; reconcile it before requesting another pass", state)
+}
+
+// Only the sole archive worker calls this, between complete normal operations.
+func (a *Archiver) processQueuedRepair(ctx context.Context) (bool, error) {
+	result, err := a.Store.DB.ExecContext(ctx, "UPDATE meta SET value='processing' WHERE key='archive_repair_requested' AND value='pending'")
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil || count == 0 {
+		return false, err
+	}
+	err = a.repairProfilePostsLocked(ctx)
+	state := "done"
+	finishCtx := context.WithoutCancel(ctx)
+	if err != nil {
+		state = "error"
+		var unknown int
+		if scanErr := a.Store.DB.QueryRowContext(finishCtx, "SELECT COUNT(*) FROM archive_profile_repairs WHERE state='uncertain'").Scan(&unknown); scanErr != nil || unknown > 0 || ctx.Err() != nil {
+			state = "uncertain"
+		}
+	} else if ctx.Err() != nil {
+		state = "uncertain"
+		err = ctx.Err()
+	}
+	if saveErr := a.Store.SetMeta(finishCtx, "archive_repair_requested", state); saveErr != nil {
+		return true, errors.Join(err, saveErr)
+	}
+	return true, err
+}
+
+// RepairProfilePosts retains each recorded whole ZIP and replaces only its
+// legacy text/photo messages. Unknown outcomes always require reconciliation.
+func (a *Archiver) RepairProfilePosts(ctx context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.Config.BackupChatID == 0 || a.Config.BackupThreadID <= 0 {
+		return errors.New("archive chat and service snapshot topic are required")
+	}
+	lock, err := os.OpenFile(filepath.Join(a.Config.DataDir, "archive-worker.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err = syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return errors.New("archive worker is active; stop the service before repairing profile posts")
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return a.repairProfilePostsLocked(ctx)
+}
+
+// Caller owns the worker mutex and file lock throughout every external call.
+func (a *Archiver) repairProfilePostsLocked(ctx context.Context) error {
+	if a.Config.BackupChatID == 0 || a.Config.BackupThreadID <= 0 {
+		return errors.New("archive chat and service snapshot topic are required")
+	}
+	if err := a.init(ctx); err != nil {
+		return err
+	}
+	if _, err := a.Store.DB.ExecContext(ctx, "UPDATE archive_profile_repairs SET state='uncertain',error='repair_restarted_during_request' WHERE state IN ('editing_zip','sending','deleting')"); err != nil {
+		return err
+	}
+	rows, err := a.Store.DB.QueryContext(ctx, `SELECT av.version_id FROM archive_versions av
+ JOIN archive_receipts r ON r.source_sha=av.source_sha
+ LEFT JOIN archive_profile_repairs repair ON repair.version_id=av.version_id
+ WHERE av.state IN ('sent','partial') AND r.kind='profile_version' AND repair.version_id IS NULL ORDER BY av.version_id`)
+	if err != nil {
+		return err
+	}
+	var versions []int64
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		versions = append(versions, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, version := range versions {
+		if err = a.repairProfilePost(ctx, version); err != nil {
+			failures = append(failures, fmt.Errorf("profile version %d: %w", version, err))
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	var unresolved int
+	if err = a.Store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM archive_profile_repairs WHERE state<>'sent'").Scan(&unresolved); err != nil {
+		failures = append(failures, err)
+	} else if unresolved > 0 {
+		failures = append(failures, fmt.Errorf("%d profile repairs require operator reconciliation; inspect archive_profile_repairs before retrying", unresolved))
+	}
+	return errors.Join(failures...)
+}
+
+func (a *Archiver) repairProfilePost(ctx context.Context, version int64) (retErr error) {
+	var owner, thread, receiptChat, receiptThread, receiptMessage int64
+	var sourceSHA, oldJSON, sentAt, fingerprint string
+	err := a.Store.DB.QueryRowContext(ctx, `SELECT av.owner_id,av.thread_id,av.source_sha,av.message_ids,av.fingerprint,r.chat_id,r.thread_id,r.message_id,r.sent_at
+ FROM archive_versions av JOIN archive_receipts r ON r.source_sha=av.source_sha WHERE av.version_id=?`, version).Scan(&owner, &thread, &sourceSHA, &oldJSON, &fingerprint, &receiptChat, &receiptThread, &receiptMessage, &sentAt)
+	if err != nil {
+		return err
+	}
+	if thread <= 0 || thread == a.Config.BackupThreadID || receiptChat != a.Config.BackupChatID || receiptThread != thread || receiptMessage <= 0 {
+		return errors.New("legacy receipt does not identify the recorded profile topic")
+	}
+	var oldIDs []int64
+	if err = json.Unmarshal([]byte(oldJSON), &oldIDs); err != nil || len(oldIDs) == 0 {
+		return errors.New("legacy profile message inventory is missing")
+	}
+	seen := make(map[int64]bool)
+	var deleteIDs []int64
+	for _, id := range oldIDs {
+		if id <= 0 || seen[id] {
+			return errors.New("legacy profile message inventory is invalid")
+		}
+		seen[id] = true
+		if id != receiptMessage {
+			deleteIDs = append(deleteIDs, id)
+		}
+	}
+	if !seen[receiptMessage] {
+		return errors.New("legacy ZIP is absent from the profile message inventory")
+	}
+	// Telegram cannot delete ordinary messages older than 48 hours. Do not create
+	// a second card when the old presentation cannot be removed safely.
+	var created time.Time
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05"} {
+		created, err = time.Parse(layout, sentAt)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil || a.now().Sub(created) >= 48*time.Hour || created.After(a.now().Add(time.Minute)) {
+		return errors.New("legacy messages are outside the verified 48-hour deletion window")
+	}
+	p, err := a.Store.Version(ctx, owner, version)
+	if err != nil {
+		return err
+	}
+	jobs, err := a.Store.MediaJobs(ctx, owner, version)
+	if err != nil {
+		return err
+	}
+	if _, err = a.Store.DB.ExecContext(ctx, "INSERT INTO archive_profile_repairs(version_id,state,old_message_ids) VALUES(?,'editing_zip',?)", version, oldJSON); err != nil {
+		return err
+	}
+	defer func() {
+		if retErr != nil {
+			_, _ = a.Store.DB.ExecContext(context.WithoutCancel(ctx), "UPDATE archive_profile_repairs SET state='uncertain',error=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=? AND state<>'sent'", archiveErrorCode(retErr), version)
+		}
+	}()
+	var edited SentMessage
+	caption := fmt.Sprintf("Jardulik %d, версия %d. Целый исходный архив.\nSHA-256 %s\nИсточник: Jardulik API; снимок %s\nTelegram: ZIP сохранён %s", p.ID, p.VersionID, sourceSHA, displayTime(p.LastSeen), displayTime(sentAt))
+	err = a.groupCall(ctx, func() error {
+		return a.TG.Call(ctx, "editMessageCaption", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": receiptMessage, "caption": caption}, &edited)
+	})
+	if err != nil {
+		return err
+	}
+	if edited.ID != receiptMessage {
+		return errors.New("source ZIP caption edit unconfirmed")
+	}
+	if _, err = a.Store.DB.ExecContext(ctx, "UPDATE archive_profile_repairs SET state='sending',updated_at=CURRENT_TIMESTAMP WHERE version_id=?", version); err != nil {
+		return err
+	}
+	save := func(ids []int64) error {
+		b, _ := json.Marshal(ids)
+		_, e := a.Store.DB.ExecContext(ctx, "UPDATE archive_profile_repairs SET new_message_ids=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=?", string(b), version)
+		return e
+	}
+	ids, err := a.sendProfileCard(ctx, p, jobs, thread, save)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return errors.New("replacement profile card is unconfirmed")
+	}
+	if _, err = a.Store.DB.ExecContext(ctx, "UPDATE archive_profile_repairs SET state='deleting',updated_at=CURRENT_TIMESTAMP WHERE version_id=?", version); err != nil {
+		return err
+	}
+	for _, id := range deleteIDs {
+		var deleted bool
+		if err = a.groupCall(ctx, func() error {
+			return a.TG.Call(ctx, "deleteMessage", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": id}, &deleted)
+		}); err != nil {
+			return err
+		}
+		if !deleted {
+			return errors.New("old profile message deletion unconfirmed")
+		}
+	}
+	newJSON, _ := json.Marshal(ids)
+	tx, err := a.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE archive_versions SET message_ids=?,error='',updated_at=CURRENT_TIMESTAMP WHERE version_id=?", string(newJSON), version); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE mirror_posts SET message_ids=? WHERE fingerprint=? AND thread_id=?", string(newJSON), fingerprint, thread); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE archive_profile_repairs SET state='sent',error='',updated_at=CURRENT_TIMESTAMP WHERE version_id=?", version); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (a *Archiver) allReceipts(ctx context.Context, db *sql.DB) ([]archiveReceipt, error) {
@@ -1027,7 +1396,7 @@ func (a *Archiver) processBackup(ctx context.Context, id int64) error {
 		return err
 	}
 	_ = os.Remove(path) // A plaintext recovery configuration is never left after encryption and delivery.
-	text := fmt.Sprintf("Jardulik Companion: снимок сервиса\nСнято: %s\nВерсия: %s; устройство: %s; %s/%s\nДокумент принят Telegram: chat=%d, topic=%d, message=%d\nSHA-256 исходного ZIP: %s\nSHA-256 зашифрованного файла: %s\nФото в ZIP: %v; ожидают загрузки: %v; ошибки фото: %v; версии без полного TG-архива: %v.\nМанифест содержит исходные хэши и Telegram IDs. Это не проверка байтов на сервере Telegram.\n#Jardulik #бэкап #восстановление", manifest.CapturedAt, Version, manifest.CaptureDevice, manifest.OS, manifest.Architecture, a.Config.BackupChatID, a.Config.BackupThreadID, sent.ID, sourceSHA, encryptedSHA, manifest.Coverage["media_embedded"], manifest.Coverage["pending_media"], manifest.Coverage["failed_media"], manifest.Coverage["versions_without_complete_telegram_archive"])
+	text := fmt.Sprintf("Jardulik Companion: снимок сервиса\nСнято: %s\nВерсия: %s; устройство: %s; %s/%s\nДокумент принят Telegram: chat=%d, topic=%d, message=%d\nSHA-256 исходного ZIP: %s\nSHA-256 зашифрованного файла: %s\nФото в ZIP: %v; ожидают загрузки: %v; ошибки фото: %v; версии без полного TG-архива: %v.\nМанифест содержит исходные хэши и Telegram IDs. Это не проверка байтов на сервере Telegram.\n#Jardulik #бэкап #восстановление", displayTime(manifest.CapturedAt), Version, manifest.CaptureDevice, manifest.OS, manifest.Architecture, a.Config.BackupChatID, a.Config.BackupThreadID, sent.ID, sourceSHA, encryptedSHA, manifest.Coverage["media_embedded"], manifest.Coverage["pending_media"], manifest.Coverage["failed_media"], manifest.Coverage["versions_without_complete_telegram_archive"])
 	var companion SentMessage
 	err = a.groupCall(ctx, func() error {
 		var e error

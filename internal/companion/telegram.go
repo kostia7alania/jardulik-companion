@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Telegram struct {
@@ -120,7 +121,18 @@ func (t *Telegram) Call(ctx context.Context, method string, payload, out any) er
 	return t.decode(res, out)
 }
 func (t *Telegram) Upload(ctx context.Context, method string, chat, thread int64, path, caption, field string) (SentMessage, error) {
+	return t.upload(ctx, method, chat, thread, path, caption, field, nil)
+}
+func (t *Telegram) upload(ctx context.Context, method string, chat, thread int64, path, caption, field string, keyboard any) (SentMessage, error) {
 	var out SentMessage
+	var markup []byte
+	if keyboard != nil {
+		var err error
+		markup, err = json.Marshal(keyboard)
+		if err != nil {
+			return out, err
+		}
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return out, err
@@ -158,6 +170,12 @@ func (t *Telegram) Upload(ctx context.Context, method string, chat, thread int64
 				return
 			}
 		}
+		if markup != nil {
+			if err := multipartWriter.WriteField("reply_markup", string(markup)); err != nil {
+				fail(err)
+				return
+			}
+		}
 		part, err := multipartWriter.CreateFormFile(field, filepath.Base(path))
 		if err == nil {
 			_, err = io.Copy(part, file)
@@ -190,6 +208,136 @@ func (t *Telegram) SendDocument(ctx context.Context, chat, thread int64, path, c
 func (t *Telegram) SendPhoto(ctx context.Context, chat, thread int64, path, caption string) (SentMessage, error) {
 	return t.Upload(ctx, "sendPhoto", chat, thread, path, caption, "photo")
 }
+func (t *Telegram) SendPhotoCard(ctx context.Context, chat, thread int64, path, caption string, keyboard any) (SentMessage, error) {
+	return t.upload(ctx, "sendPhoto", chat, thread, path, caption, "photo", keyboard)
+}
+func (t *Telegram) SendDocumentCard(ctx context.Context, chat, thread int64, path, caption string, keyboard any) (SentMessage, error) {
+	return t.upload(ctx, "sendDocument", chat, thread, path, caption, "document", keyboard)
+}
+
+// SendAlbum uploads local photos once. A transport error leaves delivery unknown.
+func (t *Telegram) SendAlbum(ctx context.Context, chat, thread int64, paths []string, caption string) (out []SentMessage, retErr error) {
+	if len(paths) < 2 || len(paths) > 10 {
+		return nil, errors.New("Telegram photo album requires 2 to 10 files")
+	}
+	if utf8.RuneCountInString(caption) > 1024 {
+		return nil, errors.New("Telegram album caption exceeds 1024 characters")
+	}
+	files := make([]*os.File, 0, len(paths))
+	defer func() {
+		for _, file := range files {
+			_ = file.Close()
+		}
+	}()
+	sizes := make([]int64, 0, len(paths))
+	media := make([]struct {
+		Type    string `json:"type"`
+		Media   string `json:"media"`
+		Caption string `json:"caption,omitempty"`
+	}, len(paths))
+	for i, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("Telegram album photo %d is not a readable local file", i+1)
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("Telegram album photo %d cannot be opened", i+1)
+		}
+		files = append(files, file)
+		info, err = file.Stat()
+		if err != nil || !info.Mode().IsRegular() || info.Size() > 9<<20 {
+			return nil, fmt.Errorf("Telegram album photo %d must be a regular file of at most 9 MiB", i+1)
+		}
+		sizes = append(sizes, info.Size())
+		media[i].Type = "photo"
+		media[i].Media = "attach://photo" + strconv.Itoa(i)
+	}
+	media[0].Caption = caption
+	mediaJSON, err := json.Marshal(media)
+	if err != nil {
+		return nil, errors.New("invalid Telegram album media")
+	}
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	reader, writer := io.Pipe()
+	mw := multipart.NewWriter(writer)
+	r, err := http.NewRequestWithContext(uploadCtx, "POST", t.Base+"/bot"+t.Token+"/sendMediaGroup", reader)
+	if err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		return nil, errors.New("invalid Telegram album request")
+	}
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	written := make(chan error, 1)
+	go func() {
+		err := func() error {
+			if err := mw.WriteField("chat_id", strconv.FormatInt(chat, 10)); err != nil {
+				return err
+			}
+			if thread > 0 {
+				if err := mw.WriteField("message_thread_id", strconv.FormatInt(thread, 10)); err != nil {
+					return err
+				}
+			}
+			if err := mw.WriteField("media", string(mediaJSON)); err != nil {
+				return err
+			}
+			for i, file := range files {
+				part, err := mw.CreateFormFile("photo"+strconv.Itoa(i), filepath.Base(paths[i]))
+				if err != nil {
+					return err
+				}
+				if _, err = io.CopyN(part, file, sizes[i]); err != nil {
+					return err
+				}
+			}
+			return mw.Close()
+		}()
+		_ = writer.CloseWithError(err)
+		written <- err
+	}()
+	defer func() {
+		cancel()
+		_ = reader.Close()
+		if err := <-written; retErr == nil && err != nil {
+			retErr = errors.New("Telegram album upload interrupted; delivery outcome unknown")
+		}
+	}()
+	uploadClient := *t.HTTP
+	uploadClient.Timeout = 3 * time.Minute
+	res, err := uploadClient.Do(r)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("Telegram album transport: %w", ctx.Err())
+		}
+		return nil, errors.New("Telegram album transport failed; delivery outcome unknown")
+	}
+	if err = t.decode(res, &out); err != nil {
+		var rejected *TelegramError
+		if errors.As(err, &rejected) {
+			description := rejected.Description
+			if t.Token != "" {
+				description = strings.ReplaceAll(description, t.Token, "[redacted]")
+				description = strings.ReplaceAll(description, url.QueryEscape(t.Token), "[redacted]")
+			}
+			return out, &TelegramError{Code: rejected.Code, Description: description, RetryAfter: rejected.RetryAfter}
+		}
+		return out, errors.New("Telegram album response interrupted or invalid; delivery outcome unknown")
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 || len(out) != len(paths) {
+		return out, errors.New("Telegram album response incomplete; delivery outcome unknown")
+	}
+	seen := make(map[int64]bool, len(out))
+	for _, message := range out {
+		if message.ID <= 0 || message.Chat.ID != chat || seen[message.ID] {
+			return out, errors.New("Telegram album message receipt invalid; delivery outcome unknown")
+		}
+		seen[message.ID] = true
+	}
+	return out, nil
+}
+
 func (t *Telegram) SendText(ctx context.Context, chat, thread int64, text string, keyboard any) (SentMessage, error) {
 	var out SentMessage
 	p := map[string]any{"chat_id": chat, "text": text, "link_preview_options": map[string]bool{"is_disabled": true}}
