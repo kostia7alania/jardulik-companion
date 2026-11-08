@@ -248,6 +248,9 @@ func (c *FeedCrawler) Request(ctx context.Context, owner int64, includeOthers bo
 	if _, err = tx.ExecContext(ctx, "DELETE FROM feed_crawl_pages WHERE owner_id=?", owner); err != nil {
 		return nil, err
 	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM meta WHERE key=?", crawlRetryKey(owner)); err != nil {
+		return nil, err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO feed_crawls(owner_id,run_id,upstream_id,generation,filters_json,include_others,include_locations,next_request,state,started_at,updated_at)
 	 VALUES(?,?,?,?,?,?,?,?,'queued',?,?)
 	 ON CONFLICT(owner_id) DO UPDATE SET run_id=excluded.run_id,upstream_id=excluded.upstream_id,generation=excluded.generation,
@@ -354,6 +357,111 @@ func crawlErrorReason(err error) string {
 		return fmt.Sprintf("http_%d", upstream.Status)
 	}
 	return "request_failed"
+}
+
+var errCrawlRetryObsolete = errors.New("crawl retry superseded")
+
+type crawlRetry struct {
+	RunID    string `json:"run_id"`
+	Mode     int    `json:"mode"`
+	Page     int    `json:"page"`
+	Target   int64  `json:"target"`
+	Failures int    `json:"failures"`
+}
+
+func crawlRetryKey(owner int64) string { return "feed_crawl_retry:" + strconv.FormatInt(owner, 10) }
+
+func crawlRetryableGET(err error) (*UpstreamError, bool) {
+	var upstream *UpstreamError
+	if !errors.As(err, &upstream) || upstream.Kind != "request_rejected" {
+		return nil, false
+	}
+	switch upstream.Status {
+	case 500, 502, 503, 504:
+	default:
+		return nil, false
+	}
+	switch upstream.Endpoint {
+	case "/user/getMe", "/user/getUsers", "/user/getUsersLocations", "/user/getUser":
+		return upstream, true
+	default:
+		return nil, false
+	}
+}
+
+// Only confirmed transient GET failures count; cancellation retains the normal resume path.
+func (c *FeedCrawler) retryGET(ctx context.Context, j *CrawlJob, target int64, upstream *UpstreamError) error {
+	tx, err := c.Service.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='feed_crawl_next'"); err != nil {
+		return err
+	}
+	var run, state string
+	var mode, page int
+	var paused bool
+	if err = tx.QueryRowContext(ctx, `SELECT j.run_id,j.state,j.mode,j.page,u.paused FROM feed_crawls j JOIN users u ON u.id=j.owner_id WHERE j.owner_id=?`, j.Owner).Scan(&run, &state, &mode, &page, &paused); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errCrawlRetryObsolete
+		}
+		return err
+	}
+	if run != j.RunID || (state != "queued" && state != "running") || mode != j.Mode || page != j.Page {
+		return errCrawlRetryObsolete
+	}
+	session, err := crawlSession(ctx, tx, c.Service.Store, j.Owner)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errCrawlRetryObsolete
+		}
+		return err
+	}
+	if paused || session.State != "connected" || session.Generation != j.Generation || session.UserID != j.UserID {
+		return errCrawlRetryObsolete
+	}
+	retry := crawlRetry{RunID: j.RunID, Mode: j.Mode, Page: j.Page, Target: target}
+	var raw string
+	err = tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", crawlRetryKey(j.Owner)).Scan(&raw)
+	if err == nil {
+		var previous crawlRetry
+		if json.Unmarshal([]byte(raw), &previous) != nil || previous.Failures < 1 || previous.Failures > 3 {
+			return errors.New("invalid crawl retry checkpoint")
+		}
+		if previous.RunID == retry.RunID && previous.Mode == retry.Mode && previous.Page == retry.Page && previous.Target == retry.Target {
+			retry.Failures = previous.Failures
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	retry.Failures++
+	if retry.Failures > 3 {
+		retry.Failures = 3
+	}
+	encoded, err := json.Marshal(retry)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", crawlRetryKey(j.Owner), string(encoded)); err != nil {
+		return err
+	}
+	if retry.Failures == 3 {
+		_, err = tx.ExecContext(ctx, "UPDATE feed_crawls SET state='stopped',reason=?,updated_at=? WHERE owner_id=? AND run_id=?", crawlErrorReason(upstream), c.now().UnixMilli(), j.Owner, j.RunID)
+	} else {
+		delay := time.Minute
+		if retry.Failures == 2 {
+			delay = 5 * time.Minute
+		}
+		if upstream.RetryAfter > delay {
+			delay = upstream.RetryAfter
+		}
+		_, err = tx.ExecContext(ctx, "UPDATE feed_crawls SET state='queued',reason=?,next_request=MAX(next_request,?),updated_at=? WHERE owner_id=? AND run_id=?", fmt.Sprintf("retry_http_%d", upstream.Status), c.now().Add(delay).UnixMilli(), c.now().UnixMilli(), j.Owner, j.RunID)
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Step handles at most one source page or catalog-proven full profile across all owners.
@@ -485,6 +593,18 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		return true, c.stop(ctx, j, reason)
 	}
 	if requestErr != nil && !(j.Mode == 3 && errors.Is(requestErr, ErrProfileUnavailable)) {
+		if upstream, retryable := crawlRetryableGET(requestErr); retryable {
+			if retryErr := c.retryGET(ctx, j, target, upstream); retryErr != nil {
+				if ctx.Err() != nil {
+					return true, ctx.Err()
+				}
+				if errors.Is(retryErr, errCrawlRetryObsolete) {
+					return true, nil
+				}
+				return true, errors.Join(retryErr, c.stop(ctx, j, "checkpoint_failed"))
+			}
+			return true, nil
+		}
 		return true, c.stop(ctx, j, crawlErrorReason(requestErr))
 	}
 	if err := s.Media.CheckDisk(); err != nil {
@@ -565,6 +685,9 @@ func (c *FeedCrawler) checkpointTx(ctx context.Context, j *CrawlJob, advance fun
 	_, err = tx.ExecContext(ctx, `UPDATE feed_crawls SET state=?,reason=?,mode=?,page=?,next_request=?,pages=?,received=?,catalog_pages=?,catalog_received=?,catalog_profiles=?,hydrated=?,unavailable=?,updated_at=? WHERE owner_id=? AND run_id=?`,
 		next.State, next.Reason, next.Mode, next.Page, next.NextRequest, next.Pages, next.Received, next.CatalogPages, next.CatalogReceived, next.CatalogProfiles, next.Hydrated, next.Unavailable, next.UpdatedAt, j.Owner, j.RunID)
 	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM meta WHERE key=?", crawlRetryKey(j.Owner)); err != nil {
 		return err
 	}
 	if next.State == "done" {
@@ -724,6 +847,9 @@ func (j CrawlJob) shortStatus() string {
 	text := fmt.Sprintf("Обход доступной выдачи: %s; %s, %s; пачек выдачи %d, записей %d.", state, mode, position, j.Pages, j.Received)
 	if j.IncludeLocations {
 		text += fmt.Sprintf(" Каталог: страниц %d, записей %d, разных ID %d; полных анкет %d, недоступных %d.", j.CatalogPages, j.CatalogReceived, j.CatalogProfiles, j.Hydrated, j.Unavailable)
+	}
+	if j.State == "queued" && (j.Reason == "retry_http_500" || j.Reason == "retry_http_502" || j.Reason == "retry_http_503" || j.Reason == "retry_http_504") {
+		return text + " Временная ошибка GET HTTP " + strings.TrimPrefix(j.Reason, "retry_http_") + "; повтор по нашему расписанию не раньше " + displayTime(time.UnixMilli(j.NextRequest).UTC().Format(time.RFC3339)) + "."
 	}
 	if j.Reason != "" && j.Reason != "empty_page" {
 		reason := map[string]string{

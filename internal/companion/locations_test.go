@@ -299,7 +299,7 @@ func TestCrawlLocationsRepeatAndCapsDoNotLimitHydrationCount(t *testing.T) {
 
 func TestCrawlLocationsGuardEveryRequestAndArchive(t *testing.T) {
 	for _, phase := range []int{2, 3} {
-		for _, kind := range []string{"premium", "pause-before", "pause-after", "session-before", "session-after", "403", "429", "500", "challenge", "disk-after", "wrong-id"} {
+		for _, kind := range []string{"premium", "pause-before", "pause-after", "session-before", "session-after", "403", "429", "400", "challenge", "disk-after", "wrong-id"} {
 			if phase == 2 && kind == "wrong-id" {
 				continue
 			}
@@ -342,7 +342,7 @@ func TestCrawlLocationsGuardEveryRequestAndArchive(t *testing.T) {
 						}
 					case "disk-after":
 						crawler.Service.Media.Config.MinFreeBytes = math.MaxUint64
-					case "403", "429", "500":
+					case "403", "429", "400":
 						status, _ := strconv.Atoi(kind)
 						w.WriteHeader(status)
 						fmt.Fprint(w, `{"error":"fixture"}`)
@@ -368,7 +368,7 @@ func TestCrawlLocationsGuardEveryRequestAndArchive(t *testing.T) {
 				if (kind == "premium" || kind == "pause-before" || kind == "session-before") && targetCalls != 0 {
 					t.Fatal("target request started after failed preflight")
 				}
-				reasons := map[string]string{"premium": "premium_required", "pause-before": "paused", "pause-after": "paused", "session-before": "session_changed", "session-after": "session_changed", "403": "http_403", "429": "http_429", "500": "http_500", "challenge": "challenge", "disk-after": "disk_reserve", "wrong-id": "request_failed"}
+				reasons := map[string]string{"premium": "premium_required", "pause-before": "paused", "pause-after": "paused", "session-before": "session_changed", "session-after": "session_changed", "403": "http_403", "429": "http_429", "400": "http_400", "challenge": "challenge", "disk-after": "disk_reserve", "wrong-id": "request_failed"}
 				if job.Reason != reasons[kind] {
 					t.Fatalf("restriction reason hidden: %+v", job)
 				}
@@ -556,5 +556,496 @@ func TestCrawlEmptyHydrationStillHonorsDiskReserve(t *testing.T) {
 	crawlStep(t, crawler, now)
 	if job := crawlJob(t, crawler); job.State != "stopped" || job.Reason != "disk_reserve" || len(source.calls) != calls {
 		t.Fatalf("empty final phase bypassed disk reserve: %+v", job)
+	}
+}
+
+func crawlRetryMeta(t *testing.T, c *FeedCrawler, owner int64) *crawlRetry {
+	t.Helper()
+	var raw string
+	err := c.Service.Store.DB.QueryRow("SELECT value FROM meta WHERE key=?", crawlRetryKey(owner)).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retry crawlRetry
+	if err = json.Unmarshal([]byte(raw), &retry); err != nil {
+		t.Fatal(err)
+	}
+	return &retry
+}
+
+func retryPhaseFixture(t *testing.T, phase int) (*FeedCrawler, *time.Time, *locationSource, string) {
+	t.Helper()
+	c, now, source := locationFixture(t)
+	source.catalog = func(*http.Request) (string, int) { return locationBody(1, 11), 200 }
+	path := "/user/getUsers"
+	if phase == 0 {
+		if _, err := c.Request(context.Background(), 1, true, true); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		startLocationPhase(t, c, now)
+		path = "/user/getUsersLocations"
+		if phase == 3 {
+			crawlStep(t, c, now)
+			path = "/user/getUser"
+		}
+	}
+	return c, now, source, path
+}
+
+func TestCrawlTransientGETRetryRestartsSameFrontierAndSuccessClearsBudget(t *testing.T) {
+	for _, phase := range []int{0, 2, 3} {
+		t.Run(strconv.Itoa(phase), func(t *testing.T) {
+			c, now, source, path := retryPhaseFixture(t, phase)
+			attempts := 0
+			source.before = func(w http.ResponseWriter, r *http.Request) bool {
+				if r.URL.Path != path {
+					return false
+				}
+				attempts++
+				if attempts == 1 {
+					w.WriteHeader(500)
+					fmt.Fprint(w, `{"error":"transient"}`)
+					return true
+				}
+				if phase == 0 {
+					_ = json.NewEncoder(w).Encode(crawlProfiles(11))
+					return true
+				}
+				return false
+			}
+			before := crawlJob(t, c)
+			failedAt := *now
+			if ok, err := c.Step(context.Background()); err != nil || !ok {
+				t.Fatal(err)
+			}
+			job := crawlJob(t, c)
+			if job.State != "queued" || job.Reason != "retry_http_500" || job.Page != before.Page || job.Mode != before.Mode || job.NextRequest != failedAt.Add(time.Minute).UnixMilli() || job.Pages != before.Pages || job.Received != before.Received || job.CatalogReceived != before.CatalogReceived || job.Hydrated != 0 || job.Unavailable != 0 {
+				t.Fatalf("5xx advanced source frontier: %+v", job)
+			}
+			retry := crawlRetryMeta(t, c, 1)
+			if retry == nil || retry.Failures != 1 || retry.RunID != job.RunID || retry.Mode != phase || retry.Page != 1 || (phase == 3 && retry.Target != 11) {
+				t.Fatalf("retry not persisted by frontier: %+v", retry)
+			}
+			var versions, seen, finished int
+			db := c.Service.Store.DB
+			if err := db.QueryRow("SELECT COUNT(*) FROM versions").Scan(&versions); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow("SELECT COUNT(*) FROM crawl_presence_profiles WHERE seen=1").Scan(&seen); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.QueryRow("SELECT COUNT(*) FROM crawl_presence_runs WHERE finished_at IS NOT NULL").Scan(&finished); err != nil {
+				t.Fatal(err)
+			}
+			if versions != 0 || seen != 0 || finished != 0 {
+				t.Fatal("failed read archived profile or marked presence complete")
+			}
+			status := job.shortStatus()
+			if !strings.Contains(status, "по нашему расписанию") || !strings.Contains(status, "UTC+3") || !strings.Contains(status, "ожидает") {
+				t.Fatalf("retry time/status missing: %s", status)
+			}
+			calls := len(source.calls)
+			*now = failedAt.Add(time.Minute - time.Millisecond)
+			if ok, err := c.Step(context.Background()); err != nil || ok || len(source.calls) != calls {
+				t.Fatal("source retried before durable backoff", err)
+			}
+			cfg, transport := c.Service.Config, c.Service.Client.HTTP.Transport
+			if err := c.Service.Close(); err != nil {
+				t.Fatal(err)
+			}
+			service, err := NewService(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer service.Close()
+			service.Client.HTTP.Transport = transport
+			c = service.Crawler
+			c.now = func() time.Time { return *now }
+			*now = failedAt.Add(time.Minute)
+			if ok, err := c.Step(context.Background()); err != nil || !ok {
+				t.Fatal("due retry failed after restart", err)
+			}
+			if attempts != 2 || crawlRetryMeta(t, c, 1) != nil {
+				t.Fatal("retry budget survived successful checkpoint")
+			}
+			job = crawlJob(t, c)
+			if phase == 0 && (job.Page != 2 || job.Pages != 1) || phase == 2 && job.Mode != 3 || phase == 3 && (job.State != "done" || job.Hydrated != 1) {
+				t.Fatalf("successful retry did not progress: %+v", job)
+			}
+		})
+	}
+}
+
+func TestCrawlTransientGETStopsOnThirdFailure(t *testing.T) {
+	for _, phase := range []int{0, 2, 3} {
+		t.Run(strconv.Itoa(phase), func(t *testing.T) {
+			c, now, source, path := retryPhaseFixture(t, phase)
+			attempts := 0
+			source.before = func(w http.ResponseWriter, r *http.Request) bool {
+				if r.URL.Path != path {
+					return false
+				}
+				attempts++
+				w.WriteHeader(503)
+				fmt.Fprint(w, `{"error":"transient"}`)
+				return true
+			}
+			for attempt := 1; attempt <= 3; attempt++ {
+				failedAt := *now
+				if ok, err := c.Step(context.Background()); err != nil || !ok {
+					t.Fatal(err)
+				}
+				job := crawlJob(t, c)
+				retry := crawlRetryMeta(t, c, 1)
+				if retry == nil || retry.Failures != attempt || job.Page != 1 || job.Hydrated != 0 || job.Unavailable != 0 {
+					t.Fatalf("retry advanced or reset budget: %+v %+v", job, retry)
+				}
+				if attempt < 3 {
+					delay := time.Minute
+					if attempt == 2 {
+						delay = 5 * time.Minute
+					}
+					if job.State != "queued" || job.NextRequest != failedAt.Add(delay).UnixMilli() {
+						t.Fatalf("wrong backoff: %+v", job)
+					}
+					*now = time.UnixMilli(job.NextRequest)
+				} else if job.State != "stopped" || job.Reason != "http_503" {
+					t.Fatalf("third failed GET did not stop: %+v", job)
+				}
+			}
+			*now = now.Add(24 * time.Hour)
+			if ok, err := c.Step(context.Background()); err != nil || ok || attempts != 3 {
+				t.Fatal("terminal retries looped", err)
+			}
+		})
+	}
+}
+
+func TestCrawlRetryAfterAndOwnerIsolationPreserveGlobalGap(t *testing.T) {
+	c, now, source, path := retryPhaseFixture(t, 0)
+	if _, err := c.Request(context.Background(), 2, false); err != nil {
+		t.Fatal(err)
+	}
+	source.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != path {
+			return false
+		}
+		w.Header().Set("Retry-After", "600")
+		w.WriteHeader(502)
+		fmt.Fprint(w, `{"error":"transient"}`)
+		return true
+	}
+	failedAt := *now
+	if ok, err := c.Step(context.Background()); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if job := crawlJob(t, c); job.NextRequest != failedAt.Add(10*time.Minute).UnixMilli() {
+		t.Fatalf("Retry-After ignored: %+v", job)
+	}
+	if ok, err := c.Step(context.Background()); err != nil || ok {
+		t.Fatal("global 20s gap bypassed", err)
+	}
+	*now = failedAt.Add(crawlGap)
+	if ok, err := c.Step(context.Background()); err != nil || !ok {
+		t.Fatal("owner backoff incorrectly blocked other owner", err)
+	}
+	a, b := crawlRetryMeta(t, c, 1), crawlRetryMeta(t, c, 2)
+	if a == nil || b == nil || a.Failures != 1 || b.Failures != 1 || a.RunID == b.RunID {
+		t.Fatalf("owners shared retry budget: %+v %+v", a, b)
+	}
+}
+
+func TestCrawlRetryBudgetIsPerHydratedTarget(t *testing.T) {
+	c, now, source := locationFixture(t)
+	source.catalog = func(*http.Request) (string, int) { return locationBody(2, 11, 12), 200 }
+	startLocationPhase(t, c, now)
+	crawlStep(t, c, now)
+	attempts := map[string]int{}
+	source.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != "/user/getUser" {
+			return false
+		}
+		id := r.URL.Query().Get("targetUserId")
+		attempts[id]++
+		if attempts[id] == 1 {
+			w.WriteHeader(504)
+			fmt.Fprint(w, `{"error":"transient"}`)
+			return true
+		}
+		return false
+	}
+	if ok, err := c.Step(context.Background()); err != nil || !ok {
+		t.Fatal(err)
+	}
+	first := crawlRetryMeta(t, c, 1)
+	if first == nil || first.Target != 11 || first.Failures != 1 {
+		t.Fatal("missing first target retry")
+	}
+	*now = time.UnixMilli(crawlJob(t, c).NextRequest)
+	crawlStep(t, c, now)
+	if crawlRetryMeta(t, c, 1) != nil {
+		t.Fatal("successful target left stale retries")
+	}
+	if ok, err := c.Step(context.Background()); err != nil || !ok {
+		t.Fatal(err)
+	}
+	second := crawlRetryMeta(t, c, 1)
+	if second == nil || second.Target != 12 || second.Page != 2 || second.Failures != 1 {
+		t.Fatalf("different target inherited retry budget: %+v", second)
+	}
+}
+
+func TestCrawlRetriesMe500ButNeverRefreshPUT500(t *testing.T) {
+	t.Run("me", func(t *testing.T) {
+		c, now, source, _ := retryPhaseFixture(t, 0)
+		calls := 0
+		source.before = func(w http.ResponseWriter, r *http.Request) bool {
+			if r.URL.Path != "/user/getMe" {
+				return false
+			}
+			calls++
+			if calls == 1 {
+				w.WriteHeader(500)
+				fmt.Fprint(w, `{"error":"transient"}`)
+				return true
+			}
+			return false
+		}
+		if ok, err := c.Step(context.Background()); err != nil || !ok {
+			t.Fatal(err)
+		}
+		if len(source.calls) != 1 || crawlJob(t, c).State != "queued" {
+			t.Fatal("Me failure continued to source page")
+		}
+		*now = time.UnixMilli(crawlJob(t, c).NextRequest)
+		if ok, err := c.Step(context.Background()); err != nil || !ok || calls != 2 {
+			t.Fatal("Me retry did not recover", err)
+		}
+	})
+	t.Run("refresh", func(t *testing.T) {
+		c, now, _, _ := retryPhaseFixture(t, 0)
+		if err := c.Service.Store.SaveSession(context.Background(), 1, Session{Token: "expired", Refresh: "fake-refresh", UserID: 101, Generation: "1", Expires: time.Now().Add(-time.Hour).Unix()}); err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		c.Service.Client.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			if r.Method != "PUT" || r.URL.Path != "/appuser/refresh" {
+				t.Fatalf("unexpected auth request: %s %s", r.Method, r.URL)
+			}
+			w.WriteHeader(500)
+			fmt.Fprint(w, `{"error":"auth unavailable"}`)
+		})}
+		if ok, err := c.Step(context.Background()); err != nil || !ok {
+			t.Fatal(err)
+		}
+		if job := crawlJob(t, c); job.State != "stopped" || job.Reason != "auth_required" || crawlRetryMeta(t, c, 1) != nil {
+			t.Fatalf("refresh replay scheduled: %+v", job)
+		}
+		*now = now.Add(10 * time.Minute)
+		if ok, err := c.Step(context.Background()); err != nil || ok || calls != 1 {
+			t.Fatal("auth mutation retried", err)
+		}
+	})
+}
+
+func TestCrawlRetryPersistenceFailureStopsWithoutMoreHTTP(t *testing.T) {
+	c, now, source, path := retryPhaseFixture(t, 0)
+	source.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != path {
+			return false
+		}
+		w.WriteHeader(500)
+		fmt.Fprint(w, `{"error":"transient"}`)
+		return true
+	}
+	if _, err := c.Service.Store.DB.Exec(`CREATE TRIGGER fail_crawl_retry BEFORE INSERT ON meta WHEN NEW.key LIKE 'feed_crawl_retry:%' BEGIN SELECT RAISE(ABORT,'retry checkpoint fault'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := c.Step(context.Background()); !ok || err == nil {
+		t.Fatal("retry persistence failure not returned")
+	}
+	if job := crawlJob(t, c); job.State != "stopped" || job.Reason != "checkpoint_failed" {
+		t.Fatalf("failed retry bookmark left job active: %+v", job)
+	}
+	calls := len(source.calls)
+	*now = now.Add(10 * time.Minute)
+	if ok, err := c.Step(context.Background()); err != nil || ok || len(source.calls) != calls {
+		t.Fatal("failed retry persistence repeated HTTP", err)
+	}
+}
+
+func TestCrawlRetryClassificationIsGETOnlyAndStrict(t *testing.T) {
+	for _, status := range []int{500, 502, 503, 504} {
+		for _, endpoint := range []string{"/user/getMe", "/user/getUsers", "/user/getUsersLocations", "/user/getUser"} {
+			if _, ok := crawlRetryableGET(&UpstreamError{Status: status, Kind: "request_rejected", Endpoint: endpoint}); !ok {
+				t.Fatalf("valid transient GET rejected: %d %s", status, endpoint)
+			}
+		}
+	}
+	for _, err := range []error{&UpstreamError{Status: 500, Kind: "request_rejected", Endpoint: "/appuser/refresh"}, &UpstreamError{Status: 500, Kind: "request_rejected", Endpoint: "/reactions/addNew"}, &UpstreamError{Status: 500, Kind: "unexpected_response_or_challenge", Endpoint: "/user/getUsers"}, errors.New("format changed"), ErrProfileUnavailable} {
+		if _, ok := crawlRetryableGET(err); ok {
+			t.Fatalf("non-GET/challenge/format error retried: %v", err)
+		}
+	}
+	for _, status := range []int{400, 401, 403, 404, 408, 410, 429, 501, 505} {
+		if _, ok := crawlRetryableGET(&UpstreamError{Status: status, Kind: "request_rejected", Endpoint: "/user/getUsers"}); ok {
+			t.Fatalf("non-transient response retried: %d", status)
+		}
+	}
+}
+
+func TestCrawlQueuedRetryPauseAndNewRequestAreExplicit(t *testing.T) {
+	c, now, source, path := retryPhaseFixture(t, 0)
+	source.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != path {
+			return false
+		}
+		w.WriteHeader(500)
+		fmt.Fprint(w, `{"error":"transient"}`)
+		return true
+	}
+	if ok, err := c.Step(context.Background()); err != nil || !ok {
+		t.Fatal(err)
+	}
+	old := crawlJob(t, c)
+	uxSend(c.Service, 1, "/pause")
+	uxSend(c.Service, 1, "/resume")
+	*now = time.UnixMilli(old.NextRequest)
+	calls := len(source.calls)
+	if ok, err := c.Step(context.Background()); err != nil || ok || len(source.calls) != calls {
+		t.Fatal("resume restarted queued retry", err)
+	}
+	if job := crawlJob(t, c); job.State != "stopped" || job.Reason != "paused" {
+		t.Fatalf("pause lost terminal meaning: %+v", job)
+	}
+	next, err := c.Request(context.Background(), 1, true, true)
+	if err != nil || next.RunID == old.RunID || crawlRetryMeta(t, c, 1) != nil {
+		t.Fatal("explicit new request did not clear old retry frontier", err)
+	}
+}
+
+func TestCrawlRetryLifecycleRaceDoesNotStopPeerOwner(t *testing.T) {
+	c, now, source, path := retryPhaseFixture(t, 0)
+	if _, err := c.Request(context.Background(), 2, false); err != nil {
+		t.Fatal(err)
+	}
+	source.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != path {
+			return false
+		}
+		if r.URL.Query().Get("userId") == "101" {
+			w.WriteHeader(500)
+			fmt.Fprint(w, `{"error":"transient"}`)
+		} else {
+			_ = json.NewEncoder(w).Encode(crawlProfiles(22))
+		}
+		return true
+	}
+	// The first no-op is post-HTTP invalid(); the second is retryGET's writer lock.
+	_, err := c.Service.Store.DB.Exec(`INSERT INTO meta(key,value)VALUES('fixture_pause_counter','0');
+ CREATE TRIGGER pause_at_retry BEFORE UPDATE ON meta
+ WHEN NEW.key='feed_crawl_next' AND NEW.value=OLD.value AND EXISTS(SELECT 1 FROM feed_crawls WHERE owner_id=1 AND state='running')
+ BEGIN
+ UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='fixture_pause_counter';
+ UPDATE users SET paused=1 WHERE id=1 AND (SELECT CAST(value AS INTEGER) FROM meta WHERE key='fixture_pause_counter')=2;
+ END;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := c.Step(context.Background()); err != nil || !handled {
+		t.Fatal("lifecycle race stopped the global worker", err)
+	}
+	if job := crawlJob(t, c); job.State == "queued" || job.Reason == "checkpoint_failed" || crawlRetryMeta(t, c, 1) != nil {
+		t.Fatalf("obsolete retry requeued/stopped the owner: %+v", job)
+	}
+	// SQLite rolls back the injected pause with the abandoned retry transaction.
+	// A real pause commits separately; ensure the next Step still serves the peer.
+	*now = now.Add(crawlGap)
+	if handled, err := c.Step(context.Background()); err != nil || !handled {
+		t.Fatal("peer owner lost its worker", err)
+	}
+	peer, err := c.Service.Store.CrawlStatus(context.Background(), 2)
+	if err != nil || peer.Page != 2 || peer.Pages != 1 {
+		t.Fatalf("peer did not progress after obsolete retry: %+v %v", peer, err)
+	}
+}
+
+func TestCrawlRetryAbandonsChangedOrDeletedLifecycle(t *testing.T) {
+	for _, kind := range []string{"paused", "stopped", "newrun", "mode", "page", "sessionstate", "sessiongeneration", "disconnect", "deletejob", "deleteuser"} {
+		t.Run(kind, func(t *testing.T) {
+			c, _, _, _ := retryPhaseFixture(t, 0)
+			ctx := context.Background()
+			job := crawlJob(t, c)
+			store := c.Service.Store
+			var err error
+			switch kind {
+			case "paused":
+				store.Pause(ctx, 1, true)
+			case "stopped":
+				err = store.StopCrawl(ctx, 1, "paused")
+			case "newrun":
+				_, err = store.DB.Exec("UPDATE feed_crawls SET run_id='new-run' WHERE owner_id=1")
+			case "mode":
+				_, err = store.DB.Exec("UPDATE feed_crawls SET mode=1 WHERE owner_id=1")
+			case "page":
+				_, err = store.DB.Exec("UPDATE feed_crawls SET page=2 WHERE owner_id=1")
+			case "sessionstate":
+				store.SessionState(ctx, 1, "reconnect_required", "fixture")
+			case "sessiongeneration":
+				err = store.SaveSession(ctx, 1, Session{Token: "new", Refresh: "r", UserID: 101, Generation: "new"})
+			case "disconnect":
+				err = store.Disconnect(ctx, 1)
+			case "deletejob":
+				_, err = store.DB.Exec("DELETE FROM feed_crawls WHERE owner_id=1")
+			case "deleteuser":
+				err = store.DeleteUser(ctx, 1)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var before string
+			scanErr := store.DB.QueryRow("SELECT run_id||':'||state||':'||reason FROM feed_crawls WHERE owner_id=1").Scan(&before)
+			if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+				t.Fatal(scanErr)
+			}
+			err = c.retryGET(ctx, job, 0, &UpstreamError{Status: 500, Kind: "request_rejected", Endpoint: "/user/getUsers"})
+			if !errors.Is(err, errCrawlRetryObsolete) {
+				t.Fatal("normal lifecycle change was treated as a worker failure", err)
+			}
+			if crawlRetryMeta(t, c, 1) != nil {
+				t.Fatal("obsolete lifecycle created a retry bookmark")
+			}
+			var after string
+			afterErr := store.DB.QueryRow("SELECT run_id||':'||state||':'||reason FROM feed_crawls WHERE owner_id=1").Scan(&after)
+			if before != after || !errors.Is(afterErr, scanErr) {
+				t.Fatal("obsolete retry changed lifecycle state", before, after, afterErr)
+			}
+		})
+	}
+}
+
+func TestCrawlCorruptRetryCheckpointRemainsFatal(t *testing.T) {
+	c, _, source, path := retryPhaseFixture(t, 0)
+	source.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path != path {
+			return false
+		}
+		w.WriteHeader(500)
+		fmt.Fprint(w, `{"error":"transient"}`)
+		return true
+	}
+	if _, err := c.Service.Store.DB.Exec("INSERT INTO meta(key,value)VALUES(?,?)", crawlRetryKey(1), `{"failures":"corrupt"}`); err != nil {
+		t.Fatal(err)
+	}
+	if handled, err := c.Step(context.Background()); !handled || err == nil || errors.Is(err, errCrawlRetryObsolete) {
+		t.Fatal("corrupt retry data was treated as benign", err)
+	}
+	if job := crawlJob(t, c); job.State != "stopped" || job.Reason != "checkpoint_failed" {
+		t.Fatalf("corrupt retry data did not stop the owner: %+v", job)
 	}
 }

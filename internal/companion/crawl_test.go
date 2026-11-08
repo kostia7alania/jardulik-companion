@@ -259,7 +259,7 @@ func TestCrawlDetectsABAAndModeFingerprintsAreSeparate(t *testing.T) {
 }
 
 func TestCrawlGuardsBeforeArchiveAndNoCursorOnErrors(t *testing.T) {
-	for _, kind := range []string{"pause", "disconnect", "session", "http403", "http429", "http500", "disk-after"} {
+	for _, kind := range []string{"pause", "disconnect", "session", "http403", "http429", "http400", "disk-after"} {
 		t.Run(kind, func(t *testing.T) {
 			var c *FeedCrawler
 			c, _, _, _ = crawlFixture(t, func(int, int) ([]Profile, int) {
@@ -280,8 +280,8 @@ func TestCrawlGuardsBeforeArchiveAndNoCursorOnErrors(t *testing.T) {
 					return nil, 403
 				case "http429":
 					return nil, 429
-				case "http500":
-					return nil, 500
+				case "http400":
+					return nil, 400
 				case "disk-after":
 					s.Media.Config.MinFreeBytes = math.MaxUint64
 				}
