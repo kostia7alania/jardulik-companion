@@ -1,0 +1,12 @@
+{
+  "verified_at": "2026-11-08T00:53:26.582407+00:00",
+  "database_quick_check": "ok",
+  "foreign_key_violations": 0,
+  "versions": 150,
+  "profiles": 150,
+  "actions": 0,
+  "verified_media_files": 388,
+  "verified_media_bytes": 59970022,
+  "expected_media_complete": true,
+  "original_source_gaps": 2
+}
