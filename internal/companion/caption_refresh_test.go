@@ -91,7 +91,7 @@ func TestRefreshCaptionsOnlyEditsKnownCardsPreservingSources(t *testing.T) {
 		if (input.Chat == svc.Config.BackupChatID && input.Message != 101) || (input.Chat == 123 && input.Message != 201) || (input.Chat != svc.Config.BackupChatID && input.Chat != 123) {
 			t.Fatalf("edited a source or unknown card: %+v", input)
 		}
-		if !strings.Contains(input.Caption, "1:") || strings.Contains(input.Caption, `[{"Фото":1}`) || len(input.Entities) != 2 {
+		if !strings.Contains(input.Caption, "1-2:") || strings.Contains(input.Caption, `[{"Фото":1}`) || len(input.Entities) != 2 {
 			t.Fatalf("existing card did not receive the compact expandable summary: %+v", input)
 		}
 		targets = append(targets, input.Message)
