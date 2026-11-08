@@ -21,7 +21,7 @@ type CaptionRefreshResult struct {
 
 // RefreshCaptions edits confirmed cards and their known source ZIP controls.
 // It never uploads, deletes, renames topics, or changes profile/media records.
-func (s *Service) RefreshCaptions(ctx context.Context) (result CaptionRefreshResult, err error) {
+func (s *Service) RefreshCaptions(ctx context.Context, cardsOnly ...bool) (result CaptionRefreshResult, err error) {
 	if !s.Config.ArchivePaused {
 		return result, errors.New("pause the archive worker with ARCHIVE_WORKER_PAUSED=true before refreshing captions")
 	}
@@ -89,6 +89,12 @@ func (s *Service) RefreshCaptions(ctx context.Context) (result CaptionRefreshRes
 			return result, fmt.Errorf("archive caption refresh: %w", err)
 		}
 		result.ArchiveCards++
+		if len(cardsOnly) > 0 && cardsOnly[0] {
+			if result.ArchiveCards%25 == 0 {
+				slog.Info("caption refresh progress", "archive_cards_confirmed", result.ArchiveCards)
+			}
+			continue
+		}
 		var updated SentMessage
 		err = s.Archiver.groupCall(ctx, func() error {
 			return s.Archiver.TG.Call(ctx, "editMessageReplyMarkup", map[string]any{"chat_id": s.Config.BackupChatID, "message_id": item.zip, "reply_markup": archiveProfileKeyboard(item.version)}, &updated)

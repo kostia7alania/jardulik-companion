@@ -67,12 +67,24 @@ func photoExifBlocks(photos []MediaJob) []string {
 // The main caption always keeps the compact summary, not a synthesized JSON dump.
 func photoJSONCardText(text string, photos []MediaJob, tail string, limit int, sourceJSON ...string) photoText {
 	value := photoCardText(text, photoMetadataRows(photos), tail, limit)
-	if len(sourceJSON) > 0 && sourceJSON[0] != "" && len(value.Entities) == 1 && textUnits(value.Text)+textUnits(sourceJSON[0])+1 <= limit {
-		quote := &value.Entities[0]
-		prefix, rest := telegramPrefix(value.Text, quote.Offset+quote.Length)
-		value.Text = prefix + "\n" + sourceJSON[0] + rest
-		quote.Length += 1 + textUnits(sourceJSON[0])
-		value.SourceJSONInline = true
+	if len(sourceJSON) > 0 && sourceJSON[0] != "" && textUnits(value.Text)+textUnits(sourceJSON[0])+1 <= limit {
+		for i, e := range value.Entities {
+			if e.Type != "expandable_blockquote" {
+				continue
+			}
+			at := e.Offset + e.Length
+			prefix, rest := telegramPrefix(value.Text, at)
+			added := 1 + textUnits(sourceJSON[0])
+			value.Text = prefix + "\n" + sourceJSON[0] + rest
+			value.Entities[i].Length += added
+			for j := range value.Entities {
+				if j != i && value.Entities[j].Offset >= at {
+					value.Entities[j].Offset += added
+				}
+			}
+			value.SourceJSONInline = true
+			break
+		}
 	}
 	return value
 }
@@ -158,7 +170,7 @@ func splitPhotoFooter(text string) (body, details, footer, link string) {
 		case strings.HasPrefix(line, "Не указано: "):
 			inside = append(inside, line)
 		case strings.HasPrefix(line, "📍 https://t.me/c/"):
-			link = "\n" + line
+			link = strings.TrimPrefix(line, "📍 ")
 		default:
 			outside = append(outside, line)
 		}
@@ -173,9 +185,11 @@ func splitPhotoFooter(text string) (body, details, footer, link string) {
 // budget and cannot be displaced by a long biography or photo metadata.
 func photoCardText(text string, rows []string, tail string, limit int) photoText {
 	body, details, footer, link := splitPhotoFooter(text)
-	tail += link
+	if validPostURL(link) {
+		tail += "\n🔗 пост"
+	}
 	if len(rows) == 0 && details == "" {
-		return photoText{Text: captionWithTail(body+footer, tail, limit)}
+		return withPostLinkEntity(photoText{Text: captionWithTail(body+footer, tail, limit)}, link)
 	}
 	quoteBudget := 420
 	available := limit - textUnits(footer+tail) - 12
@@ -207,7 +221,7 @@ func photoCardText(text string, rows []string, tail string, limit int) photoText
 	if quote != "" {
 		result.Entities = []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(quote)}}
 	}
-	return result
+	return withPostLinkEntity(result, link)
 }
 
 func fullPhotoText(text string, rows []string) photoText {
@@ -223,7 +237,8 @@ func fullPhotoText(text string, rows []string) photoText {
 		return photoText{Text: text}
 	}
 	prefix := body + "\n\n"
-	return photoText{Text: prefix + quote + footer + link, Entities: []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(quote)}}}
+	result := photoText{Text: prefix + quote + footer, Entities: []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(quote)}}}
+	return appendPostLink(result, link)
 }
 
 func photoTextPart(value photoText, limit int) (photoText, photoText) {
@@ -254,4 +269,63 @@ func photoTextPart(value photoText, limit int) (photoText, photoText) {
 		}
 	}
 	return first, next
+}
+
+func photoQuote(entities []MessageEntity) (MessageEntity, bool) {
+	for _, e := range entities {
+		if e.Type == "expandable_blockquote" {
+			return e, true
+		}
+	}
+	return MessageEntity{}, false
+}
+func withPostLinkEntity(value photoText, link string) photoText {
+	if validPostURL(link) && strings.HasSuffix(value.Text, "🔗 пост") {
+		value.Entities = append(value.Entities, MessageEntity{Type: "text_link", Offset: textUnits(value.Text) - textUnits("🔗 пост"), Length: textUnits("🔗 пост"), URL: link})
+	}
+	return value
+}
+func appendPostLink(value photoText, link string) photoText {
+	if validPostURL(link) {
+		value.Text += "\n🔗 пост"
+		return withPostLinkEntity(value, link)
+	}
+	return value
+}
+func privateAlbumActionTail(p StoredProfile, photos int) string {
+	if photos < 2 {
+		return ""
+	}
+	return fmt.Sprintf("\n\nТекст: /text_%d\nJSON: /json_%d\nИзбранное: /fav_%d · /next", p.ID, p.VersionID, p.ID)
+}
+func unavailableMediaCount(jobs []MediaJob) int {
+	n := 0
+	for _, j := range jobs {
+		if j.State != "complete" || j.SHA == "" {
+			n++
+		}
+	}
+	return n
+}
+
+// Both destinations reserve the same body budget. Only private albums append
+// their contextual commands; the configured post link remains the final line.
+func renderProfileCard(p StoredProfile, photos []MediaJob, missing int, noPhotos bool, link string, limit int, private bool) (photoText, error) {
+	pretty, err := prettyProfileJSON(p.RawJSON)
+	if err != nil {
+		return photoText{}, err
+	}
+	text := profileText(p)
+	if missing > 0 {
+		text += fmt.Sprintf("\nНедоступных исходных фото: %d. Подробности в ZIP.", missing)
+	}
+	if noPhotos {
+		text += "\nФотографии пока недоступны."
+	}
+	actions := privateAlbumActionTail(p, len(photos))
+	card := photoJSONCardText(text, photos, "", limit-textUnits(actions+"\n🔗 пост"), pretty)
+	if private {
+		card.Text += actions
+	}
+	return appendPostLink(card, link), nil
 }

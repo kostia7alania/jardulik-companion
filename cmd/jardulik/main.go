@@ -167,7 +167,11 @@ func run() error {
 	case "repair-zips":
 		return s.Archiver.RequestZIPRepair(ctx)
 	case "refresh-captions":
-		result, err := s.RefreshCaptions(ctx)
+		cardsOnly := len(os.Args) == 3 && os.Args[2] == "--cards-only"
+		if len(os.Args) > 2 && !cardsOnly {
+			return errors.New("usage: refresh-captions [--cards-only]")
+		}
+		result, err := s.RefreshCaptions(ctx, cardsOnly)
 		_ = json.NewEncoder(os.Stdout).Encode(result)
 		return err
 	case "reconcile-albums":

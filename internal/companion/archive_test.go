@@ -1692,8 +1692,12 @@ func TestArchiveCaptionKeepsTopicLinkAtEndWithinUTF16Budget(t *testing.T) {
 	p.Profile["description"] = strings.Repeat("🙂", 3000)
 	link := forumTopicURL(a.Config.BackupChatID, 55)
 	for _, limit := range []int{1024, 4096} {
-		caption := a.profileCardText(p, 0, 55, limit, limit == 4096)
-		if textUnits(caption) > limit || !strings.HasSuffix(caption, "📍 "+link) {
+		card, err := a.profileCardContent(p, 0, 55, limit, limit == 4096, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		caption := card.Text
+		if textUnits(caption) > limit || !strings.HasSuffix(caption, "🔗 пост") || len(card.Entities) < 2 || card.Entities[len(card.Entities)-1].URL != link {
 			t.Fatalf("caption lost final topic link or exceeded budget: units=%d limit=%d", textUnits(caption), limit)
 		}
 	}
@@ -1714,7 +1718,7 @@ func TestZIPRepairRefreshesConfirmedCaptionWithoutReupload(t *testing.T) {
 		case "editMessageMedia":
 			return fmt.Sprintf(`{"ok":true,"result":{"message_id":11,"chat":{"id":-100123},"document":{"file_id":"new-zip","file_unique_id":"new-unique","file_size":%d}}}`, len(call.fields["archive"])), nil
 		case "editMessageCaption":
-			if call.json["message_id"] != float64(101) || !strings.HasSuffix(call.json["caption"].(string), "📍 "+forumTopicURL(c.BackupChatID, 55)) {
+			if call.json["message_id"] != float64(101) || !strings.HasSuffix(call.json["caption"].(string), "🔗 пост") {
 				t.Fatal("confirmed card caption/link was not refreshed in place")
 			}
 			return `{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}`, nil

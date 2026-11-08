@@ -54,11 +54,49 @@ type MessageEntity struct {
 	Type   string `json:"type"`
 	Offset int    `json:"offset"`
 	Length int    `json:"length"`
+	URL    string `json:"url,omitempty"`
 }
 
+func validPostURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host != "t.me" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.RawPath != "" {
+		return false
+	}
+	parts := strings.Split(u.Path, "/")
+	if len(parts) != 4 || parts[0] != "" || parts[1] != "c" {
+		return false
+	}
+	for _, part := range parts[2:] {
+		if part == "" || strings.Trim(part, "0123456789") != "" {
+			return false
+		}
+		n, err := strconv.ParseUint(part, 10, 64)
+		if err != nil || n == 0 {
+			return false
+		}
+	}
+	return true
+}
 func validMessageEntities(text string, entities []MessageEntity) error {
 	for _, e := range entities {
-		if e.Type != "expandable_blockquote" || e.Offset < 0 || e.Length <= 0 || e.Offset > textUnits(text)-e.Length {
+		if e.Offset < 0 || e.Length <= 0 || e.Offset > textUnits(text)-e.Length {
+			return errors.New("invalid Telegram message entity")
+		}
+		prefix, _ := telegramPrefix(text, e.Offset)
+		end, _ := telegramPrefix(text, e.Offset+e.Length)
+		if textUnits(prefix) != e.Offset || textUnits(end) != e.Offset+e.Length {
+			return errors.New("invalid Telegram entity boundary")
+		}
+		switch e.Type {
+		case "expandable_blockquote":
+			if e.URL != "" {
+				return errors.New("unexpected quote URL")
+			}
+		case "text_link":
+			if !validPostURL(e.URL) {
+				return errors.New("invalid Telegram post URL")
+			}
+		default:
 			return errors.New("invalid Telegram message entity")
 		}
 	}

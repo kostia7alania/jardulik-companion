@@ -26,6 +26,10 @@ func storedProfileJSON(ctx context.Context, store *Store, owner, version int64) 
 	if err := store.DB.QueryRowContext(ctx, "SELECT raw_json FROM versions WHERE owner_id=? AND id=?", owner, version).Scan(&raw); err != nil {
 		return "", err
 	}
+	return prettyProfileJSON(raw)
+}
+
+func prettyProfileJSON(raw string) (string, error) {
 	var pretty bytes.Buffer
 	if err := json.Indent(&pretty, []byte(raw), "", "  "); err != nil {
 		return "", errors.New("stored profile JSON is invalid")
@@ -39,8 +43,8 @@ func fullExifTextParts(text string, photos []MediaJob) ([]photoText, error) {
 	value := fullPhotoText(text, blocks)
 	type span struct{ start, end int }
 	var protected []span
-	if len(blocks) > 0 && len(value.Entities) > 0 {
-		offset := value.Entities[0].Offset
+	if quote, ok := photoQuote(value.Entities); len(blocks) > 0 && ok {
+		offset := quote.Offset
 		for _, block := range blocks {
 			protected = append(protected, span{offset, offset + textUnits(block)})
 			offset += textUnits(block) + 1

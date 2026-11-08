@@ -39,9 +39,22 @@ encrypted file SHA-256 before starting an upload. Reuse that ID only for this
 same operation and file; never assign a new ID to an uncertain retry.
 
 ```text
+telegram-transfer check-target
 telegram-transfer upload --file /private/path/snapshot.zip.enc --random-id 123 --sha256 <encrypted-file-sha256> --size <bytes>
 telegram-transfer download --receipt /private/path/receipt.json --output /private/path/new-copy.zip.enc --sha256 <encrypted-file-sha256> --size <bytes>
 ```
+
+`check-target` accepts no file or destination arguments. It verifies the bot,
+resolves only the configured forum through `channels.getChannels`, validates its
+full nonzero access hash, and reads the known topic-creation message. General
+(topic 1) has no such message and is unsupported by this probe. No document is
+uploaded and no message is sent. A successful probe confirms the configured
+peer/topic and returns `checked` with the known topic message ID; it does not
+prove write permission or an earlier delivery.
+
+The same peer resolution runs before upload and download. A mismatched, partial,
+non-forum or inaccessible peer fails before file upload; later requests use the
+validated full access hash rather than the zero-hash bootstrap value.
 
 All paths must be absolute. Files are limited to 1 GiB. Transfers have a
 25-minute deadline and use one upload worker with 512 KiB parts. Upload verifies
@@ -63,12 +76,23 @@ claim Telegram server-byte verification of an upload. Bot API `file_id` and
 `file_unique_id` are omitted until a separate compatibility check verifies them;
 neither is invented from a temporary upload ID.
 
-Failures return `failed` or `uncertain`, an allowlisted `error_code`, and optional
-`retry_after` seconds. Any error after starting `sendMedia`, including a failed
-readback, is `uncertain`: the caller must not blindly repeat it or mark sources
-clean. Raw errors, tokens, API hashes, auth keys and source paths are not printed.
+Failures return `failed` or `uncertain`, an allowlisted `error_code`, optional
+`retry_after` seconds, and allowlisted `phase`/`rpc_type` diagnostics. For example,
+`resolve_target_channel_invalid` identifies a failure before upload. Unknown
+server error text is never copied into these fields. Any error after starting
+`sendMedia`, including a failed readback, is `uncertain`: the caller must not
+blindly repeat it or mark sources clean. Raw errors, tokens, API hashes, auth
+keys and source paths are not printed.
 
 `NoUpdates: true` is mandatory. In the pinned SDK this selects
-`ConnModeData`, which wraps RPC calls in `invokeWithoutUpdates`. Cloud-poller
-coexistence, real bot authorization, actual upload/download and VPS memory still
-require an authorized live acceptance; unit tests make no Telegram calls.
+`ConnModeData`, which wraps RPC calls in `invokeWithoutUpdates`.
+
+The helper and resolver were deployed in release `8a03309` with green CI;
+authorized bot/peer/topic resolution passed against the configured forum. The
+first cloud attempt remains `uncertain`. A new full backup was sent after the
+resolver fix: 202 profiles, 203 versions and 514 files; its companion post was
+observed in Telegram. Cloud polling/history worked during transfer, with a
+combined cgroup peak of 101,183,488 bytes and zero OOM events under 128 MiB.
+Local full v2 restore passed for the earlier 150 profiles and 388 media. The
+owner then stopped the main service; downloading and restoring the new cloud
+copy remain pending. Unit tests make no Telegram calls.

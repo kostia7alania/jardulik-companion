@@ -32,16 +32,11 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		return nil, err
 	}
 	photos := selectedProfilePhotos(jobs)
-	text := s.cardText(ctx, owner, p)
-	pretty, err := storedProfileJSON(ctx, s.Store, owner, p.VersionID)
+	card, err := s.renderPrivateCard(ctx, owner, p, jobs, photos)
 	if err != nil {
 		return nil, err
 	}
 	if len(photos) == 0 {
-		if len(jobs) > 0 {
-			text += "\n\nФотографии пока недоступны."
-		}
-		card := photoJSONCardText(text, nil, "", 4096, pretty)
 		m, e := s.TG.SendText(ctx, owner, 0, card.Text, profileButtons(p, card.Truncated, !card.SourceJSONInline), card.Entities)
 		if e != nil {
 			return nil, e
@@ -51,11 +46,6 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		}
 		return []int64{m.ID}, nil
 	}
-	tail := ""
-	if len(photos) > 1 {
-		tail = fmt.Sprintf("\n\nТекст: /text_%d\nJSON: /json_%d\nИзбранное: /fav_%d · /next", p.ID, p.VersionID, p.ID)
-	}
-	card := photoJSONCardText(text, photos, tail, 1024, pretty)
 	buttons := profileButtons(p, card.Truncated || len(photoExifBlocks(photos)) > 0, !card.SourceJSONInline)
 	caption := card.Text
 	var ids []int64
@@ -142,18 +132,29 @@ func (s *Service) fullText(ctx context.Context, chat int64, p StoredProfile) {
 	}
 }
 
-func (s *Service) cardText(ctx context.Context, owner int64, p StoredProfile) string {
-	text := profileText(p)
-	if owner != s.Config.OwnerID {
-		return text
+func (s *Service) profilePostURL(ctx context.Context, recipient int64, p StoredProfile) string {
+	if recipient != s.Config.OwnerID {
+		return ""
 	}
 	var thread int64
-	if err := s.Store.DB.QueryRowContext(ctx, "SELECT thread_id FROM mirror_topics WHERE profile_id=?", p.ID).Scan(&thread); err == nil {
-		if link := forumTopicURL(s.Config.BackupChatID, thread); link != "" {
-			text += "\n📍 " + link
-		}
+	if err := s.Store.DB.QueryRowContext(ctx, "SELECT thread_id FROM mirror_topics WHERE profile_id=?", p.ID).Scan(&thread); err != nil {
+		return ""
+	}
+	return forumTopicURL(s.Config.BackupChatID, thread)
+}
+func (s *Service) cardText(ctx context.Context, owner int64, p StoredProfile) string {
+	text := profileText(p)
+	if link := s.profilePostURL(ctx, owner, p); link != "" {
+		text += "\n📍 " + link
 	}
 	return text
+}
+func (s *Service) renderPrivateCard(ctx context.Context, owner int64, p StoredProfile, jobs, photos []MediaJob) (photoText, error) {
+	limit := 1024
+	if len(photos) == 0 {
+		limit = 4096
+	}
+	return renderProfileCard(p, photos, unavailableMediaCount(jobs), len(photos) == 0, s.profilePostURL(ctx, owner, p), limit, true)
 }
 
 // Operator archive callbacks are accepted only from the configured owner in
@@ -392,24 +393,15 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			tail := ""
-			if len(ids) > 1 {
-				tail = fmt.Sprintf("\n\nТекст: /text_%d\nJSON: /json_%d\nИзбранное: /fav_%d · /next", p.ID, p.VersionID, p.ID)
-			}
 			photos := selectedProfilePhotos(jobs)
-			limit, method := 1024, "editMessageCaption"
+			method := "editMessageCaption"
 			if len(photos) == 0 {
-				limit, method = 4096, "editMessageText"
+				method = "editMessageText"
 			}
-			text := s.cardText(ctx, v.owner, p)
-			if len(photos) == 0 && len(jobs) > 0 {
-				text += "\n\nФотографии пока недоступны."
-			}
-			pretty, err := storedProfileJSON(ctx, s.Store, v.owner, p.VersionID)
+			card, err := s.renderPrivateCard(ctx, v.owner, p, jobs, photos)
 			if err != nil {
 				return err
 			}
-			card := photoJSONCardText(text, photos, tail, limit, pretty)
 			payload := map[string]any{"chat_id": v.owner, "message_id": ids[0], "caption": card.Text, "caption_entities": card.Entities}
 			if len(photos) == 0 {
 				delete(payload, "caption")

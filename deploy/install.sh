@@ -3,7 +3,12 @@ set -Eeuo pipefail
 
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 
-[[ $# -eq 4 ]] || die 'usage: install.sh <40-character-commit> <unpacked-release-directory> <binary-sha256> <helper-sha256>'
+[[ $# -eq 4 || $# -eq 5 ]] || die 'usage: install.sh <40-character-commit> <unpacked-release-directory> <binary-sha256> <helper-sha256> [--no-start]'
+no_start=false
+if [[ $# -eq 5 ]]; then
+    [[ $5 == --no-start ]] || die 'invalid installation mode'
+    no_start=true
+fi
 revision=$1
 source_dir=$2
 binary_sha=$3
@@ -24,6 +29,15 @@ base=/opt/jardulik-companion
 data_dir=/var/lib/jardulik-companion
 env_file=/etc/jardulik-companion.env
 unit_names=(jardulik-companion.service jardulik-companion-backup.service jardulik-companion-backup.timer)
+
+require_inactive() {
+    local state
+    state=$(systemctl show --property=ActiveState --value jardulik-companion.service) || return 1
+    if [[ $state != inactive ]]; then
+        printf 'install: service must already be inactive for --no-start\n' >&2
+        return 1
+    fi
+}
 
 # Validate secrets and capacity before creating users, changing releases or restarting.
 [[ -f $env_file && ! -L $env_file ]] || die "create $env_file before deploying"
@@ -86,6 +100,7 @@ done
 
 exec 9>/run/lock/jardulik-companion-deploy.lock
 flock -n 9 || die 'another Jardulik deployment is running'
+if $no_start; then require_inactive; fi
 
 if id jardulik >/dev/null 2>&1; then
     [[ $(id -u jardulik) -lt 1000 && $(id -gn jardulik) == jardulik ]] || die 'the existing jardulik account is not the dedicated service account'
@@ -143,39 +158,52 @@ rollback() {
         if [[ -n $previous_target ]]; then
             ln -s "$previous_target" "$base/.current.rollback.$$"
             mv -Tf -- "$base/.current.rollback.$$" "$base/current"
-            if ! systemctl restart jardulik-companion.service; then
-                printf 'install: previous release restored, but its service restart failed\n' >&2
+            if ! $no_start; then
+                if ! systemctl restart jardulik-companion.service; then
+                    printf 'install: previous release restored, but its service restart failed\n' >&2
+                fi
             fi
         else
-            systemctl disable --now jardulik-companion.service jardulik-companion-backup.timer || true
+            if ! $no_start; then
+                systemctl disable --now jardulik-companion.service jardulik-companion-backup.timer || true
+            fi
             rm -f -- "$base/current"
         fi
     fi
     exit "$code"
 }
 trap rollback ERR
+if $no_start; then require_inactive; fi
 ln -s "$release_dir" "$base/.current.$$"
 mv -Tf -- "$base/.current.$$" "$base/current"
 switched=true
 systemd-analyze verify "${unit_names[@]/#/$source_dir/deploy/}"
-systemctl restart jardulik-companion.service
-sleep 2
-systemctl is-active --quiet jardulik-companion.service
-systemd-run --quiet --wait --pipe --collect \
-    --unit="jardulik-companion-health-$$" \
-    --property=User=jardulik --property=Group=jardulik \
-    --property="EnvironmentFile=$env_file" \
-    --property="WorkingDirectory=$data_dir" \
-    --property=RuntimeMaxSec=30 \
-    --property=MemoryMax=128M --property=TasksMax=32 \
-    --setenv=GOMEMLIMIT=64MiB --setenv=GOMAXPROCS=1 \
-    "$base/current/jardulik" status >/dev/null
-systemctl is-active --quiet jardulik-companion.service
-systemctl enable jardulik-companion.service
-systemctl enable --now jardulik-companion-backup.timer
+if $no_start; then
+    require_inactive
+else
+    systemctl restart jardulik-companion.service
+    sleep 2
+    systemctl is-active --quiet jardulik-companion.service
+    systemd-run --quiet --wait --pipe --collect \
+        --unit="jardulik-companion-health-$$" \
+        --property=User=jardulik --property=Group=jardulik \
+        --property="EnvironmentFile=$env_file" \
+        --property="WorkingDirectory=$data_dir" \
+        --property=RuntimeMaxSec=30 \
+        --property=MemoryMax=128M --property=TasksMax=32 \
+        --setenv=GOMEMLIMIT=64MiB --setenv=GOMAXPROCS=1 \
+        "$base/current/jardulik" status >/dev/null
+    systemctl is-active --quiet jardulik-companion.service
+    systemctl enable jardulik-companion.service
+    systemctl enable --now jardulik-companion-backup.timer
+fi
 if [[ -n $previous_target && $previous_target != "$release_dir" ]]; then
     ln -s "$previous_target" "$base/.previous.$$"
     mv -Tf -- "$base/.previous.$$" "$base/previous"
 fi
 trap - ERR
-printf 'Deployed %s; service active; daily Telegram backup timer enabled.\n' "$revision"
+if $no_start; then
+    printf 'Installed %s without starting the service or backup timer.\n' "$revision"
+else
+    printf 'Deployed %s; service active; daily Telegram backup timer enabled.\n' "$revision"
+fi

@@ -694,20 +694,8 @@ func moderationText(p StoredProfile, _ string, missing int) string {
 	return text
 }
 
-func (a *Archiver) profileCardContent(p StoredProfile, missing int, thread int64, limit int, noPhotos bool, photos []MediaJob) photoText {
-	text := moderationText(p, "", missing)
-	if noPhotos {
-		text += "\nФото пока недоступны."
-	}
-	tail := ""
-	if link := forumTopicURL(a.Config.BackupChatID, thread); link != "" {
-		tail = "\n\n📍 " + link
-	}
-	return photoJSONCardText(text, photos, tail, limit)
-}
-
-func (a *Archiver) profileCardText(p StoredProfile, missing int, thread int64, limit int, noPhotos bool) string {
-	return a.profileCardContent(p, missing, thread, limit, noPhotos, nil).Text
+func (a *Archiver) profileCardContent(p StoredProfile, missing int, thread int64, limit int, noPhotos bool, photos []MediaJob) (photoText, error) {
+	return renderProfileCard(p, photos, missing, noPhotos, forumTopicURL(a.Config.BackupChatID, thread), limit, false)
 }
 
 func archiveProfileKeyboard(version int64) any {
@@ -753,7 +741,10 @@ func (a *Archiver) sendProfileCard(ctx context.Context, p StoredProfile, jobs []
 		}
 	}
 	sort.SliceStable(selected, func(i, j int) bool { return selected[i].Position < selected[j].Position })
-	card := a.profileCardContent(p, missing, thread, 1024, false, selected)
+	card, err := a.profileCardContent(p, missing, thread, 1024, false, selected)
+	if err != nil {
+		return nil, err
+	}
 	caption := card.Text
 	var keyboard any // Archive controls belong to the first, whole-ZIP message.
 	var ids []int64
@@ -767,9 +758,12 @@ func (a *Archiver) sendProfileCard(ctx context.Context, p StoredProfile, jobs []
 		return save(ids)
 	}
 	if len(selected) == 0 {
-		body := a.profileCardContent(p, missing, thread, 4096, true, nil)
+		body, err := a.profileCardContent(p, missing, thread, 4096, true, nil)
+		if err != nil {
+			return nil, err
+		}
 		var m SentMessage
-		err := a.groupCall(ctx, func() (err error) {
+		err = a.groupCall(ctx, func() (err error) {
 			m, err = a.TG.SendText(ctx, a.Config.BackupChatID, thread, body.Text, keyboard, body.Entities)
 			return err
 		})
@@ -1423,7 +1417,10 @@ func (a *Archiver) reconcileCaptionedAlbum(ctx context.Context, version int64) (
 	if err = a.editKnownCaption(ctx, zipID, zipCaption, archiveProfileKeyboard(version)); err != nil {
 		return err
 	}
-	card := a.profileCardContent(p, missing, thread, 1024, false, selectedProfilePhotos(jobs))
+	card, err := a.profileCardContent(p, missing, thread, 1024, false, selectedProfilePhotos(jobs))
+	if err != nil {
+		return err
+	}
 	if err = a.editKnownCaption(ctx, ids[0], card.Text, nil, card.Entities); err != nil {
 		return err
 	}
@@ -1688,12 +1685,19 @@ func (a *Archiver) refreshConfirmedProfileCaption(ctx context.Context, version, 
 		if len(ids) != 1 {
 			return errors.New("confirmed text card inventory is invalid")
 		}
-		return a.editKnownText(ctx, ids[0], a.profileCardContent(p, missing, thread, 4096, true, nil))
+		card, err := a.profileCardContent(p, missing, thread, 4096, true, nil)
+		if err != nil {
+			return err
+		}
+		return a.editKnownText(ctx, ids[0], card)
 	}
 	if expected != len(ids) {
 		return errors.New("confirmed profile photo inventory is incomplete")
 	}
-	card := a.profileCardContent(p, missing, thread, 1024, false, selectedProfilePhotos(jobs))
+	card, err := a.profileCardContent(p, missing, thread, 1024, false, selectedProfilePhotos(jobs))
+	if err != nil {
+		return err
+	}
 	return a.editKnownCaption(ctx, ids[0], card.Text, nil, card.Entities)
 }
 

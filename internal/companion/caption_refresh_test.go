@@ -91,7 +91,7 @@ func TestRefreshCaptionsOnlyEditsKnownCardsPreservingSources(t *testing.T) {
 		if (input.Chat == svc.Config.BackupChatID && input.Message != 101) || (input.Chat == 123 && input.Message != 201) || (input.Chat != svc.Config.BackupChatID && input.Chat != 123) {
 			t.Fatalf("edited a source or unknown card: %+v", input)
 		}
-		if !strings.Contains(input.Caption, "1:") || strings.Contains(input.Caption, `[{"Фото":1}`) || len(input.Entities) != 1 {
+		if !strings.Contains(input.Caption, "1:") || strings.Contains(input.Caption, `[{"Фото":1}`) || len(input.Entities) != 2 {
 			t.Fatalf("existing card did not receive the compact expandable summary: %+v", input)
 		}
 		targets = append(targets, input.Message)
@@ -234,6 +234,51 @@ func TestRefreshZIPControlsRequiresConfirmedIDChatAndThread(t *testing.T) {
 				if err == nil || result.ArchiveCards != 1 || result.ArchiveControls != 0 || fmt.Sprint(methods) != "[editMessageCaption editMessageReplyMarkup]" {
 					t.Fatalf("unconfirmed control receipt accepted/retried: %+v %v %v", result, methods, err)
 				}
+			}
+		})
+	}
+}
+
+func TestRefreshCardsOnlyEditsConfirmedCardsWithoutZIPControls(t *testing.T) {
+	for _, repairState := range []string{"sent", "uncertain"} {
+		t.Run("repair="+repairState, func(t *testing.T) {
+			svc, p, _, _ := captionRefreshFixture(t)
+			if _, err := svc.Store.DB.Exec("DELETE FROM deliveries"); err != nil {
+				t.Fatal(err)
+			}
+			if repairState != "sent" {
+				if _, err := svc.Store.DB.Exec("UPDATE archive_profile_repairs SET state=? WHERE version_id=?", repairState, p.VersionID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls := 0
+			tg := NewTelegram(svc.Config)
+			tg.HTTP = &http.Client{Transport: archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if filepath.Base(r.URL.Path) != "editMessageCaption" {
+					t.Fatalf("cards-only attempted non-caption mutation: %s", r.URL.Path)
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["message_id"] != float64(101) || body["chat_id"] != float64(svc.Config.BackupChatID) || body["reply_markup"] != nil {
+					t.Fatal("cards-only edited ZIP or markup")
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}`)), Request: r}, nil
+			})}
+			svc.TG = tg
+			svc.Archiver.TG = tg
+			result, err := svc.RefreshCaptions(context.Background(), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 1
+			if repairState != "sent" {
+				want = 0
+			}
+			if calls != want || result.ArchiveCards != want || result.ArchiveControls != 0 || result.PrivateCards != 0 {
+				t.Fatalf("normal/excluded selection or cards-only count wrong: %+v calls%d", result, calls)
 			}
 		})
 	}

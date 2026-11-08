@@ -238,7 +238,7 @@ if sys.argv[1] == 'restart':
                 env = dict(self.env, DEPLOY_TEST_RESTART_COUNT=str(counter),
                            DEPLOY_TEST_FAIL_RESTART="1" if fail else "0")
                 setup = "set -Eeuo pipefail\nbase=$1; release_dir=$2; previous_target=$3; source_dir=$4; revision=" + "b" * 40 + "\n"
-                setup += "data_dir=/unused; env_file=/unused; unit_names=(jardulik-companion.service)\nswitched=false\n"
+                setup += "data_dir=/unused; env_file=/unused; unit_names=(jardulik-companion.service)\nno_start=false\nswitched=false\n"
                 result = subprocess.run(["bash", "-c", setup + activation,
                                          "activate", str(base), str(new), str(old), str(self.repo)],
                                         env=env, capture_output=True, text=True, timeout=10)
@@ -251,6 +251,80 @@ if sys.argv[1] == 'restart':
                 self.assertEqual(counter.read_text(), "2" if fail else "1")
                 if not fail:
                     self.assertEqual((base / "previous").resolve(), old.resolve())
+
+    def test_no_start_mode_reaches_remote_installer_and_rejects_unknown_mode(self):
+        self.commit_and_publish_locally()
+        result = self.run_deploy("--no-start", "sg-1gb")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        remote = [line for line in self.log.read_text().splitlines() if "bash -s --" in line]
+        self.assertEqual(len(remote), 1)
+        self.assertTrue(remote[0].endswith(" true"), remote)
+        result = subprocess.run(["bash", str(SOURCE / "deploy/install.sh"), "0" * 40,
+                                 str(self.base), "0" * 64, "0" * 64, "--unknown-mode"],
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid installation mode", result.stderr)
+
+    def test_no_start_requires_inactive_and_rolls_back_without_starting_units(self):
+        script = (SOURCE / "deploy/install.sh").read_text()
+        guard = "require_inactive() {\n" + script.split("require_inactive() {\n", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+        activation = script.split("switched=false\n", 1)[1]
+        self.write_mock("mv", """#!/usr/bin/env python3
+import os, sys
+paths = [arg for arg in sys.argv[1:] if not arg.startswith('-')]
+os.replace(paths[0], paths[1])
+""")
+        self.write_mock("systemctl", """#!/usr/bin/env python3
+import os, pathlib, sys
+with pathlib.Path(os.environ['DEPLOY_TEST_CONTROL_LOG']).open('a') as f:
+    f.write(' '.join(sys.argv[1:]) + '\\n')
+if sys.argv[1] == 'show':
+    print(os.environ['DEPLOY_TEST_SERVICE_STATE'])
+else:
+    raise SystemExit(99)
+""")
+        self.write_mock("systemd-analyze", """#!/bin/sh
+if [ "$DEPLOY_TEST_FAIL_VERIFY" = 1 ]; then exit 1; fi
+""")
+        for name in ("systemd-run", "sleep"):
+            self.write_mock(name, "#!/bin/sh\nexit 99\n")
+        cases = (("inactive", False), ("inactive", True), ("active", False),
+                 ("activating", False), ("failed", False))
+        for index, (state, fail_verify) in enumerate(cases):
+            with self.subTest(service_state=state, failed_verification=fail_verify):
+                base = self.base / ("no-start-" + str(index))
+                old = base / "releases" / ("a" * 40)
+                new = base / "releases" / ("b" * 40)
+                old.mkdir(parents=True)
+                new.mkdir()
+                for folder, label in ((old, "old"), (new, "new")):
+                    for binary in ("jardulik", "telegram-transfer"):
+                        (folder / binary).write_text(label + ":" + binary)
+                (base / "current").symlink_to(old)
+                control_log = base / "control.log"
+                env = dict(self.env, DEPLOY_TEST_CONTROL_LOG=str(control_log),
+                           DEPLOY_TEST_SERVICE_STATE=state,
+                           DEPLOY_TEST_FAIL_VERIFY="1" if fail_verify else "0")
+                setup = "set -Eeuo pipefail\nbase=$1; release_dir=$2; previous_target=$3; source_dir=$4; revision=" + "b" * 40 + "\n"
+                setup += "data_dir=/unused; env_file=/unused; unit_names=(jardulik-companion.service)\nno_start=true\nswitched=false\n"
+                result = subprocess.run(["bash", "-c", setup + guard + activation,
+                                         "install-stopped", str(base), str(new), str(old), str(self.repo)],
+                                        env=env, capture_output=True, text=True, timeout=10)
+                success = state == "inactive" and not fail_verify
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+                expected, label = (new, "new") if success else (old, "old")
+                self.assertEqual((base / "current").resolve(), expected.resolve())
+                for binary in ("jardulik", "telegram-transfer"):
+                    self.assertEqual((base / "current" / binary).read_text(), label + ":" + binary)
+                calls = control_log.read_text().splitlines()
+                self.assertTrue(calls)
+                self.assertTrue(all(line.startswith("show ") for line in calls), calls)
+                self.assertEqual(len(calls), 2 if success else 1)
+                if success:
+                    self.assertIn("without starting", result.stdout)
+                    self.assertEqual((base / "previous").resolve(), old.resolve())
+                if state != "inactive":
+                    self.assertIn("must already be inactive", result.stderr)
 
     def test_environment_gate_rejects_unsafe_values_without_disclosing_secrets(self):
         script = (SOURCE / "deploy/install.sh").read_text()

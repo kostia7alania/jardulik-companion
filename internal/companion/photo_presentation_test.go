@@ -32,13 +32,13 @@ func photoPresentationSource(t *testing.T, index, width, height int) MediaJob {
 
 func photoQuoteText(t *testing.T, value photoText) string {
 	t.Helper()
-	if len(value.Entities) != 1 {
+	e, ok := photoQuote(value.Entities)
+	if !ok {
 		t.Fatalf("expected one collapsed quote: %+v", value.Entities)
 	}
 	if err := validMessageEntities(value.Text, value.Entities); err != nil {
 		t.Fatal(err)
 	}
-	e := value.Entities[0]
 	text := utf16.Encode([]rune(value.Text))
 	return string(utf16.Decode(text[e.Offset : e.Offset+e.Length]))
 }
@@ -53,7 +53,7 @@ func TestPhotoCaptionQuotePreservesFooterAndSafeNumberedOrder(t *testing.T) {
 	text := strings.Repeat("🙂<blockquote>О фото</blockquote>", 300) + "\n\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
 	card := photoCardText(text, rows, "\nТекст: /text_99", 1024)
 	quote := photoQuoteText(t, card)
-	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "1:2×3") || !strings.Contains(quote, "2:4×5") || !strings.Contains(quote, "Jardulik: 99") || !strings.Contains(card.Text, "Jardulik: 99") || !strings.Contains(card.Text, "UTC+3") || !strings.HasSuffix(card.Text, "https://t.me/c/123/55") {
+	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "1:2×3") || !strings.Contains(quote, "2:4×5") || !strings.Contains(quote, "Jardulik: 99") || !strings.Contains(card.Text, "Jardulik: 99") || !strings.Contains(card.Text, "UTC+3") || !strings.HasSuffix(card.Text, "🔗 пост") {
 		t.Fatalf("caption/entity/footer invalid: %+v", card)
 	}
 }
@@ -259,7 +259,7 @@ func TestPhotoQuoteContainsDetailsWhileSnapshotAndLinkStayOutside(t *testing.T) 
 				card = fullPhotoText(text, rows)
 			}
 			quote := photoQuoteText(t, card)
-			if strings.Contains(quote, "О фото") || !strings.HasSuffix(quote, "Не указано: возраст, рост, город\nJardulik: 99") || strings.Contains(quote, snapshot) || strings.Contains(quote, link) || strings.Count(card.Text, "Jardulik: 99") != 1 || strings.Count(card.Text, "Не указано:") != 1 || !strings.HasSuffix(card.Text, link) {
+			if strings.Contains(quote, "О фото") || !strings.HasSuffix(quote, "Не указано: возраст, рост, город\nJardulik: 99") || strings.Contains(quote, snapshot) || strings.Contains(quote, link) || strings.Count(card.Text, "Jardulik: 99") != 1 || strings.Count(card.Text, "Не указано:") != 1 || !strings.HasSuffix(card.Text, "🔗 пост") {
 				t.Fatalf("details/outer footer misplaced: %+v", card)
 			}
 		}
@@ -314,7 +314,7 @@ func TestNoPhotoArchiveCardUsesTextEntityAndRefreshMethod(t *testing.T) {
 			t.Fatal(err)
 		}
 		text, _ := call.json["text"].(string)
-		if photoQuoteText(t, photoText{Text: text, Entities: entities}) != fmt.Sprintf("Jardulik: %d", p.ID) {
+		if !strings.Contains(photoQuoteText(t, photoText{Text: text, Entities: entities}), fmt.Sprintf("Jardulik: %d", p.ID)) {
 			t.Fatal("archive text details missing")
 		}
 		return `{"ok":true,"result":{"message_id":101,"chat":{"id":-100123}}}`, nil
@@ -322,7 +322,11 @@ func TestNoPhotoArchiveCardUsesTextEntityAndRefreshMethod(t *testing.T) {
 	if _, err := a.sendProfileCard(context.Background(), p, nil, 55, func([]int64) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.editKnownText(context.Background(), 101, a.profileCardContent(p, 0, 55, 4096, true, nil)); err != nil {
+	card, err := a.profileCardContent(p, 0, 55, 4096, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.editKnownText(context.Background(), 101, card); err != nil {
 		t.Fatal(err)
 	}
 	if fmt.Sprint(methods) != "[sendMessage editMessageText]" {

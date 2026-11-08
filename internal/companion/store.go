@@ -48,6 +48,7 @@ type Profile map[string]any
 type StoredProfile struct {
 	VersionID, ID       int64
 	Profile             Profile
+	RawJSON             string `json:"-"`
 	FirstSeen, LastSeen string
 }
 type MediaJob struct {
@@ -328,10 +329,9 @@ func (s *Store) archive(ctx context.Context, owner int64, profiles []Profile, so
 }
 func scanProfile(row interface{ Scan(...any) error }) (StoredProfile, error) {
 	var p StoredProfile
-	var raw string
-	err := row.Scan(&p.VersionID, &p.ID, &raw, &p.FirstSeen, &p.LastSeen)
+	err := row.Scan(&p.VersionID, &p.ID, &p.RawJSON, &p.FirstSeen, &p.LastSeen)
 	if err == nil {
-		err = json.Unmarshal([]byte(raw), &p.Profile)
+		err = json.Unmarshal([]byte(p.RawJSON), &p.Profile)
 	}
 	return p, err
 }
@@ -418,11 +418,10 @@ func (s *Store) List(ctx context.Context, owner int64, favorites bool, before in
 	var out []ProfileListItem
 	for rows.Next() {
 		var p ProfileListItem
-		var raw string
-		if err := rows.Scan(&p.VersionID, &p.ID, &raw, &p.FirstSeen, &p.LastSeen, &p.Cursor); err != nil {
+		if err := rows.Scan(&p.VersionID, &p.ID, &p.RawJSON, &p.FirstSeen, &p.LastSeen, &p.Cursor); err != nil {
 			return nil, err
 		}
-		if err := json.Unmarshal([]byte(raw), &p.Profile); err != nil {
+		if err := json.Unmarshal([]byte(p.RawJSON), &p.Profile); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

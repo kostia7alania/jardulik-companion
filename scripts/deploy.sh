@@ -3,7 +3,12 @@ set -euo pipefail
 
 die() { printf 'deploy: %s\n' "$*" >&2; exit 1; }
 
-[[ $# -le 1 ]] || die 'usage: scripts/deploy.sh [ssh-host-alias]'
+no_start=false
+if [[ ${1:-} == --no-start ]]; then
+    no_start=true
+    shift
+fi
+[[ $# -le 1 ]] || die 'usage: scripts/deploy.sh [--no-start] [ssh-host-alias]'
 deploy_host=${1:-sg-1gb}
 [[ $deploy_host =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'invalid SSH host alias'
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -60,15 +65,22 @@ stage_candidate=$(ssh "${ssh_options[@]}" "$deploy_host" 'mktemp -d /tmp/jarduli
 [[ $stage_candidate =~ ^/tmp/jardulik-deploy\.[A-Za-z0-9]+$ ]] || die 'the server returned an unexpected staging path'
 remote_stage=$stage_candidate
 scp "${ssh_options[@]}" "$staging_dir/release.tar.gz" "$deploy_host:$remote_stage/release.tar.gz"
-ssh "${ssh_options[@]}" "$deploy_host" bash -s -- "$remote_stage" "$revision" "$archive_sha" "$binary_sha" "$helper_sha" <<'REMOTE'
+ssh "${ssh_options[@]}" "$deploy_host" bash -s -- "$remote_stage" "$revision" "$archive_sha" "$binary_sha" "$helper_sha" "$no_start" <<'REMOTE'
 set -euo pipefail
 stage=$1
 revision=$2
 archive_sha=$3
 binary_sha=$4
 helper_sha=$5
+no_start=$6
+install_args=("$revision" "$stage/unpacked" "$binary_sha" "$helper_sha")
+if [[ $no_start == true ]]; then
+    install_args+=(--no-start)
+elif [[ $no_start != false ]]; then
+    exit 1
+fi
 printf '%s  %s\n' "$archive_sha" "$stage/release.tar.gz" | sha256sum --check --status
 mkdir "$stage/unpacked"
 tar --no-same-owner -xzf "$stage/release.tar.gz" -C "$stage/unpacked"
-bash "$stage/unpacked/deploy/install.sh" "$revision" "$stage/unpacked" "$binary_sha" "$helper_sha"
+bash "$stage/unpacked/deploy/install.sh" "${install_args[@]}"
 REMOTE
