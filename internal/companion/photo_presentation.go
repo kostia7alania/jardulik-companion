@@ -296,7 +296,7 @@ func privateAlbumActionTail(p StoredProfile, photos int) string {
 	if photos < 2 {
 		return ""
 	}
-	return fmt.Sprintf("\n\nТекст: /text_%d\nJSON: /json_%d\nИзбранное: /fav_%d · /next", p.ID, p.VersionID, p.ID)
+	return fmt.Sprintf("\n\nТекст: /text_%d\nJSON: /json_%d\n❤️ /like_%d · Избранное: /fav_%d · /next", p.ID, p.VersionID, p.ID, p.ID)
 }
 func unavailableMediaCount(jobs []MediaJob) int {
 	n := 0

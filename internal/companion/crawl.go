@@ -24,9 +24,11 @@ const crawlSchema = `
 CREATE TABLE IF NOT EXISTS feed_crawls (
  owner_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
  run_id TEXT NOT NULL, upstream_id INTEGER NOT NULL, generation TEXT NOT NULL,
- filters_json TEXT NOT NULL, include_others INTEGER NOT NULL, mode INTEGER NOT NULL DEFAULT 0,
+ filters_json TEXT NOT NULL, include_others INTEGER NOT NULL, include_locations INTEGER NOT NULL DEFAULT 0, mode INTEGER NOT NULL DEFAULT 0,
  page INTEGER NOT NULL DEFAULT 1, next_request INTEGER NOT NULL, state TEXT NOT NULL,
  reason TEXT NOT NULL DEFAULT '', pages INTEGER NOT NULL DEFAULT 0, received INTEGER NOT NULL DEFAULT 0,
+ catalog_pages INTEGER NOT NULL DEFAULT 0, catalog_received INTEGER NOT NULL DEFAULT 0, catalog_profiles INTEGER NOT NULL DEFAULT 0,
+ hydrated INTEGER NOT NULL DEFAULT 0, unavailable INTEGER NOT NULL DEFAULT 0,
  started_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS feed_crawl_pages (
@@ -37,31 +39,37 @@ CREATE TABLE IF NOT EXISTS feed_crawl_pages (
 INSERT OR IGNORE INTO meta(key,value) VALUES('feed_crawl_next','0');`
 
 type CrawlJob struct {
-	Owner         int64       `json:"owner"`
-	RunID         string      `json:"run_id"`
-	UserID        int64       `json:"user_id"`
-	Generation    string      `json:"-"`
-	Filters       FeedFilters `json:"filters"`
-	IncludeOthers bool        `json:"include_others"`
-	Mode          int         `json:"all_mode"`
-	Page          int         `json:"next_page"`
-	NextRequest   int64       `json:"next_request"`
-	State         string      `json:"state"`
-	Reason        string      `json:"reason,omitempty"`
-	Pages         int         `json:"pages_archived"`
-	Received      int         `json:"records_received"`
-	StartedAt     int64       `json:"started_at"`
-	UpdatedAt     int64       `json:"updated_at"`
+	Owner            int64       `json:"owner"`
+	RunID            string      `json:"run_id"`
+	UserID           int64       `json:"user_id"`
+	Generation       string      `json:"-"`
+	Filters          FeedFilters `json:"filters"`
+	IncludeOthers    bool        `json:"include_others"`
+	IncludeLocations bool        `json:"include_locations"`
+	Mode             int         `json:"all_mode"`
+	Page             int         `json:"next_page"`
+	NextRequest      int64       `json:"next_request"`
+	State            string      `json:"state"`
+	Reason           string      `json:"reason,omitempty"`
+	Pages            int         `json:"pages_archived"`
+	Received         int         `json:"records_received"`
+	CatalogPages     int         `json:"catalog_pages"`
+	CatalogReceived  int         `json:"catalog_records_received"`
+	CatalogProfiles  int         `json:"catalog_unique_profiles"`
+	Hydrated         int         `json:"profiles_hydrated"`
+	Unavailable      int         `json:"profiles_unavailable"`
+	StartedAt        int64       `json:"started_at"`
+	UpdatedAt        int64       `json:"updated_at"`
 }
 
 func (j CrawlJob) active() bool { return j.State == "queued" || j.State == "running" }
 
-const crawlColumns = "owner_id,run_id,upstream_id,generation,filters_json,include_others,mode,page,next_request,state,reason,pages,received,started_at,updated_at"
+const crawlColumns = "owner_id,run_id,upstream_id,generation,filters_json,include_others,include_locations,mode,page,next_request,state,reason,pages,received,catalog_pages,catalog_received,catalog_profiles,hydrated,unavailable,started_at,updated_at"
 
 func scanCrawl(row interface{ Scan(...any) error }) (*CrawlJob, error) {
 	var j CrawlJob
 	var raw string
-	err := row.Scan(&j.Owner, &j.RunID, &j.UserID, &j.Generation, &raw, &j.IncludeOthers, &j.Mode, &j.Page, &j.NextRequest, &j.State, &j.Reason, &j.Pages, &j.Received, &j.StartedAt, &j.UpdatedAt)
+	err := row.Scan(&j.Owner, &j.RunID, &j.UserID, &j.Generation, &raw, &j.IncludeOthers, &j.IncludeLocations, &j.Mode, &j.Page, &j.NextRequest, &j.State, &j.Reason, &j.Pages, &j.Received, &j.CatalogPages, &j.CatalogReceived, &j.CatalogProfiles, &j.Hydrated, &j.Unavailable, &j.StartedAt, &j.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +91,9 @@ func (s *Store) CrawlStatus(ctx context.Context, owner int64) (*CrawlJob, error)
 	if err != nil || !exists {
 		return nil, err
 	}
+	if err = s.migrateCrawl(ctx); err != nil {
+		return nil, err
+	}
 	j, err := scanCrawl(s.DB.QueryRowContext(ctx, "SELECT "+crawlColumns+" FROM feed_crawls WHERE owner_id=?", owner))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -99,18 +110,6 @@ func (s *Store) StopCrawl(ctx context.Context, owner int64, reason string) error
 	return err
 }
 
-func stopCrawlTx(ctx context.Context, tx *sql.Tx, owner int64, reason string) error {
-	var exists bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='feed_crawls')").Scan(&exists); err != nil {
-		return err
-	}
-	if !exists {
-		return nil
-	}
-	_, err := tx.ExecContext(ctx, "UPDATE feed_crawls SET state='stopped',reason=?,updated_at=? WHERE owner_id=? AND state IN ('queued','running')", reason, time.Now().UnixMilli(), owner)
-	return err
-}
-
 type FeedCrawler struct {
 	Service *Service
 	mu      sync.Mutex
@@ -121,9 +120,52 @@ func NewFeedCrawler(s *Service) *FeedCrawler {
 	return &FeedCrawler{Service: s, now: time.Now}
 }
 
+func (s *Store) migrateCrawl(ctx context.Context) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Serialize schema inspection with other processes before taking a WAL read snapshot.
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='feed_crawl_next'"); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(feed_crawls)")
+	if err != nil {
+		return err
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var def any
+		if err = rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"include_locations", "catalog_pages", "catalog_received", "catalog_profiles", "hydrated", "unavailable"} {
+		if !columns[name] {
+			if _, err = tx.ExecContext(ctx, "ALTER TABLE feed_crawls ADD COLUMN "+name+" INTEGER NOT NULL DEFAULT 0"); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
+}
+
 func (c *FeedCrawler) init(ctx context.Context) error {
-	_, err := c.Service.Store.DB.ExecContext(ctx, filterSchema+crawlSchema)
-	return err
+	_, err := c.Service.Store.DB.ExecContext(ctx, filterSchema+crawlSchema+locationSchema+crawlPresenceSchema)
+	if err != nil {
+		return err
+	}
+	return c.Service.Store.migrateCrawl(ctx)
 }
 
 func crawlSession(ctx context.Context, tx *sql.Tx, store *Store, owner int64) (Session, error) {
@@ -146,7 +188,11 @@ func crawlSession(ctx context.Context, tx *sql.Tx, store *Store, owner int64) (S
 }
 
 // Request is DB-only. Source entitlement is freshly verified by each worker page.
-func (c *FeedCrawler) Request(ctx context.Context, owner int64, includeOthers bool) (*CrawlJob, error) {
+func (c *FeedCrawler) Request(ctx context.Context, owner int64, includeOthers bool, includeLocations ...bool) (*CrawlJob, error) {
+	if len(includeLocations) > 1 {
+		return nil, errors.New("invalid crawl options")
+	}
+	locations := len(includeLocations) == 1 && includeLocations[0]
 	s := c.Service
 	mu := s.userLock(owner)
 	mu.Lock()
@@ -167,7 +213,6 @@ func (c *FeedCrawler) Request(ctx context.Context, owner int64, includeOthers bo
 	if err != nil {
 		return nil, err
 	}
-	s.cancelRun(owner)
 	tx, err := s.Store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -200,24 +245,19 @@ func (c *FeedCrawler) Request(ctx context.Context, owner int64, includeOthers bo
 	if next < now {
 		next = now
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO feed_filters(owner_id,applied_json,draft_json,include_others,others_id) VALUES(?,?,NULL,0,'')
-	 ON CONFLICT(owner_id) DO UPDATE SET applied_json=excluded.applied_json,draft_json=NULL,include_others=0,others_id=''`, owner, string(raw))
-	if err != nil {
-		return nil, err
-	}
-	if err = resetFilterQueueTx(ctx, tx, owner); err != nil {
-		return nil, err
-	}
 	if _, err = tx.ExecContext(ctx, "DELETE FROM feed_crawl_pages WHERE owner_id=?", owner); err != nil {
 		return nil, err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO feed_crawls(owner_id,run_id,upstream_id,generation,filters_json,include_others,next_request,state,started_at,updated_at)
-	 VALUES(?,?,?,?,?,?,?,'queued',?,?)
+	_, err = tx.ExecContext(ctx, `INSERT INTO feed_crawls(owner_id,run_id,upstream_id,generation,filters_json,include_others,include_locations,next_request,state,started_at,updated_at)
+	 VALUES(?,?,?,?,?,?,?,?,'queued',?,?)
 	 ON CONFLICT(owner_id) DO UPDATE SET run_id=excluded.run_id,upstream_id=excluded.upstream_id,generation=excluded.generation,
-	 filters_json=excluded.filters_json,include_others=excluded.include_others,mode=0,page=1,next_request=excluded.next_request,
-	 state='queued',reason='',pages=0,received=0,started_at=excluded.started_at,updated_at=excluded.updated_at`,
-		owner, run, session.UserID, session.Generation, string(raw), includeOthers, next, now, now)
+	 filters_json=excluded.filters_json,include_others=excluded.include_others,include_locations=excluded.include_locations,mode=0,page=1,next_request=excluded.next_request,
+	 state='queued',reason='',pages=0,received=0,catalog_pages=0,catalog_received=0,catalog_profiles=0,hydrated=0,unavailable=0,started_at=excluded.started_at,updated_at=excluded.updated_at`,
+		owner, run, session.UserID, session.Generation, string(raw), includeOthers, locations, next, now, now)
 	if err != nil {
+		return nil, err
+	}
+	if err = initCrawlPresenceTx(ctx, tx, owner, run); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -275,13 +315,6 @@ func (c *FeedCrawler) invalid(ctx context.Context, j *CrawlJob) (string, error) 
 	if c.Service.Store.Paused(ctx, j.Owner) {
 		return "paused", nil
 	}
-	filters, err := c.Service.Store.filterState(ctx, j.Owner)
-	if err != nil {
-		return "", err
-	}
-	if filters.Applied == nil || *filters.Applied != j.Filters || filters.Others {
-		return "filters_changed", nil
-	}
 	return "", nil
 }
 
@@ -323,7 +356,7 @@ func crawlErrorReason(err error) string {
 	return "request_failed"
 }
 
-// Step handles at most one page across all owners, without reactions or ID scans.
+// Step handles at most one source page or catalog-proven full profile across all owners.
 func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -357,11 +390,35 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 	} else if reason != "" {
 		return true, c.stop(ctx, j, reason)
 	}
-	if j.Page > crawlPageCap {
+	if j.Mode < 0 || j.Mode > 3 || (j.Mode >= 2 && !j.IncludeLocations) {
+		return true, c.stop(ctx, j, "invalid_phase")
+	}
+	if j.Mode != 3 && j.Page > crawlPageCap {
 		return true, c.stop(ctx, j, "page_cap")
 	}
 	if err := s.Media.CheckDisk(); err != nil {
 		return true, c.stop(ctx, j, "disk_reserve")
+	}
+	var target int64
+	if j.Mode == 3 {
+		target, err = s.Store.nextCrawlLocation(ctx, j)
+		if errors.Is(err, sql.ErrNoRows) {
+			sessionMu := s.Client.lock(j.Owner)
+			sessionMu.Lock()
+			defer sessionMu.Unlock()
+			if reason, guardErr := c.invalid(ctx, j); guardErr != nil {
+				return true, guardErr
+			} else if reason != "" {
+				return true, c.stop(ctx, j, reason)
+			}
+			if err = c.checkpointHydration(ctx, j, 0, nil, false); err != nil {
+				return true, c.stop(ctx, j, "checkpoint_failed")
+			}
+			return true, nil
+		}
+		if err != nil {
+			return true, err
+		}
 	}
 	// Reserve a durable gap before HTTP, then extend it from completion in defer.
 	tx, err := s.Store.DB.BeginTx(ctx, nil)
@@ -396,7 +453,22 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		_, _ = s.Store.DB.ExecContext(gapCtx, "UPDATE meta SET value=MAX(CAST(value AS INTEGER),?) WHERE key='feed_crawl_next'", next)
 		_, _ = s.Store.DB.ExecContext(gapCtx, "UPDATE feed_crawls SET next_request=MAX(next_request,?) WHERE owner_id=? AND run_id=?", next, j.Owner, j.RunID)
 	}()
-	profiles, requestErr := s.Client.UsersFrozen(ctx, j.Owner, Session{UserID: j.UserID, Generation: j.Generation}, j.Filters, j.Page, j.Mode == 1)
+	var profiles []Profile
+	var locations LocationPage
+	var requestErr error
+	expected := Session{UserID: j.UserID, Generation: j.Generation}
+	switch j.Mode {
+	case 0, 1:
+		profiles, requestErr = s.Client.UsersFrozen(ctx, j.Owner, expected, j.Filters, j.Page, j.Mode == 1)
+	case 2:
+		locations, requestErr = s.Client.LocationsFrozen(ctx, j.Owner, expected, "", "", j.Page)
+	case 3:
+		var profile Profile
+		profile, requestErr = s.Client.FullProfileFrozen(ctx, j.Owner, expected, target)
+		if requestErr == nil {
+			profiles = []Profile{profile}
+		}
+	}
 	if ctx.Err() != nil {
 		return true, ctx.Err()
 	}
@@ -412,29 +484,56 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		}
 		return true, c.stop(ctx, j, reason)
 	}
-	if requestErr != nil {
+	if requestErr != nil && !(j.Mode == 3 && errors.Is(requestErr, ErrProfileUnavailable)) {
 		return true, c.stop(ctx, j, crawlErrorReason(requestErr))
 	}
 	if err := s.Media.CheckDisk(); err != nil {
 		return true, c.stop(ctx, j, "disk_reserve")
 	}
+	if j.Mode == 2 {
+		if err = s.Store.saveCrawlLocations(ctx, j, locations, c.now()); err != nil {
+			if ctx.Err() != nil {
+				return true, ctx.Err()
+			}
+			return true, c.stop(ctx, j, "archive_failed")
+		}
+		if err = c.checkpointLocations(ctx, j, locations); err != nil {
+			if ctx.Err() != nil {
+				return true, ctx.Err()
+			}
+			return true, c.stop(ctx, j, "checkpoint_failed")
+		}
+		return true, nil
+	}
+	if j.Mode == 3 && errors.Is(requestErr, ErrProfileUnavailable) {
+		if err = c.checkpointHydration(ctx, j, target, nil, true); err != nil {
+			if ctx.Err() != nil {
+				return true, ctx.Err()
+			}
+			return true, c.stop(ctx, j, "checkpoint_failed")
+		}
+		return true, nil
+	}
 	fingerprint, err := crawlFingerprint(profiles)
 	if err != nil {
 		return true, c.stop(ctx, j, "invalid_profiles")
 	}
-	if _, err = s.Store.Archive(ctx, j.Owner, profiles, "GET /user/getUsers (crawl)"); err != nil {
+	source := "GET /user/getUsers (crawl)"
+	if j.Mode == 3 {
+		source = "GET /user/getUser (crawl catalog)"
+	}
+	if _, err = s.Store.ArchiveViewed(ctx, j.Owner, profiles, source); err != nil {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
 		}
 		return true, c.stop(ctx, j, "archive_failed")
 	}
-	if err = s.Store.RestoreFilteredBatch(ctx, j.Owner, profiles); err != nil {
-		if ctx.Err() != nil {
-			return true, ctx.Err()
-		}
-		return true, c.stop(ctx, j, "archive_failed")
+	if j.Mode == 3 {
+		err = c.checkpointHydration(ctx, j, target, profiles, false)
+	} else {
+		err = c.checkpoint(ctx, j, fingerprint, len(profiles), profiles)
 	}
-	if err = c.checkpoint(ctx, j, fingerprint, len(profiles)); err != nil {
+	if err != nil {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
 		}
@@ -443,61 +542,189 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (c *FeedCrawler) checkpoint(ctx context.Context, j *CrawlJob, fingerprint string, count int) error {
+func (c *FeedCrawler) checkpointTx(ctx context.Context, j *CrawlJob, advance func(*sql.Tx, *CrawlJob) error) error {
 	tx, err := c.Service.Store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var state, run string
-	if err = tx.QueryRowContext(ctx, "SELECT run_id,state FROM feed_crawls WHERE owner_id=?", j.Owner).Scan(&run, &state); err != nil {
+	var mode, page int
+	if err = tx.QueryRowContext(ctx, "SELECT run_id,state,mode,page FROM feed_crawls WHERE owner_id=?", j.Owner).Scan(&run, &state, &mode, &page); err != nil {
 		return err
 	}
-	if run != j.RunID || (state != "queued" && state != "running") {
+	if run != j.RunID || (state != "queued" && state != "running") || mode != j.Mode || page != j.Page {
 		return nil
 	}
-	nextPage, nextMode := j.Page, j.Mode
-	reason, nextState := "", "running"
-	pages, received := j.Pages, j.Received
-	if count == 0 {
-		if j.Mode == 0 && j.IncludeOthers {
-			nextMode, nextPage = 1, 1
-		} else {
-			nextState, reason = "done", "empty_page"
-		}
-	} else {
-		pages++
-		received += count
-		var seen bool
-		if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM feed_crawl_pages WHERE owner_id=? AND run_id=? AND mode=? AND fingerprint=?)", j.Owner, j.RunID, j.Mode, fingerprint).Scan(&seen); err != nil {
-			return err
-		}
-		if seen {
-			nextState, reason = "stopped", "repeated_page"
-		} else {
-			if _, err = tx.ExecContext(ctx, "INSERT INTO feed_crawl_pages(owner_id,run_id,mode,fingerprint,page) VALUES(?,?,?,?,?)", j.Owner, j.RunID, j.Mode, fingerprint, j.Page); err != nil {
-				return err
-			}
-			nextPage++
-			if nextPage > crawlPageCap {
-				nextState, reason = "stopped", "page_cap"
-			}
-		}
+	next := *j
+	next.State, next.Reason = "running", ""
+	if err = advance(tx, &next); err != nil {
+		return err
 	}
-	_, err = tx.ExecContext(ctx, "UPDATE feed_crawls SET state=?,reason=?,mode=?,page=?,next_request=?,pages=?,received=?,updated_at=? WHERE owner_id=? AND run_id=?", nextState, reason, nextMode, nextPage, c.now().Add(crawlGap).UnixMilli(), pages, received, c.now().UnixMilli(), j.Owner, j.RunID)
+	next.NextRequest, next.UpdatedAt = c.now().Add(crawlGap).UnixMilli(), c.now().UnixMilli()
+	_, err = tx.ExecContext(ctx, `UPDATE feed_crawls SET state=?,reason=?,mode=?,page=?,next_request=?,pages=?,received=?,catalog_pages=?,catalog_received=?,catalog_profiles=?,hydrated=?,unavailable=?,updated_at=? WHERE owner_id=? AND run_id=?`,
+		next.State, next.Reason, next.Mode, next.Page, next.NextRequest, next.Pages, next.Received, next.CatalogPages, next.CatalogReceived, next.CatalogProfiles, next.Hydrated, next.Unavailable, next.UpdatedAt, j.Owner, j.RunID)
 	if err != nil {
 		return err
 	}
+	if next.State == "done" {
+		if err = finishCrawlPresenceTx(ctx, tx, &next, c.now()); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
+}
+
+func crawlPageSeenTx(ctx context.Context, tx *sql.Tx, j *CrawlJob, fingerprint string) (bool, error) {
+	var seen bool
+	err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM feed_crawl_pages WHERE owner_id=? AND run_id=? AND mode=? AND fingerprint=?)", j.Owner, j.RunID, j.Mode, fingerprint).Scan(&seen)
+	if err != nil || seen {
+		return seen, err
+	}
+	_, err = tx.ExecContext(ctx, "INSERT INTO feed_crawl_pages(owner_id,run_id,mode,fingerprint,page) VALUES(?,?,?,?,?)", j.Owner, j.RunID, j.Mode, fingerprint, j.Page)
+	return false, err
+}
+
+func (c *FeedCrawler) checkpoint(ctx context.Context, j *CrawlJob, fingerprint string, count int, batches ...[]Profile) error {
+	return c.checkpointTx(ctx, j, func(tx *sql.Tx, next *CrawlJob) error {
+		if len(batches) > 0 {
+			if err := recordCrawlSeenTx(ctx, tx, j, batches[0], c.now()); err != nil {
+				return err
+			}
+		}
+		if count == 0 {
+			switch {
+			case j.Mode == 0 && j.IncludeOthers:
+				next.Mode, next.Page = 1, 1
+			case j.IncludeLocations:
+				next.Mode, next.Page = 2, 1
+			default:
+				next.State, next.Reason = "done", "empty_page"
+			}
+			return nil
+		}
+		next.Pages++
+		next.Received += count
+		seen, err := crawlPageSeenTx(ctx, tx, j, fingerprint)
+		if err != nil {
+			return err
+		}
+		if seen {
+			next.State, next.Reason = "stopped", "repeated_page"
+			return nil
+		}
+		next.Page++
+		if next.Page > crawlPageCap {
+			next.State, next.Reason = "stopped", "page_cap"
+		}
+		return nil
+	})
+}
+
+func (c *FeedCrawler) checkpointLocations(ctx context.Context, j *CrawlJob, page LocationPage) error {
+	return c.checkpointTx(ctx, j, func(tx *sql.Tx, next *CrawlJob) error {
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM crawl_location_results WHERE owner_id=? AND run_id=?", j.Owner, j.RunID).Scan(&next.CatalogProfiles); err != nil {
+			return err
+		}
+		count := len(page.Entries)
+		if count > 0 {
+			next.CatalogPages++
+			next.CatalogReceived += count
+			seen, err := crawlPageSeenTx(ctx, tx, j, page.Fingerprint)
+			if err != nil {
+				return err
+			}
+			if seen {
+				next.State, next.Reason = "stopped", "repeated_page"
+				return nil
+			}
+		}
+		if count == 0 || (int64(j.Page)*locationPageSize >= page.Total) {
+			next.Mode, next.Page = 3, 1
+		} else {
+			next.Page++
+			if next.Page > crawlPageCap {
+				next.State, next.Reason = "stopped", "page_cap"
+			}
+		}
+		return nil
+	})
+}
+
+func (c *FeedCrawler) checkpointHydration(ctx context.Context, j *CrawlJob, target int64, profiles []Profile, unavailable bool) error {
+	return c.checkpointTx(ctx, j, func(tx *sql.Tx, next *CrawlJob) error {
+		if target != 0 {
+			state, version := "unavailable", int64(0)
+			if !unavailable {
+				if len(profiles) != 1 || profiles[0].ID() != target {
+					return errors.New("invalid hydrated profile")
+				}
+				if err := recordCrawlSeenTx(ctx, tx, j, profiles, c.now()); err != nil {
+					return err
+				}
+				if err := tx.QueryRowContext(ctx, "SELECT version_id FROM queue WHERE owner_id=? AND profile_id=?", j.Owner, target).Scan(&version); err != nil {
+					return err
+				}
+				state = "hydrated"
+			}
+			result, err := tx.ExecContext(ctx, "UPDATE crawl_location_results SET state=?,version_id=?,completed_at=? WHERE owner_id=? AND run_id=? AND profile_id=? AND state='pending'", state, version, c.now().UnixMilli(), j.Owner, j.RunID, target)
+			if err != nil {
+				return err
+			}
+			if n, err := result.RowsAffected(); err != nil {
+				return err
+			} else if n != 1 {
+				return errors.New("hydration cursor changed")
+			}
+			if unavailable {
+				known, err := presenceVersionTx(ctx, tx, j.Owner, target)
+				if err != nil {
+					return err
+				}
+				if known > 0 {
+					if _, err = recordProfilePresenceTx(ctx, tx, j.Owner, target, false, "direct_unavailable", known, known, c.now()); err != nil {
+						return err
+					}
+				}
+				next.Unavailable++
+			} else {
+				next.Hydrated++
+			}
+			next.Page++
+		}
+		var pending bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM crawl_location_results WHERE owner_id=? AND run_id=? AND state='pending')", j.Owner, j.RunID).Scan(&pending); err != nil {
+			return err
+		}
+		if target == 0 && pending {
+			return errors.New("pending profile lacks source provenance")
+		}
+		if !pending {
+			next.State, next.Reason = "done", "empty_page"
+		}
+		return nil
+	})
 }
 
 func (j CrawlJob) shortStatus() string {
 	state := map[string]string{"queued": "ожидает", "running": "идёт", "done": "завершён", "stopped": "остановлен"}[j.State]
 	mode := "основная выдача"
-	if j.Mode == 1 {
+	switch j.Mode {
+	case 1:
 		mode = "дополнительная выдача"
+	case 2:
+		mode = "каталог локаций"
+	case 3:
+		mode = "полные анкеты из каталога"
 	}
-	text := fmt.Sprintf("Обход: %s; %s, страница %d; пачек %d, получено записей %d.", state, mode, j.Page, j.Pages, j.Received)
+	position := fmt.Sprintf("страница %d", j.Page)
+	if j.Mode == 3 {
+		position = fmt.Sprintf("обработано ID %d", j.Hydrated+j.Unavailable)
+	}
+	text := fmt.Sprintf("Обход доступной выдачи: %s; %s, %s; пачек выдачи %d, записей %d.", state, mode, position, j.Pages, j.Received)
+	if j.IncludeLocations {
+		text += fmt.Sprintf(" Каталог: страниц %d, записей %d, разных ID %d; полных анкет %d, недоступных %d.", j.CatalogPages, j.CatalogReceived, j.CatalogProfiles, j.Hydrated, j.Unavailable)
+	}
 	if j.Reason != "" && j.Reason != "empty_page" {
 		reason := map[string]string{
 			"paused": "пауза", "disconnected": "сессия отключена", "session_changed": "сессия изменилась",
@@ -506,7 +733,7 @@ func (j CrawlJob) shortStatus() string {
 			"repeated_page": "сервис повторяет уже полученную страницу", "page_cap": "лимит 1000 страниц",
 			"disk_reserve": "недостаточно свободного места", "challenge": "сервис запросил дополнительную проверку",
 			"archive_failed": "не удалось сохранить пачку", "request_failed": "не удалось получить страницу",
-			"checkpoint_failed": "не удалось сохранить прогресс обхода",
+			"checkpoint_failed": "не удалось сохранить прогресс обхода", "invalid_phase": "неизвестная фаза обхода",
 		}[j.Reason]
 		if reason == "" {
 			reason = j.Reason

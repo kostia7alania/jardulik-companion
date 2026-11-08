@@ -207,9 +207,6 @@ func (s *Store) applyFilterDraft(ctx context.Context, owner int64, draft filterD
 	if n, err := res.RowsAffected(); err != nil || n != 1 {
 		return errors.New("черновик устарел; открой /filters заново")
 	}
-	if err := stopCrawlTx(ctx, tx, owner, "filters_changed"); err != nil {
-		return err
-	}
 	if err := resetFilterQueueTx(ctx, tx, owner); err != nil {
 		return err
 	}

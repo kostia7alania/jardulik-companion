@@ -76,6 +76,70 @@ func uxProfiles(t *testing.T, s *Service, owner int64, count int) {
 	}
 }
 
+func TestUXImmediatePauseRequiresExactPrivateOwnerCommand(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		chat TGChat
+		want bool
+	}{
+		{"/pause", TGChat{ID: 1, Type: "private"}, true},
+		{"/pause@our_bot", TGChat{ID: 1, Type: "private"}, true},
+		{"/paused", TGChat{ID: 1, Type: "private"}, false},
+		{" ", TGChat{ID: 1, Type: "private"}, false},
+		{"/pause", TGChat{ID: 2, Type: "private"}, false},
+		{"/pause", TGChat{ID: 1, Type: "group"}, false},
+	} {
+		if got := isPrivatePause(&Message{From: TGUser{ID: 1}, Chat: tc.chat, Text: tc.text}); got != tc.want {
+			t.Fatalf("pause %q in %+v: got %t want %t", tc.text, tc.chat, got, tc.want)
+		}
+	}
+	if isPrivatePause(nil) {
+		t.Fatal("missing message recognized as pause")
+	}
+}
+
+func TestUXSettingsRoutesDoNotEnableOrContactSource(t *testing.T) {
+	s, sent := uxFixture(t)
+	for _, command := range []string{"/settings", "/autolike@our_bot"} {
+		uxSend(s, 1, command)
+	}
+	uxTap(s, 1, "settings")
+	if len(*sent) != 3 {
+		t.Fatalf("settings routes did not produce menus: %d", len(*sent))
+	}
+	for _, message := range *sent {
+		if !strings.Contains(message.Text, "выключен") {
+			t.Fatal("opening settings enabled automatic reactions")
+		}
+	}
+	var mode string
+	if err := s.Store.DB.QueryRow("SELECT mode FROM autolike_settings WHERE owner_id=1").Scan(&mode); err != nil || mode != "off" {
+		t.Fatalf("settings default: mode=%q err=%v", mode, err)
+	}
+	before := len(*sent)
+	s.Handle(context.Background(), Update{Callback: &Callback{From: TGUser{ID: 2}, Message: Message{Chat: TGChat{ID: 1, Type: "private"}}, Data: "settings"}})
+	if len(*sent) != before {
+		t.Fatal("foreign private chat accepted settings callback")
+	}
+}
+
+func TestUXPauseAndResumeDoNotRestartAutolikes(t *testing.T) {
+	s, _, calls := manualLikeFixture(t, `{"userId":101,"freezeState":false}`, `{"IsSuccess":true}`)
+	uxSend(s, 1, "/autolikes 1")
+	var mode string
+	if err := s.Store.DB.QueryRow("SELECT mode FROM autolike_settings WHERE owner_id=1").Scan(&mode); err != nil || mode != "series" {
+		t.Fatalf("explicit series request not persisted: mode=%q err=%v", mode, err)
+	}
+	uxSend(s, 1, "/pause")
+	uxSend(s, 1, "/resume")
+	if err := s.Store.DB.QueryRow("SELECT mode FROM autolike_settings WHERE owner_id=1").Scan(&mode); err != nil || mode != "off" {
+		t.Fatalf("resume enabled auto policy: mode=%q err=%v", mode, err)
+	}
+	if s.Store.Paused(context.Background(), 1) || len(*calls) != 0 {
+		t.Fatal("policy commands contacted source or failed to restore manual mode")
+	}
+}
+
 func TestUXHistoryAliasesAndPrivateOwnership(t *testing.T) {
 	s, sent := uxFixture(t)
 	uxProfiles(t, s, 1, 1)
@@ -251,7 +315,7 @@ func TestUXStatusShowsOnlyFreshPresentBalances(t *testing.T) {
 			if tc.balances && (!strings.Contains(text, "🔥 Огонь: 3") || !strings.Contains(text, "Чистый лист: 0")) {
 				t.Fatal("present zero balance was lost")
 			}
-			if !strings.Contains(text, "Отправлено лайков ботом: 0") || !strings.Contains(text, "Автолайки: выключены") || strings.Contains(text, "false") || strings.Contains(text, "суточ") {
+			if !strings.Contains(text, "Отправлено лайков ботом: 0") || !strings.Contains(text, "Реакции в Jardulik: выключены") || !strings.Contains(text, "Автолайкер: выключен") || strings.Contains(text, "false") || strings.Contains(text, "суточ") {
 				t.Fatalf("misleading action status: %s", text)
 			}
 		})
@@ -327,7 +391,7 @@ func TestUXWelcomeHelpAndConnectStayShortAndActionable(t *testing.T) {
 	}
 	s.Config.AllowReactions = true
 	uxSend(s, 1, "/autolikes 0")
-	if !strings.Contains((*sent)[len(*sent)-1].Text, "обычных лайков") || !strings.Contains((*sent)[len(*sent)-1].Text, strconv.Itoa(50)) {
+	if !strings.Contains((*sent)[len(*sent)-1].Text, "серии") || !strings.Contains((*sent)[len(*sent)-1].Text, strconv.Itoa(50)) {
 		t.Fatal("series guard not explained")
 	}
 }

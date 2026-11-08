@@ -31,7 +31,7 @@ func (s *Store) initRelations(ctx context.Context) error {
 	return err
 }
 
-// KnownProfile accepts only this owner's discovery or saved relationship provenance.
+// KnownProfile accepts only this owner's discovery, relationship or location provenance.
 func (s *Store) KnownProfile(ctx context.Context, owner, id int64) error {
 	if owner <= 0 || id <= 0 {
 		return sql.ErrNoRows
@@ -44,7 +44,18 @@ func (s *Store) KnownProfile(ctx context.Context, owner, id int64) error {
 	if err = s.initRelations(ctx); err != nil {
 		return err
 	}
-	return s.DB.QueryRowContext(ctx, `SELECT 1 FROM relation_profiles p JOIN relation_batches b ON b.id=p.batch_id AND b.owner_id=p.owner_id WHERE p.owner_id=? AND p.profile_id=? LIMIT 1`, owner, id).Scan(&found)
+	err = s.DB.QueryRowContext(ctx, `SELECT 1 FROM relation_profiles p JOIN relation_batches b ON b.id=p.batch_id AND b.owner_id=p.owner_id WHERE p.owner_id=? AND p.profile_id=? LIMIT 1`, owner, id).Scan(&found)
+	if err == nil || !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var catalog bool
+	if err = s.DB.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='location_profiles')").Scan(&catalog); err != nil {
+		return err
+	}
+	if !catalog {
+		return sql.ErrNoRows
+	}
+	return s.DB.QueryRowContext(ctx, `SELECT 1 FROM location_profiles p JOIN location_batches b ON b.id=p.batch_id AND b.owner_id=p.owner_id WHERE p.owner_id=? AND p.profile_id=? LIMIT 1`, owner, id).Scan(&found)
 }
 
 type RelationPage struct {

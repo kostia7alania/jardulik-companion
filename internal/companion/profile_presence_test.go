@@ -65,6 +65,43 @@ func presenceTopic(t *testing.T, f *watchFixture) {
 	if _, err := f.store.DB.Exec("INSERT INTO mirror_topics(profile_id,thread_id) VALUES(90,55)"); err != nil {
 		t.Fatal(err)
 	}
+	rows, err := f.store.DB.Query("SELECT id FROM versions WHERE owner_id=1 AND profile_id=90")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var versions []int64
+	for rows.Next() {
+		var version int64
+		if err = rows.Scan(&version); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		versions = append(versions, version)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+	for _, version := range versions {
+		presenceConfirmVersion(t, f, version, "sent", true)
+	}
+}
+
+func presenceConfirmVersion(t *testing.T, f *watchFixture, version int64, state string, layout bool) {
+	t.Helper()
+	if err := f.watch.Archiver.init(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.store.DB.Exec(`INSERT INTO archive_versions(version_id,owner_id,profile_id,fingerprint,state,thread_id,message_ids) SELECT id,owner_id,profile_id,fingerprint,?,55,'[40]' FROM versions WHERE id=? ON CONFLICT(version_id) DO UPDATE SET state=excluded.state`, state, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout {
+		if _, err = f.store.DB.Exec("INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids) VALUES(?,'sent','[]','[40]') ON CONFLICT(version_id) DO UPDATE SET state='sent'", version); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestProfilePresenceTransitionsAreDurableAndDoNotSpamInitialAvailability(t *testing.T) {

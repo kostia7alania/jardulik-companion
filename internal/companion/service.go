@@ -17,16 +17,17 @@ import (
 )
 
 type Service struct {
-	Config   Config
-	Store    *Store
-	Client   *Client
-	TG       *Telegram
-	Media    *MediaManager
-	Archiver *Archiver
-	Watcher  *ProfileWatcher
-	Crawler  *FeedCrawler
-	locks    sync.Map
-	runs     sync.Map
+	Config    Config
+	Store     *Store
+	Client    *Client
+	TG        *Telegram
+	Media     *MediaManager
+	Archiver  *Archiver
+	Watcher   *ProfileWatcher
+	Crawler   *FeedCrawler
+	Autoliker *Autoliker
+	locks     sync.Map
+	runs      sync.Map
 }
 
 func NewService(c Config) (*Service, error) {
@@ -38,6 +39,7 @@ func NewService(c Config) (*Service, error) {
 	v.Archiver = NewArchiver(c, s, v.TG, v.Media)
 	v.Watcher = NewProfileWatcher(c, s, v.Client, v.Archiver)
 	v.Crawler = NewFeedCrawler(v)
+	v.Autoliker = NewAutoliker(v)
 	return v, nil
 }
 func (s *Service) Close() error { return s.Store.Close() }
@@ -69,11 +71,12 @@ func (s *Service) Run(ctx context.Context) error {
 		return errors.New("existing webhook configured; refusing simultaneous long polling")
 	}
 	commands := []map[string]string{{"command": "next", "description": "Следующая анкета"}, {"command": "status", "description": "Аккаунт и архив"}, {"command": "connect", "description": "Подключить свой Jardulik"}, {"command": "favorites", "description": "Избранные анкеты"}, {"command": "likes", "description": "Входящие лайки"}, {"command": "matches", "description": "Взаимности"}, {"command": "filters", "description": "Фильтры Jardulik"}, {"command": "history", "description": "История анкет"}, {"command": "pause", "description": "Остановить действия"}, {"command": "disconnect", "description": "Отключить сессию Jardulik"}, {"command": "delete", "description": "Удалить свои данные"}, {"command": "help", "description": "Подключение и команды"}}
+	commands = append(commands, map[string]string{"command": "settings", "description": "Настройки и автолайки"}, map[string]string{"command": "autolike", "description": "Управление автолайками"})
 	if err := s.TG.Call(ctx, "setMyCommands", map[string]any{"commands": commands}, nil); err != nil {
 		return err
 	}
 	var background sync.WaitGroup
-	background.Add(5)
+	background.Add(6)
 	go func() { defer background.Done(); s.Media.Run(ctx) }()
 	go func() {
 		defer background.Done()
@@ -84,6 +87,7 @@ func (s *Service) Run(ctx context.Context) error {
 	go func() { defer background.Done(); s.runPrivateCardRepair(ctx) }()
 	go func() { defer background.Done(); s.Watcher.Run(ctx) }()
 	go func() { defer background.Done(); s.Crawler.Run(ctx) }()
+	go func() { defer background.Done(); s.Autoliker.Run(ctx) }()
 	queues := make([]chan Update, 4)
 	var workers sync.WaitGroup
 	for i := range queues {
@@ -135,10 +139,16 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 			if claimed {
 				// Pause is not queued behind a long-running profile fetch.
-				if u.Message != nil && strings.HasPrefix(u.Message.Text, "/pause") {
+				if isPrivatePause(u.Message) {
 					s.Store.Pause(ctx, u.Message.From.ID, true)
 					_ = s.Store.StopCrawl(ctx, u.Message.From.ID, "paused")
 					s.cancelRun(u.Message.From.ID)
+				}
+				if u.Callback != nil && u.Callback.Message.Chat.Type == "private" && u.Callback.Message.Chat.ID == u.Callback.From.ID && strings.HasPrefix(u.Callback.Data, "as:") && strings.HasSuffix(u.Callback.Data, ":off") {
+					_ = s.DisableAutolike(ctx, u.Callback.From.ID, "user_off")
+				}
+				if isPrivateCommand(u.Message, "/autolike_off") {
+					_ = s.DisableAutolike(ctx, u.Message.From.ID, "user_off")
 				}
 				select {
 				case queues[updateShard(u, len(queues))] <- u:
@@ -177,6 +187,16 @@ func updateShard(u Update, n int) int {
 		owner = -owner
 	}
 	return int(uint64(owner) % uint64(n))
+}
+func isPrivatePause(m *Message) bool {
+	return isPrivateCommand(m, "/pause")
+}
+func isPrivateCommand(m *Message, command string) bool {
+	if m == nil || m.Chat.Type != "private" || m.Chat.ID != m.From.ID {
+		return false
+	}
+	fields := strings.Fields(m.Text)
+	return len(fields) > 0 && strings.Split(fields[0], "@")[0] == command
 }
 func sleep(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
@@ -228,6 +248,12 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 	}
 	if u.Callback != nil {
 		_ = s.TG.Call(ctx, "answerCallbackQuery", map[string]string{"callback_query_id": u.Callback.ID}, nil)
+		if handled, err := s.HandleSettingsCallback(ctx, owner, u.Callback.Data); handled {
+			if err != nil {
+				_ = s.say(ctx, owner, "Не удалось изменить настройки: "+err.Error(), nil)
+			}
+			return
+		}
 		if s.FilterCallback(ctx, owner, u.Callback.Data) {
 			return
 		}
@@ -248,6 +274,8 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 				return
 			}
 			switch parts[0] {
+			case "l":
+				s.manualLike(ctx, owner, id)
 			case "jv":
 				s.sourceJSON(ctx, owner, owner, id)
 			case "f":
@@ -279,6 +307,8 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 				s.status(ctx, owner)
 			case "filters":
 				_ = s.OpenFilters(ctx, owner)
+			case "settings":
+				_ = s.OpenSettings(ctx, owner)
 			case "likes":
 				s.OpenRelations(ctx, owner, false)
 			case "matches":
@@ -299,12 +329,16 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		return
 	}
 	cmd := strings.Split(fields[0], "@")[0]
-	for _, prefix := range []string{"/text_", "/fav_", "/history_", "/json_"} {
+	for _, prefix := range []string{"/text_", "/fav_", "/history_", "/json_", "/like_"} {
 		if !strings.HasPrefix(cmd, prefix) {
 			continue
 		}
 		id, err := strconv.ParseInt(strings.TrimPrefix(cmd, prefix), 10, 64)
 		if err != nil || id <= 0 {
+			return
+		}
+		if prefix == "/like_" {
+			s.manualLike(ctx, owner, id)
 			return
 		}
 		if prefix == "/json_" {
@@ -321,6 +355,12 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 			} else if s.Store.Favorite(ctx, owner, id) == nil {
 				_ = s.say(ctx, owner, "Сохранено в избранное.", nil)
 			}
+		}
+		return
+	}
+	if handled, err := s.HandleAutolikeCommand(ctx, owner, m.Text); handled {
+		if err != nil {
+			_ = s.say(ctx, owner, "Не удалось изменить настройки: "+err.Error(), nil)
 		}
 		return
 	}
@@ -379,7 +419,7 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 			_ = s.say(ctx, owner, "Сессия получена, но проверка аккаунта не завершилась. /status", nil)
 			return
 		}
-		_ = s.say(ctx, owner, "Аккаунт подключён. "+accountSummary(account)+"\n/next покажет первую анкету. Лайки выключены.", nil)
+		_ = s.say(ctx, owner, "Аккаунт подключён. "+accountSummary(account)+"\n/next покажет первую анкету. Настройки и автолайки: /settings", nil)
 	case "/next":
 		s.next(ctx, owner)
 	case "/status":
@@ -434,20 +474,6 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 				_ = s.say(ctx, s.Config.OwnerID, fmt.Sprintf("Запрос удаления: Telegram ID %d. Рабочая база очищена, нужна обработка архивных копий и deletion log перед восстановлением старых бэкапов.", owner), nil)
 			}
 		}
-	case "/autolikes":
-		if !s.Config.AllowReactions {
-			_ = s.say(ctx, owner, "Автолайки выключены администратором. Никаких реакций не отправлено.", nil)
-			return
-		}
-		n := int64(0)
-		if len(fields) == 2 {
-			n, _ = strconv.ParseInt(fields[1], 10, 64)
-		}
-		if n < 1 || n > 50 {
-			_ = s.say(ctx, owner, "Укажи /autolikes N, от 1 до 50 обычных лайков. Это предел одной серии бота; он не обозначает Огонь или суточный лимит Jardulik.", nil)
-			return
-		}
-		s.startRun(ctx, owner, int(n))
 	case "/stats":
 		if owner == s.Config.OwnerID {
 			b, _ := json.Marshal(s.Store.AdminCounts(ctx))
@@ -479,7 +505,7 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 
 const welcomeText = "Jardulik Companion\nНезависимый помощник: анкеты, фото, избранное и история. Выбери действие ниже.\n\nСохраняем полученные анкеты и фото. Оператор имеет доступ к архиву для работы сервиса и модерации; копия хранится в закрытой Telegram-группе. Другие пользователи твою историю не видят.\n\nПолитика: https://kostia7alania.ru/jardulik-companion-site/privacy.html"
 
-const shortHelp = "Выбери действие кнопкой. Для подключения: /connect\n\n/pause останавливает фоновые действия.\n/disconnect отключает Jardulik, архив остаётся.\n/delete удаляет данные из рабочей базы.\nОператору: /support текст"
+const shortHelp = "Выбери действие кнопкой. Для подключения: /connect\n\n❤️ Лайк отправляет реакцию в Jardulik. Избранное хранится только в боте.\n/settings открывает настройки и управление автолайками.\n/pause останавливает фоновые действия.\n/disconnect отключает Jardulik, архив остаётся.\n/delete удаляет данные из рабочей базы.\nОператору: /support текст"
 
 const connectHelp = "Подключение Jardulik\n\n1. Открой официальный @jardulik_bot в Telegram Web на компьютере и запусти приложение.\n2. В инструментах разработчика браузера найди iframe с адресом mini.jardulik.app и скопируй полный src, содержащий #tgWebAppData=.\n3. Отправь сюда /connect и ссылку одним сообщением. После обработки бот попробует удалить сообщение со ссылкой."
 
@@ -488,7 +514,7 @@ func mainButtons() any {
 		{{"text": "Следующая анкета", "callback_data": "next"}, {"text": "Избранное", "callback_data": "favorites"}},
 		{{"text": "Входящие лайки", "callback_data": "likes"}, {"text": "Взаимности", "callback_data": "matches"}},
 		{{"text": "История", "callback_data": "history"}, {"text": "Аккаунт", "callback_data": "status"}},
-		{{"text": "Фильтры", "callback_data": "filters"}},
+		{{"text": "Фильтры", "callback_data": "filters"}, {"text": "Настройки", "callback_data": "settings"}},
 		{{"text": "Подключение", "callback_data": "connect_help"}, {"text": "Помощь", "callback_data": "help"}},
 	}}
 }
@@ -539,7 +565,8 @@ func (s *Service) status(ctx context.Context, owner int64) {
 	if s.Config.AllowReactions {
 		mode = "включены"
 	}
-	text := fmt.Sprintf("%s\nАнкет: %d, снимков: %d\nФото сохранено: %d, в очереди: %d\nИзбранное: %d\nОтправлено лайков ботом: %d\nАвтолайки: %s", state, n["profiles"], n["versions"], n["photos"], n["pending_photos"], n["favorites"], n["likes"], mode)
+	text := fmt.Sprintf("%s\nАнкет: %d, снимков: %d\nФото сохранено: %d, в очереди: %d\nИзбранное: %d\nОтправлено лайков ботом: %d\nРеакции в Jardulik: %s", state, n["profiles"], n["versions"], n["photos"], n["pending_photos"], n["favorites"], n["likes"], mode)
+	text += "\n" + s.AutolikeStatus(ctx, owner)
 	if owner == s.Config.OwnerID {
 		text += "\nБэкап: " + s.Archiver.BackupStatus(ctx)
 	}
@@ -646,13 +673,125 @@ func profileText(p StoredProfile) string {
 	if fields := missingProfileFields(v); len(fields) > 0 {
 		footer = append(footer, "Не указано: "+strings.Join(fields, ", "))
 	}
-	if p.LastSeen != "" {
-		footer = append(footer, displayTime(p.LastSeen))
+	capturedAt := p.FirstSeen
+	if capturedAt == "" {
+		capturedAt = p.LastSeen
+	}
+	if capturedAt != "" {
+		footer = append(footer, displayTime(capturedAt))
 	}
 	footer = append(footer, fmt.Sprintf("Jardulik: %d", p.ID))
 	b.WriteString("\n\n" + strings.Join(footer, "\n"))
 	return b.String()
 }
+
+// manualLike is called only after Handle verifies the private chat and locks its owner.
+func (s *Service) manualLike(ctx context.Context, owner, id int64) {
+	if !s.Config.AllowReactions || !s.Store.cfg.AllowReactions {
+		_ = s.say(ctx, owner, "Лайки сейчас выключены.", nil)
+		return
+	}
+	if s.Store.Paused(ctx, owner) {
+		_ = s.say(ctx, owner, "Действия приостановлены: /resume", nil)
+		return
+	}
+	if _, err := s.Store.Profile(ctx, owner, id); err != nil {
+		_ = s.say(ctx, owner, "Анкета недоступна.", nil)
+		return
+	}
+	// Avoid even an account refresh on a repeated click. Like still owns the
+	// authoritative action claim, including races with other reaction callers.
+	var state string
+	err := s.Store.DB.QueryRowContext(ctx, `SELECT state FROM actions WHERE owner_id=? AND profile_id=? AND kind='Like' AND state IN ('pending','succeeded','unknown') LIMIT 1`, owner, id).Scan(&state)
+	if err == nil {
+		message := "Результат предыдущего лайка не подтверждён. Повторно не отправляю."
+		if state == "succeeded" {
+			message = "Лайк уже отправлен."
+		}
+		_ = s.say(ctx, owner, message, nil)
+		return
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		_ = s.say(ctx, owner, "Не удалось проверить предыдущие действия. Лайк не отправлен.", nil)
+		return
+	}
+	// LikeGuarded rechecks the personal budget around its fresh account check
+	// and action claim, without enabling an automatic mode.
+	result, err := s.Client.LikeGuarded(ctx, owner, id, func(guardCtx context.Context) error {
+		return s.ManualLikeBudgetGuard(guardCtx, owner)
+	})
+	if err != nil {
+		_ = s.say(ctx, owner, s.manualLikeFailure(ctx, owner, id, err), nil)
+		return
+	}
+	message := "Лайк не подтверждён. Повторно не отправляю."
+	switch result.Decision {
+	case ReactionSuccess:
+		message = "Лайк отправлен."
+		if result.Mutual {
+			message = "Взаимный лайк! Посмотреть: /matches"
+		}
+	case ReactionQuota:
+		message = "Лимит лайков в Jardulik исчерпан."
+		if result.Wait > 0 {
+			message += fmt.Sprintf(" До следующего лайка: %d ч %d мин.", result.HoursLeft, result.MinutesLeft)
+		}
+	case ReactionFireUnavailable:
+		message = "В Jardulik закончились реакции Огонь."
+	case ReactionPremiumRequired:
+		message = "Для этой реакции нужен Premium в Jardulik."
+	case ReactionExhausted:
+		message = "Анкеты закончились. Попробуйте позже."
+	}
+	if result.Exhausted && result.Decision != ReactionExhausted {
+		message += " Анкеты закончились. Попробуйте позже."
+	}
+	_ = s.say(ctx, owner, message, nil)
+}
+
+func (s *Service) manualLikeFailure(ctx context.Context, owner, id int64, err error) string {
+	switch {
+	case errors.Is(err, ErrAccountFrozen):
+		return "Анкета заморожена в Jardulik. Лайк не отправлен."
+	case errors.Is(err, ErrReactionDisabled):
+		return "Лайки сейчас выключены."
+	case errors.Is(err, ErrReactionPaused):
+		return "Действия приостановлены: /resume"
+	case errors.Is(err, ErrReactionSessionChanged):
+		return "Сессия Jardulik изменилась. Лайк не отправлен. Проверь /status."
+	case errors.Is(err, ErrOwnLikeLimit):
+		return "Достигнут твой лимит отправок за 24 часа. Настройки: /settings."
+	}
+	var blocked *ActionBlockedError
+	if errors.As(err, &blocked) {
+		if blocked.State == "quota_waiting" {
+			message := "Лимит лайков в Jardulik исчерпан."
+			if wait := blocked.RetryAt.Sub(s.Client.Now()); !blocked.RetryAt.IsZero() && wait > 0 {
+				minutes := int64(wait / time.Minute)
+				if wait%time.Minute >= 30*time.Second {
+					minutes++
+				}
+				if minutes == 0 {
+					message += " Осталось меньше минуты."
+				} else {
+					message += fmt.Sprintf(" Осталось примерно %d ч %d мин.", minutes/60, minutes%60)
+				}
+			}
+			return message
+		}
+		if blocked.State == "succeeded" {
+			return "Лайк уже отправлен."
+		}
+		return "Эта реакция уже обрабатывалась. Повторно не отправляю."
+	}
+	// No action row means the fresh account check failed before sending.
+	var state string
+	if e := s.Store.DB.QueryRowContext(ctx, "SELECT state FROM actions WHERE owner_id=? AND profile_id=? AND kind='Like' ORDER BY id DESC LIMIT 1", owner, id).Scan(&state); errors.Is(e, sql.ErrNoRows) {
+		return "Лайк не отправлен. Проверь аккаунт через /status."
+	}
+	return "Лайк не подтверждён. Повторно не отправляю."
+}
+
 func (s *Service) Deliver(ctx context.Context, owner int64, p StoredProfile) error {
 	if _, err := s.Store.Version(ctx, owner, p.VersionID); err != nil {
 		return err
@@ -745,46 +884,9 @@ func (s *Service) cancelRun(owner int64) {
 	if v, ok := s.runs.Load(owner); ok {
 		v.(context.CancelFunc)()
 	}
-}
-func (s *Service) startRun(parent context.Context, owner int64, count int) {
-	ctx, cancel := context.WithCancel(parent)
-	if _, loaded := s.runs.LoadOrStore(owner, context.CancelFunc(cancel)); loaded {
-		cancel()
-		_ = s.say(parent, owner, "Серия уже выполняется. /pause остановит её.", nil)
-		return
+	if err := s.DisableAutolike(context.Background(), owner, "stopped"); err != nil {
+		slog.Warn("autolike stop unavailable", "kind", safeError(err))
 	}
-	go func() {
-		defer s.runs.Delete(owner)
-		defer cancel()
-		done := 0
-		for done < count && ctx.Err() == nil && !s.Store.Paused(ctx, owner) {
-			p, err := s.Store.Next(ctx, owner)
-			if errors.Is(err, sql.ErrNoRows) {
-				_, err = s.Fetch(ctx, owner)
-				if err == nil {
-					p, err = s.Store.Next(ctx, owner)
-				}
-			}
-			if err != nil {
-				break
-			}
-			account, err := s.Client.Me(ctx, owner)
-			if err != nil || account["freezeState"] == true {
-				break
-			}
-			result, err := s.Client.Like(ctx, owner, p.ID)
-			if err != nil || !result.Success {
-				break
-			}
-			done++
-			s.Store.Delivered(ctx, owner, p.ID)
-			if !sleep(ctx, 10*time.Second) {
-				break
-			}
-		}
-		_ = s.say(context.WithoutCancel(parent), owner, fmt.Sprintf("Серия завершена. Подтверждено лайков: %d из %d.", done, count), nil)
-	}()
-	_ = s.say(parent, owner, fmt.Sprintf("Лимит серии бота: до %d обычных лайков по текущей выдаче. /pause остановит следующие действия.", count), nil)
 }
 
 // WriteRecoveryKey keeps the off-server restore key out of Git and service archives.

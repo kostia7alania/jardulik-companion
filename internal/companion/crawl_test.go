@@ -116,8 +116,8 @@ func TestCrawlRequestIsLocalAtomicAndRespectsPause(t *testing.T) {
 		t.Fatalf("bad new job: %+v", j)
 	}
 	state, err := s.Store.filterState(ctx, 1)
-	if err != nil || state.Applied == nil || *state.Applied != j.Filters || state.Draft != nil || state.Others {
-		t.Fatal("UI filters not atomically aligned with crawl")
+	if err != nil || state.Applied != nil || state.Draft != nil || state.Others {
+		t.Fatal("collection changed manual UI filters")
 	}
 	if _, err = c.Request(ctx, 1, false); err == nil {
 		t.Fatal("second active job accepted")
@@ -259,7 +259,7 @@ func TestCrawlDetectsABAAndModeFingerprintsAreSeparate(t *testing.T) {
 }
 
 func TestCrawlGuardsBeforeArchiveAndNoCursorOnErrors(t *testing.T) {
-	for _, kind := range []string{"pause", "disconnect", "session", "filters", "http403", "http429", "http500", "disk-after"} {
+	for _, kind := range []string{"pause", "disconnect", "session", "http403", "http429", "http500", "disk-after"} {
 		t.Run(kind, func(t *testing.T) {
 			var c *FeedCrawler
 			c, _, _, _ = crawlFixture(t, func(int, int) ([]Profile, int) {
@@ -274,19 +274,6 @@ func TestCrawlGuardsBeforeArchiveAndNoCursorOnErrors(t *testing.T) {
 					}
 				case "session":
 					if err := s.Store.SaveSession(ctx, 1, Session{Token: "new", Refresh: "r", UserID: 101, Generation: "new", Expires: time.Now().Add(time.Hour).Unix()}); err != nil {
-						t.Fatal(err)
-					}
-				case "filters":
-					state, err := s.Store.filterState(ctx, 1)
-					if err != nil {
-						t.Fatal(err)
-					}
-					draft := &filterDraft{Values: *state.Applied}
-					draft.Values.AgeMax = 60
-					if err = s.Store.saveFilterDraft(ctx, 1, draft); err != nil {
-						t.Fatal(err)
-					}
-					if err = s.Store.applyFilterDraft(ctx, 1, *draft); err != nil {
 						t.Fatal(err)
 					}
 				case "http403":
@@ -600,5 +587,206 @@ func TestCrawlArchiveFailureStopsOnlyFailingOwner(t *testing.T) {
 	peer, err := c.Service.Store.CrawlStatus(context.Background(), 2)
 	if err != nil || peer.Page != 2 || peer.Pages != 1 || !peer.active() {
 		t.Fatalf("healthy owner did not checkpoint: %+v %v", peer, err)
+	}
+}
+
+func TestCrawlCollectionPreservesManualFiltersCursorAndPending(t *testing.T) {
+	c, now, _, _ := crawlFixture(t, func(_ int, page int) ([]Profile, int) {
+		if page == 1 {
+			return crawlProfiles(11, 12), 200
+		}
+		return nil, 200
+	})
+	ctx := context.Background()
+	store := c.Service.Store
+	if _, err := store.Archive(ctx, 1, crawlProfiles(11), "manual"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.filterState(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := filterDraft{ID: "manual-draft", Values: DefaultFeedFilters()}
+	draft.Values.AgeMin = 35
+	draft.Values.AgeMax = 60
+	if err = store.saveFilterDraft(ctx, 1, &draft); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.applyFilterDraft(ctx, 1, draft); err != nil {
+		t.Fatal(err)
+	}
+	draft.ID = "pending-edit"
+	draft.Values.AgeMax = 65
+	if err = store.saveFilterDraft(ctx, 1, &draft); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.DB.Exec("UPDATE feed_filters SET include_others=1,others_id='manual-nonce' WHERE owner_id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.DB.Exec("UPDATE users SET feed_page=8 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.DB.Exec("UPDATE queue SET delivered=0 WHERE owner_id=1 AND profile_id=11"); err != nil {
+		t.Fatal(err)
+	}
+	state, err = store.filterState(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, _ := json.Marshal(state)
+	if _, err = c.Request(ctx, 1, true, true); err != nil {
+		t.Fatal(err)
+	}
+	crawlStep(t, c, now)
+	afterState, err := store.filterState(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, _ := json.Marshal(afterState)
+	var page, oldDelivered, newDelivered int
+	if err = store.DB.QueryRow("SELECT feed_page FROM users WHERE id=1").Scan(&page); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DB.QueryRow("SELECT delivered FROM queue WHERE owner_id=1 AND profile_id=11").Scan(&oldDelivered); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.DB.QueryRow("SELECT delivered FROM queue WHERE owner_id=1 AND profile_id=12").Scan(&newDelivered); err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) || page != 8 || oldDelivered != 0 || newDelivered != 1 {
+		t.Fatalf("collection changed manual filters/cursor/pending: %s %s %d %d %d", before, after, page, oldDelivered, newDelivered)
+	}
+	draft.ID = "another-edit"
+	draft.Values.AgeMax = 70
+	if err = store.saveFilterDraft(ctx, 1, &draft); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.applyFilterDraft(ctx, 1, draft); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.DB.Exec("UPDATE feed_crawls SET next_request=0 WHERE owner_id=1"); err != nil {
+		t.Fatal(err)
+	}
+	// Applying a UI filter may stop other workflows; collection uses its own frozen bounds.
+	if handled, err := c.Step(ctx); err != nil || !handled {
+		t.Fatal("UI filter change stopped independent collection", err)
+	}
+	if job := crawlJob(t, c); !job.active() || job.Mode != 1 {
+		t.Fatalf("collection depended on mutable manual filters: %+v", job)
+	}
+}
+
+const legacyCrawlTable = `CREATE TABLE feed_crawls (
+ owner_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ run_id TEXT NOT NULL,upstream_id INTEGER NOT NULL,generation TEXT NOT NULL,
+ filters_json TEXT NOT NULL,include_others INTEGER NOT NULL,mode INTEGER NOT NULL DEFAULT 0,
+ page INTEGER NOT NULL DEFAULT 1,next_request INTEGER NOT NULL,state TEXT NOT NULL,
+ reason TEXT NOT NULL DEFAULT '',pages INTEGER NOT NULL DEFAULT 0,received INTEGER NOT NULL DEFAULT 0,
+ started_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`
+
+func TestCrawlLegacySchemaStatusMigratesWithoutChangingJob(t *testing.T) {
+	crawler, now, _, _ := crawlFixture(t, func(int, int) ([]Profile, int) { return crawlProfiles(11), 200 })
+	db := crawler.Service.Store.DB
+	_, err := db.Exec(legacyCrawlTable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filters := DefaultFeedFilters()
+	filters.AgeMin = 0
+	filters.AgeMax = 100
+	raw, _ := json.Marshal(filters)
+	if _, err = db.Exec("INSERT INTO feed_crawls(owner_id,run_id,upstream_id,generation,filters_json,include_others,next_request,state,started_at,updated_at) VALUES(1,'legacy',101,'1',?,0,0,'running',1,1)", string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	job, err := crawler.Service.Store.CrawlStatus(context.Background(), 1)
+	if err != nil || job.RunID != "legacy" || job.IncludeLocations || job.CatalogProfiles != 0 || job.Page != 1 {
+		t.Fatalf("legacy status migration lost job: %+v %v", job, err)
+	}
+	crawlStep(t, crawler, now)
+	if job = crawlJob(t, crawler); job.Page != 2 || job.Pages != 1 || job.RunID != "legacy" {
+		t.Fatalf("legacy job did not resume safely: %+v", job)
+	}
+}
+
+func TestCrawlMigrationSerializesIndependentStoresBeforeSchemaRead(t *testing.T) {
+	crawler, _, _, _ := crawlFixture(t, func(int, int) ([]Profile, int) { t.Fatal("migration made an HTTP request"); return nil, 200 })
+	first := crawler.Service.Store
+	if _, err := first.DB.Exec(legacyCrawlTable); err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenStore(crawler.Service.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.DB.Close()
+	filters := DefaultFeedFilters()
+	filters.AgeMin = 0
+	filters.AgeMax = 100
+	raw, _ := json.Marshal(filters)
+	if _, err = first.DB.Exec("INSERT INTO feed_crawls(owner_id,run_id,upstream_id,generation,filters_json,include_others,next_request,state,started_at,updated_at) VALUES(1,'legacy',101,'1',?,0,0,'running',1,1)", string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	// Keep a separate connection writing while both stores start their migration.
+	first.DB.SetMaxOpenConns(2)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	holder, err := first.DB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback()
+	if _, err = holder.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='feed_crawl_next'"); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		job *CrawlJob
+		err error
+	}
+	results := make(chan result, 2)
+	started := make(chan struct{}, 2)
+	for _, store := range []*Store{first, second} {
+		go func(store *Store) {
+			started <- struct{}{}
+			job, err := store.CrawlStatus(ctx, 1)
+			results <- result{job, err}
+		}(store)
+	}
+	<-started
+	<-started
+	var received []result
+	select {
+	case r := <-results:
+		received = append(received, r)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err = holder.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	returnedBeforeWriterReleased := len(received) > 0
+	for len(received) < 2 {
+		select {
+		case r := <-results:
+			received = append(received, r)
+		case <-ctx.Done():
+			t.Fatal("concurrent migrations did not finish", ctx.Err())
+		}
+	}
+	if returnedBeforeWriterReleased {
+		t.Fatalf("migration inspected the old schema before acquiring its writer lock: %v", received[0].err)
+	}
+	for _, r := range received {
+		if r.err != nil {
+			t.Fatal("concurrent schema migration failed", r.err)
+		}
+		if r.job == nil || r.job.RunID != "legacy" || r.job.Page != 1 || r.job.IncludeLocations || r.job.CatalogProfiles != 0 {
+			t.Fatalf("migration changed the legacy job: %+v", r.job)
+		}
+	}
+	// Both connections can now inspect the same fully migrated schema.
+	for _, store := range []*Store{first, second} {
+		var count int
+		if err = store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('feed_crawls') WHERE name IN ('include_locations','catalog_pages','catalog_received','catalog_profiles','hydrated','unavailable')").Scan(&count); err != nil || count != 6 {
+			t.Fatalf("partial schema after concurrent migration: %d %v", count, err)
+		}
 	}
 }

@@ -45,7 +45,7 @@ func NewProfileWatcher(c Config, s *Store, client *Client, archive ...*Archiver)
 		c.WatchGap = 20 * time.Second
 	}
 	if c.WatchDailyLimit <= 0 {
-		c.WatchDailyLimit = 300
+		c.WatchDailyLimit = 2000
 	}
 	w := &ProfileWatcher{Config: c, Store: s, Client: client, now: time.Now}
 	if len(archive) > 0 {
@@ -56,7 +56,18 @@ func NewProfileWatcher(c Config, s *Store, client *Client, archive ...*Archiver)
 
 func (w *ProfileWatcher) init(ctx context.Context) error {
 	if !w.initialized {
-		if _, err := w.Store.DB.ExecContext(ctx, watchSchema+profilePresenceSchema); err != nil {
+		if _, err := w.Store.DB.ExecContext(ctx, watchSchema); err != nil {
+			return err
+		}
+		tx, err := w.Store.DB.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err = migrateProfilePresenceTx(ctx, tx); err != nil {
+			return err
+		}
+		if err = tx.Commit(); err != nil {
 			return err
 		}
 		w.initialized = true

@@ -34,7 +34,7 @@ type Config struct {
 }
 
 func LoadConfig() (Config, error) {
-	c := Config{DataDir: os.Getenv("APP_DATA_DIR"), Token: os.Getenv("TELEGRAM_BOT_TOKEN"), APIBase: "https://api.jardulik.app/api", TelegramBase: "https://api.telegram.org", MinFreeBytes: 2 << 30, InitMaxAge: 24 * time.Hour, WatchInterval: 24 * time.Hour, WatchGap: 20 * time.Second, WatchDailyLimit: 300}
+	c := Config{DataDir: os.Getenv("APP_DATA_DIR"), Token: os.Getenv("TELEGRAM_BOT_TOKEN"), APIBase: "https://api.jardulik.app/api", TelegramBase: "https://api.telegram.org", MinFreeBytes: 2 << 30, InitMaxAge: 24 * time.Hour, WatchInterval: 24 * time.Hour, WatchGap: 20 * time.Second, WatchDailyLimit: 2000}
 	c.UserAgent = strings.TrimSpace(os.Getenv("JARDULIK_USER_AGENT"))
 	if c.UserAgent == "" {
 		c.UserAgent = defaultUserAgent

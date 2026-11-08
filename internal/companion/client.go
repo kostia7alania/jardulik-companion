@@ -393,61 +393,259 @@ type ReactionResult struct {
 	Success, Mutual, Last        bool
 	Kind, HoursLeft, MinutesLeft int64
 	Raw                          []byte
+	Decision                     ReactionDecision
+	Wait                         time.Duration
+	RetryAt                      time.Time
+	Exhausted                    bool
+}
+
+type ReactionDecision string
+
+const (
+	ReactionSuccess         ReactionDecision = "success"
+	ReactionQuota           ReactionDecision = "quota"
+	ReactionPremiumRequired ReactionDecision = "premium_required"
+	ReactionFireUnavailable ReactionDecision = "fire_unavailable"
+	ReactionExhausted       ReactionDecision = "exhausted"
+	ReactionUnknown         ReactionDecision = "unknown"
+)
+
+var (
+	ErrReactionDisabled       = errors.New("лайки выключены администратором")
+	ErrReactionPaused         = errors.New("действия приостановлены: /resume")
+	ErrAccountFrozen          = errors.New("анкета заморожена в Jardulik")
+	ErrActionBlocked          = errors.New("реакция уже отправлялась или её повтор запрещён")
+	ErrReactionSessionChanged = errors.New("сессия изменилась или требует подключения")
+)
+
+type claimedLikeContextKey struct{}
+
+// ClaimedLikeActionID lets a post-claim DB guard exclude its own reservation
+// from an account budget. No caller may claim or release this action itself.
+func ClaimedLikeActionID(ctx context.Context) int64 {
+	id, _ := ctx.Value(claimedLikeContextKey{}).(int64)
+	return id
+}
+
+func decodeReactionResult(body []byte, now time.Time) (ReactionResult, error) {
+	out := ReactionResult{Decision: ReactionUnknown, Raw: body}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || fields == nil {
+		return out, errors.New("неизвестный формат ответа реакции")
+	}
+	conflict := false
+	get := func(keys ...string) json.RawMessage {
+		var found json.RawMessage
+		for _, key := range keys {
+			if raw, ok := fields[key]; ok {
+				if found != nil && !bytes.Equal(bytes.TrimSpace(raw), bytes.TrimSpace(found)) {
+					conflict = true
+				}
+				found = raw
+			}
+		}
+		return found
+	}
+	readBool := func(raw json.RawMessage, required bool) (bool, error) {
+		raw = bytes.TrimSpace(raw)
+		if !required && (raw == nil || bytes.Equal(raw, []byte("null"))) {
+			return false, nil
+		}
+		if !bytes.Equal(raw, []byte("true")) && !bytes.Equal(raw, []byte("false")) {
+			return false, errors.New("неизвестный флаг ответа реакции")
+		}
+		return bytes.Equal(raw, []byte("true")), nil
+	}
+	integer := func(raw json.RawMessage) (int64, bool) {
+		if raw == nil {
+			return 0, true
+		}
+		value := string(raw)
+		if len(raw) > 0 && raw[0] == '"' {
+			if json.Unmarshal(raw, &value) != nil {
+				return 0, false
+			}
+		}
+		n, err := strconv.ParseInt(value, 10, 64)
+		return n, err == nil
+	}
+	var err error
+	if out.Success, err = readBool(get("IsSuccess", "Success", "success"), true); err != nil {
+		return out, err
+	}
+	if out.Mutual, err = readBool(get("IsMutual", "Mutual", "mutual"), false); err != nil {
+		return out, err
+	}
+	if out.Last, err = readBool(get("IsLast", "Last", "last"), false); err != nil {
+		return out, err
+	}
+	var kindValid bool
+	out.Kind, kindValid = integer(get("MessageKind", "Kind", "kind"))
+	if conflict || !out.Success && out.Mutual {
+		return out, errors.New("противоречивый ответ реакции")
+	}
+	if out.Success {
+		out.Decision = ReactionSuccess
+		return out, nil // The frontend interprets Last only inside the failure branch.
+	}
+	out.Exhausted = out.Last
+	if !kindValid {
+		return out, errors.New("неизвестный код ответа реакции")
+	}
+	switch out.Kind {
+	case -1:
+		out.Decision = ReactionQuota
+		hours, minutes := get("HoursLeft", "hoursLeft"), get("MinutesLeft", "minutesLeft")
+		if conflict {
+			out.Decision = ReactionUnknown
+			return out, errors.New("противоречивый срок квоты")
+		}
+		var hOK, mOK bool
+		out.HoursLeft, hOK = integer(hours)
+		out.MinutesLeft, mOK = integer(minutes)
+		if (hours != nil || minutes != nil) && hOK && mOK && out.HoursLeft >= 0 && out.MinutesLeft >= 0 && out.MinutesLeft < 60 && out.HoursLeft <= int64((1<<63-1)/int64(time.Hour)) {
+			wait := time.Duration(out.HoursLeft) * time.Hour
+			mins := time.Duration(out.MinutesLeft) * time.Minute
+			if wait <= time.Duration(1<<63-1)-mins && wait+mins > 0 {
+				out.Wait = wait + mins
+				out.RetryAt = now.Add(out.Wait).UTC()
+			}
+		}
+	case -2:
+		out.Decision = ReactionFireUnavailable
+	case -3:
+		out.Decision = ReactionPremiumRequired
+	default:
+		if out.Exhausted {
+			out.Decision = ReactionExhausted
+		}
+	}
+	if out.Decision == ReactionUnknown {
+		return out, errors.New("неизвестный результат реакции")
+	}
+	return out, nil
 }
 
 func (c *Client) Like(ctx context.Context, owner, id int64) (ReactionResult, error) {
-	var out ReactionResult
-	if !c.Store.cfg.AllowReactions {
-		return out, errors.New("автолайки выключены администратором")
+	return c.LikeGuarded(ctx, owner, id, nil)
+}
+
+func (c *Client) LikeGuarded(ctx context.Context, owner, id int64, guard func(context.Context) error) (ReactionResult, error) {
+	out := ReactionResult{Decision: ReactionUnknown}
+	if err := c.Store.checkReactionAction(ctx, c.Store.DB, owner, id, c.Now()); err != nil {
+		return out, err
 	}
-	if c.Store.Paused(ctx, owner) {
-		return out, errors.New("действия приостановлены: /resume")
-	}
-	if _, err := c.Store.Profile(ctx, owner, id); err != nil {
-		return out, errors.New("анкета недоступна")
-	}
-	s, err := c.Store.Session(ctx, owner)
+	initial, err := c.Store.Session(ctx, owner)
 	if err != nil {
 		return out, err
 	}
-	action, err := c.Store.ClaimAction(ctx, owner, id)
+	if guard != nil {
+		if err = guard(ctx); err != nil {
+			return out, err
+		}
+	}
+	account, err := c.Me(ctx, owner)
 	if err != nil {
-		return out, errors.New("реакция уже отправлялась или её результат неизвестен")
+		return out, err
 	}
-	b, err := c.Request(ctx, owner, "POST", "/reactions/addNew", map[string]any{"reactionType": 1, "isDeleted": false, "userId": id, "fromUserId": s.UserID, "message": ""})
+	if value, exists := account["freezeState"]; exists && value != nil {
+		frozen, ok := value.(bool)
+		if !ok {
+			return out, errors.New("неизвестное состояние аккаунта")
+		}
+		if frozen {
+			return out, ErrAccountFrozen
+		}
+	}
+	// Refresh is allowed for this read-only preflight, never as a replay of POST.
+	if _, err = c.token(ctx, owner, ""); err != nil {
+		return out, err
+	}
+	mu := c.lock(owner)
+	mu.Lock()
+	defer mu.Unlock()
+	bound := func() (Session, error) {
+		if err := c.Store.checkReactionAction(ctx, c.Store.DB, owner, id, c.Now()); err != nil {
+			return Session{}, err
+		}
+		current, err := c.Store.Session(ctx, owner)
+		if err != nil || current.Generation != initial.Generation || current.UserID != initial.UserID {
+			return Session{}, ErrReactionSessionChanged
+		}
+		return current, nil
+	}
+	if _, err = bound(); err != nil {
+		return out, err
+	}
+	if guard != nil {
+		if err = guard(ctx); err != nil {
+			return out, err
+		}
+	}
+	action, err := c.Store.ClaimOwnerAction(ctx, owner, id, c.Now())
 	if err != nil {
-		c.Store.FinishAction(ctx, action, "unknown", nil)
-		c.Store.Pause(ctx, owner, true)
-		return out, errors.New("результат реакции неизвестен; серия остановлена без повторной отправки")
+		return out, err
 	}
-	var p Profile
-	if json.Unmarshal(b, &p) != nil {
-		c.Store.FinishAction(ctx, action, "unknown", b)
-		c.Store.Pause(ctx, owner, true)
-		return out, errors.New("неизвестный ответ реакции")
+	release := func(cause error) (ReactionResult, error) {
+		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancelWrite()
+		return out, errors.Join(cause, c.Store.releaseUnsentReaction(writeCtx, action))
 	}
-	get := func(keys ...string) any {
-		for _, k := range keys {
-			if v, ok := p[k]; ok {
-				return v
+	if guard != nil {
+		if err = guard(context.WithValue(ctx, claimedLikeContextKey{}, action)); err != nil {
+			return release(err)
+		}
+	}
+	// The new pending row is our own claim, so recheck lifecycle independently.
+	current, err := c.Store.Session(ctx, owner)
+	if err != nil || current.State != "connected" || current.Generation != initial.Generation || current.UserID != initial.UserID {
+		return release(ErrReactionSessionChanged)
+	}
+	if !c.Store.cfg.AllowReactions || c.Store.Paused(ctx, owner) {
+		cause := ErrReactionPaused
+		if !c.Store.cfg.AllowReactions {
+			cause = ErrReactionDisabled
+		}
+		return release(cause)
+	}
+	target, err := c.Store.Profile(ctx, owner, id)
+	if err != nil {
+		return release(err)
+	}
+	if target.ID != id {
+		return release(errors.New("анкета изменилась; действие отменено"))
+	}
+	if err = ctx.Err(); err != nil {
+		return release(err)
+	}
+	body, err := c.exchange(ctx, http.MethodPost, "/reactions/addNew", current.Token, map[string]any{"reactionType": 1, "isDeleted": false, "userId": id, "fromUserId": current.UserID, "message": ""})
+	if err == nil {
+		out, err = decodeReactionResult(body, c.Now())
+	}
+	writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelWrite()
+	if err != nil {
+		var upstream *UpstreamError
+		if errors.As(err, &upstream) {
+			if upstream.Status == 401 {
+				c.Store.SessionState(writeCtx, owner, "reconnect_required", "reaction_auth_not_confirmed")
+			} else if upstream.Status == 403 || upstream.Status == 429 || upstream.Kind == "unexpected_response_or_challenge" {
+				c.Store.SessionState(writeCtx, owner, "paused", upstream.Kind)
 			}
 		}
-		return nil
+		persistErr := c.Store.finishReactionAction(writeCtx, action, "unknown", body, time.Time{})
+		c.Store.Pause(writeCtx, owner, true)
+		return out, errors.Join(errors.New("результат реакции неизвестен; повторная отправка запрещена"), persistErr)
 	}
-	out.Success, _ = get("IsSuccess", "Success", "success").(bool)
-	out.Mutual, _ = get("IsMutual", "Mutual", "mutual").(bool)
-	out.Last, _ = get("IsLast", "Last", "last").(bool)
-	out.Kind = number(get("MessageKind", "Kind", "kind"))
-	out.HoursLeft = number(get("HoursLeft", "hoursLeft"))
-	out.MinutesLeft = number(get("MinutesLeft", "minutesLeft"))
-	out.Raw = b
-	state := "failed"
-	if out.Success {
+	state := "rejected"
+	if out.Decision == ReactionSuccess {
 		state = "succeeded"
+	} else if out.Decision == ReactionQuota {
+		state = "quota_waiting"
 	}
-	c.Store.FinishAction(ctx, action, state, b)
-	if !out.Success || out.Last {
-		c.Store.Pause(ctx, owner, true)
+	if err = c.Store.finishReactionAction(writeCtx, action, state, body, out.RetryAt); err != nil {
+		c.Store.Pause(writeCtx, owner, true)
+		return out, err
 	}
 	return out, nil
 }

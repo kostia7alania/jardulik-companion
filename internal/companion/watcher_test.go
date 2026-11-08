@@ -332,3 +332,11 @@ func TestProfileWatcherCancellation(t *testing.T) {
 		t.Fatal("watcher did not stop after cancellation")
 	}
 }
+
+func TestProfileWatcherDefaultBudgetCoversCatalogue(t *testing.T) {
+	s, c := testStore(t)
+	w := NewProfileWatcher(c, s, NewClient(s, c))
+	if w.Config.WatchDailyLimit != 2000 || w.Config.WatchGap != 20*time.Second {
+		t.Fatalf("catalogue daily budget/gap: %+v", w.Config)
+	}
+}

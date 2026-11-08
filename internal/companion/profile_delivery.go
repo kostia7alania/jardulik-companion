@@ -12,7 +12,7 @@ import (
 )
 
 func profileButtons(p StoredProfile, full, jsonSource bool) any {
-	rows := [][]map[string]string{{{"text": "В избранное", "callback_data": fmt.Sprintf("f:%d", p.ID)}, {"text": "История", "callback_data": fmt.Sprintf("h:%d", p.ID)}}}
+	rows := [][]map[string]string{{{"text": "❤️ Лайк", "callback_data": fmt.Sprintf("l:%d", p.ID)}, {"text": "В избранное", "callback_data": fmt.Sprintf("f:%d", p.ID)}, {"text": "История", "callback_data": fmt.Sprintf("h:%d", p.ID)}}}
 	var actions []map[string]string
 	if full {
 		actions = append(actions, map[string]string{"text": "Полный текст", "callback_data": fmt.Sprintf("t:%d", p.ID)})

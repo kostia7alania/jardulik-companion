@@ -249,6 +249,11 @@ func fullSourceFingerprint(ctx context.Context, db *sql.DB) (string, error) {
 		return "", err
 	}
 	records = append(records, relations...)
+	locations, err := fullLocationRecords(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	records = append(records, locations...)
 	sort.Strings(records)
 	h := sha256.New()
 	last := ""
@@ -1194,8 +1199,9 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		{"deletions", "deletion", "SELECT owner_id,deleted_at FROM deletions"},
 		{"sessions", "connection", "SELECT owner_id,upstream_id,state FROM sessions"},
 		{"favorites", "favorite", "SELECT owner_id,profile_id,created_at FROM favorites"},
-		{"actions", "reaction", `SELECT owner_id,profile_id,kind,state,response,created_at FROM actions WHERE state IN ('pending','succeeded','unknown')`},
+		{"actions", "reaction", `SELECT owner_id,profile_id,kind,state,response,created_at FROM actions WHERE state IN ('pending','succeeded','unknown','quota_waiting','quota_retried')`},
 		{"feed_filters", "filters", `SELECT owner_id,applied_json,include_others FROM feed_filters WHERE applied_json IS NOT NULL OR include_others<>0`},
+		{"autolike_settings", "autolike", "SELECT owner_id,mode,interval_seconds,series_count,daily_cap FROM autolike_settings"},
 	}
 	for _, q := range queries {
 		exists, err := snapshotHasTable(ctx, db, q.table)
@@ -1329,6 +1335,80 @@ func fullRelationRecords(ctx context.Context, db *sql.DB) ([]string, error) {
 	}
 	for key, fp := range heads {
 		records = append(records, "relation-head:"+key+":"+fp)
+	}
+	return records, nil
+}
+
+func fullLocationRecords(ctx context.Context, db *sql.DB) ([]string, error) {
+	exists, err := snapshotHasTable(ctx, db, "location_batches")
+	if err != nil || !exists {
+		return nil, err
+	}
+	rows, err := db.QueryContext(ctx, "SELECT owner_id,country,city,source_page,raw_json FROM location_batches ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []string
+	heads := map[string]string{}
+	count := 0
+	for rows.Next() {
+		count++
+		if count > fullBundleEntries {
+			return nil, errArchiveBudget
+		}
+		var owner int64
+		var page int
+		var country, city, raw string
+		if err = rows.Scan(&owner, &country, &city, &page, &raw); err != nil {
+			return nil, err
+		}
+		if len(raw) > serviceManifestLimit || len(country) > serviceManifestLimit || len(city) > serviceManifestLimit {
+			return nil, errArchiveBudget
+		}
+		locations, err := decodeLocations([]byte(raw))
+		if err != nil {
+			return nil, err
+		}
+		normalized := make([]string, 0, len(locations.Entries))
+		for _, entry := range locations.Entries {
+			p, err := decodeProfile(entry.Raw)
+			if err != nil {
+				return nil, err
+			}
+			// Keep preview content while excluding map rendering and scan counters.
+			for _, key := range []string{"distance", "line", "randomAngle", "totalCount", "pageCount"} {
+				delete(p, key)
+			}
+			value, err := json.Marshal(p)
+			if err != nil {
+				return nil, err
+			}
+			normalized = append(normalized, string(value))
+		}
+		sort.Strings(normalized)
+		hash := sha256.New()
+		previous := ""
+		for _, value := range normalized {
+			if value != previous {
+				io.WriteString(hash, value)
+				io.WriteString(hash, "\n")
+				previous = value
+			}
+		}
+		fp := hex.EncodeToString(hash.Sum(nil))
+		key, err := json.Marshal([]any{owner, country, city, page})
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, "location-version:"+string(key)+":"+fp)
+		heads[string(key)] = fp
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	for key, fp := range heads {
+		records = append(records, "location-head:"+key+":"+fp)
 	}
 	return records, nil
 }

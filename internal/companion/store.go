@@ -76,7 +76,12 @@ func OpenStore(c Config) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{DB: db, cfg: c}, nil
+	s := &Store{DB: db, cfg: c}
+	if err = s.initReactionActions(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
@@ -517,12 +522,178 @@ func (s *Store) ClaimUpdate(ctx context.Context, id int64) (bool, error) {
 func (s *Store) FinishUpdate(ctx context.Context, id int64) {
 	_, _ = s.DB.ExecContext(ctx, "UPDATE updates SET state='done' WHERE id=?", id)
 }
+
+type ActionBlockedError struct {
+	State   string
+	RetryAt time.Time
+}
+
+func (e *ActionBlockedError) Error() string {
+	return "предыдущее действие не разрешает повтор"
+}
+func (e *ActionBlockedError) Unwrap() error { return ErrActionBlocked }
+
+func (s *Store) initReactionActions(ctx context.Context) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='reaction_actions_schema'"); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(actions)")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, kind string
+		var defaultValue any
+		if err = rows.Scan(&cid, &name, &kind, &notnull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		found = found || name == "retry_at"
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	if !found {
+		if _, err = tx.ExecContext(ctx, "ALTER TABLE actions ADD COLUMN retry_at INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	// Keep the original audit rows. A confirmed quota is protected until its
+	// deadline; a retry closes that old attempt and creates a new pending row.
+	if _, err = tx.ExecContext(ctx, "DROP INDEX IF EXISTS actions_no_duplicate"); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `CREATE UNIQUE INDEX actions_no_duplicate ON actions(owner_id,profile_id,kind)
+ WHERE state IN ('pending','processing','succeeded','unknown','quota_waiting','rejected')`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type reactionQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func (s *Store) checkReactionAction(ctx context.Context, q reactionQuerier, owner, profile int64, now time.Time) error {
+	if !s.cfg.AllowReactions {
+		return ErrReactionDisabled
+	}
+	var paused bool
+	var sessionState string
+	var known bool
+	err := q.QueryRowContext(ctx, `SELECT u.paused,s.state,EXISTS(
+ SELECT 1 FROM queue q JOIN versions v ON v.id=q.version_id AND v.owner_id=q.owner_id AND v.profile_id=q.profile_id
+ WHERE q.owner_id=u.id AND q.profile_id=?) FROM users u JOIN sessions s ON s.owner_id=u.id WHERE u.id=?`, profile, owner).Scan(&paused, &sessionState, &known)
+	if err != nil {
+		return err
+	}
+	if paused {
+		return ErrReactionPaused
+	}
+	if sessionState != "connected" {
+		return ErrReactionSessionChanged
+	}
+	if !known {
+		return errors.New("анкета недоступна этому аккаунту")
+	}
+	var state string
+	var retry int64
+	// A service quota is account-wide, including clicks on another profile.
+	err = q.QueryRowContext(ctx, `SELECT state,retry_at FROM actions WHERE owner_id=? AND kind='Like'
+ AND state='quota_waiting' AND (retry_at=0 OR retry_at>?) ORDER BY retry_at=0 DESC,retry_at DESC LIMIT 1`, owner, now.Unix()).Scan(&state, &retry)
+	if err == nil {
+		blocked := &ActionBlockedError{State: state}
+		if retry > 0 {
+			blocked.RetryAt = time.Unix(retry, 0).UTC()
+		}
+		return blocked
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	err = q.QueryRowContext(ctx, `SELECT state,retry_at FROM actions WHERE owner_id=? AND profile_id=? AND kind='Like'
+ AND state NOT IN ('quota_waiting','quota_retried') ORDER BY id DESC LIMIT 1`, owner, profile).Scan(&state, &retry)
+	if err == nil {
+		return &ActionBlockedError{State: state}
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) CanAttemptLike(ctx context.Context, owner, profile int64, at ...time.Time) (bool, error) {
+	now := time.Now()
+	if len(at) > 0 {
+		now = at[0]
+	}
+	err := s.checkReactionAction(ctx, s.DB, owner, profile, now)
+	return err == nil, err
+}
+
 func (s *Store) ClaimAction(ctx context.Context, owner, profile int64) (int64, error) {
-	r, err := s.DB.ExecContext(ctx, "INSERT INTO actions(owner_id,profile_id,kind,state) VALUES(?,?,'Like','pending')", owner, profile)
+	return s.ClaimOwnerAction(ctx, owner, profile, time.Now())
+}
+
+func (s *Store) ClaimOwnerAction(ctx context.Context, owner, profile int64, now time.Time) (int64, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	return r.LastInsertId()
+	defer tx.Rollback()
+	if err = s.checkReactionAction(ctx, tx, owner, profile, now); err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE actions SET state='quota_retried' WHERE owner_id=? AND profile_id=? AND kind='Like'
+ AND state='quota_waiting' AND retry_at>0 AND retry_at<=?`, owner, profile, now.Unix()); err != nil {
+		return 0, err
+	}
+	r, err := tx.ExecContext(ctx, "INSERT INTO actions(owner_id,profile_id,kind,state,created_at) VALUES(?,?,'Like','pending',?)", owner, profile, now.UTC().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return 0, err
+	}
+	id, err := r.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, tx.Commit()
+}
+
+func (s *Store) finishReactionAction(ctx context.Context, id int64, state string, response []byte, retryAt time.Time) error {
+	retry := int64(0)
+	if !retryAt.IsZero() {
+		// Never retry before the entire server duration has elapsed.
+		retry = retryAt.Unix()
+		if retryAt.Nanosecond() > 0 {
+			retry++
+		}
+	}
+	r, err := s.DB.ExecContext(ctx, "UPDATE actions SET state=?,response=?,retry_at=? WHERE id=? AND state='pending'", state, string(response), retry, id)
+	if err != nil {
+		return err
+	}
+	n, err := r.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return errors.New("не удалось сохранить состояние реакции")
+	}
+	return nil
+}
+
+func (s *Store) releaseUnsentReaction(ctx context.Context, id int64) error {
+	_, err := s.DB.ExecContext(ctx, "DELETE FROM actions WHERE id=? AND state='pending' AND response=''", id)
+	return err
 }
 func (s *Store) FinishAction(ctx context.Context, id int64, state string, response []byte) {
 	_, _ = s.DB.ExecContext(ctx, "UPDATE actions SET state=?,response=? WHERE id=?", state, string(response), id)

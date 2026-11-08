@@ -30,6 +30,64 @@ func photoPresentationSource(t *testing.T, index, width, height int) MediaJob {
 	return MediaJob{Role: "photos", Position: index, State: "complete", SHA: sha, Path: path, Size: int64(b.Len())}
 }
 
+func TestPrivateAlbumLikeTailSharesBodyBudget(t *testing.T) {
+	for _, long := range []bool{false, true} {
+		p := StoredProfile{ID: 99, VersionID: 123, RawJSON: `{"userId":99,"name":"Ира🙂","large":9007199254740993}`, Profile: Profile{"name": "Ира🙂"}}
+		if long {
+			p.Profile["description"] = strings.Repeat("Биография🙂 ", 300)
+		}
+		photos := []MediaJob{photoPresentationSource(t, 0, 2, 3), photoPresentationSource(t, 1, 4, 5)}
+		private, err := renderProfileCard(p, photos, 0, false, "https://t.me/c/123/55", 1024, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		archive, err := renderProfileCard(p, photos, 0, false, "https://t.me/c/123/55", 1024, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(private.Text, "❤️ /like_99 · Избранное: /fav_99") || !strings.Contains(private.Text, "/json_123") || strings.Contains(archive.Text, "/like_") {
+			t.Fatal("album command identity or private scope lost")
+		}
+		if photoQuoteText(t, private) != photoQuoteText(t, archive) || private.Truncated != archive.Truncated || private.SourceJSONInline != archive.SourceJSONInline {
+			t.Fatal("album commands changed shared source body")
+		}
+		for _, card := range []photoText{private, archive} {
+			if textUnits(card.Text) > 1024 || !strings.HasSuffix(card.Text, "🔗 пост") {
+				t.Fatal("album action displaced caption budget or footer")
+			}
+			if err := validMessageEntities(card.Text, card.Entities); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestProfileSnapshotDateStableAcrossRepeatedObservations(t *testing.T) {
+	p := StoredProfile{ID: 99, VersionID: 123, RawJSON: `{"userId":99,"name":"Ира🙂"}`, Profile: Profile{"name": "Ира🙂"}, FirstSeen: "2026-11-07 22:10:00", LastSeen: "2026-11-07 22:10:00"}
+	for _, private := range []bool{false, true} {
+		before, err := renderProfileCard(p, nil, 0, true, "https://t.me/c/123/55", 4096, private)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observed := p
+		observed.LastSeen = "2026-11-10 12:30:00"
+		after, err := renderProfileCard(observed, nil, 0, true, "https://t.me/c/123/55", 4096, private)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if before.Text != after.Text || !strings.Contains(after.Text, "8.11.26, 01:10 (вс, UTC+3)") {
+			t.Fatal("repeated observation changed the snapshot date")
+		}
+		if observed.LastSeen != "2026-11-10 12:30:00" || observed.RawJSON != p.RawJSON {
+			t.Fatal("rendering changed source or observation history")
+		}
+	}
+	p.FirstSeen = ""
+	if !strings.Contains(profileText(p), displayTime(p.LastSeen)) {
+		t.Fatal("legacy snapshot without FirstSeen lost its date")
+	}
+}
+
 func photoQuoteText(t *testing.T, value photoText) string {
 	t.Helper()
 	e, ok := photoQuote(value.Entities)

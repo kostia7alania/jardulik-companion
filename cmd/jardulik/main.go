@@ -115,10 +115,18 @@ func run() error {
 		out := map[string]any{"connected": true, "tenant": owner, "user_id": account.ID(), "type": account["type"], "order_end_date": account["orderEndDate"]}
 		return json.NewEncoder(os.Stdout).Encode(out)
 	case "crawl-request":
-		if len(os.Args) > 3 || (len(os.Args) == 3 && os.Args[2] != "--include-others") {
-			return errors.New("usage: crawl-request [--include-others]")
+		includeOthers, includeLocations := false, false
+		for _, arg := range os.Args[2:] {
+			switch {
+			case arg == "--include-others" && !includeOthers:
+				includeOthers = true
+			case arg == "--include-locations" && !includeLocations:
+				includeLocations = true
+			default:
+				return errors.New("usage: crawl-request [--include-others] [--include-locations]")
+			}
 		}
-		job, err := s.Crawler.Request(ctx, owner, len(os.Args) == 3)
+		job, err := s.Crawler.Request(ctx, owner, includeOthers, includeLocations)
 		if err != nil {
 			return err
 		}
