@@ -27,6 +27,7 @@ type Config struct {
 	SessionKey, BackupKey                              []byte
 	AllowReactions                                     bool
 	ArchivePaused                                      bool
+	DailyCrawl                                         bool
 	MinFreeBytes                                       uint64
 	InitMaxAge                                         time.Duration
 	WatchInterval, WatchGap                            time.Duration
@@ -105,6 +106,7 @@ func LoadConfig() (Config, error) {
 	c.FullBackupEnabled = os.Getenv("FULL_BACKUP_TRANSFER_ENABLED") == "true"
 	c.AllowReactions = os.Getenv("ALLOW_REACTIONS") == "true"
 	c.ArchivePaused = os.Getenv("ARCHIVE_WORKER_PAUSED") == "true"
+	c.DailyCrawl = os.Getenv("DAILY_CRAWL_ENABLED") == "true"
 	if s := os.Getenv("MIN_FREE_BYTES"); s != "" {
 		c.MinFreeBytes, err = strconv.ParseUint(s, 10, 64)
 		if err != nil {

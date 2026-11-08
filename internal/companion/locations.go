@@ -105,6 +105,15 @@ func (c *Client) crawlPremium(ctx context.Context, owner int64, expected Session
 	if err != nil {
 		return err
 	}
+	if value, exists := account["freezeState"]; exists && value != nil {
+		frozen, ok := value.(bool)
+		if !ok {
+			return errors.New("неизвестное состояние аккаунта")
+		}
+		if frozen {
+			return ErrAccountFrozen
+		}
+	}
 	if number(account["type"]) != 1 {
 		return ErrFiltersPremium
 	}
@@ -125,7 +134,13 @@ func (c *Client) LocationsFrozen(ctx context.Context, owner int64, expected Sess
 	if err := c.crawlPremium(ctx, owner, expected); err != nil {
 		return LocationPage{}, err
 	}
-	query := url.Values{"userId": {strconv.FormatInt(expected.UserID, 10)}, "country": {country}, "city": {city}, "pageNumber": {strconv.Itoa(page)}, "pageSize": {strconv.Itoa(locationPageSize)}}
+	query := url.Values{"userId": {strconv.FormatInt(expected.UserID, 10)}, "pageNumber": {strconv.Itoa(page)}, "pageSize": {strconv.Itoa(locationPageSize)}}
+	if country != "" {
+		query.Set("country", country)
+	}
+	if city != "" {
+		query.Set("city", city)
+	}
 	raw, err := c.requestSession(ctx, owner, http.MethodGet, "/user/getUsersLocations?"+query.Encode(), nil, &expected)
 	if err != nil {
 		return LocationPage{}, err

@@ -228,7 +228,24 @@ func (s *Store) Paused(ctx context.Context, owner int64) bool {
 	return v != 0
 }
 func (s *Store) Pause(ctx context.Context, owner int64, pause bool) {
-	_, _ = s.DB.ExecContext(ctx, "UPDATE users SET paused=? WHERE id=?", pause, owner)
+	if !pause {
+		_, _ = s.DB.ExecContext(ctx, "UPDATE users SET paused=0 WHERE id=?", owner)
+		return
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE users SET paused=1 WHERE id=?", owner); err != nil {
+		return
+	}
+	// /resume must not re-enable a daily crawl between scheduler ticks.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO meta(key,value) SELECT ?,'1' WHERE EXISTS(SELECT 1 FROM users WHERE id=?)
+ ON CONFLICT(key) DO UPDATE SET value='1'`, dailyCrawlBlockKey(owner), owner); err != nil {
+		return
+	}
+	_ = tx.Commit()
 }
 
 func valueString(v any) string {

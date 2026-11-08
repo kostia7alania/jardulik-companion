@@ -42,11 +42,11 @@ func locationFixture(t *testing.T) (*FeedCrawler, *time.Time, *locationSource) {
 		switch r.URL.Path {
 		case "/user/getUsersLocations":
 			q := r.URL.Query()
-			if q.Get("userId") != "101" || q.Get("pageSize") != "20" || len(q) != 5 {
+			if q.Get("userId") != "101" || q.Get("pageSize") != "20" || len(q) != 3 {
 				t.Fatalf("unexpected catalog query: %s", r.URL)
 			}
 			for _, key := range []string{"country", "city"} {
-				if values, ok := q[key]; !ok || len(values) != 1 || values[0] != "" {
+				if _, ok := q[key]; ok {
 					t.Fatalf("catalog scope changed: %s", r.URL)
 				}
 			}
@@ -87,6 +87,60 @@ func locationFixture(t *testing.T) (*FeedCrawler, *time.Time, *locationSource) {
 		fmt.Fprint(w, body)
 	})}
 	return crawler, now, source
+}
+
+func TestLocationsFrozenOmitsOnlyEmptyGeography(t *testing.T) {
+	for _, geography := range [][2]string{{"", ""}, {"Russia", ""}, {"", "Vladikavkaz"}, {"Russia", "Vladikavkaz"}} {
+		t.Run(geography[0]+"/"+geography[1], func(t *testing.T) {
+			crawler, _, source := locationFixture(t)
+			calls := 0
+			source.before = func(w http.ResponseWriter, r *http.Request) bool {
+				if r.URL.Path != "/user/getUsersLocations" {
+					return false
+				}
+				calls++
+				query := r.URL.Query()
+				wantKeys := 3
+				for i, key := range []string{"country", "city"} {
+					values, exists := query[key]
+					if geography[i] == "" {
+						if exists {
+							t.Fatalf("empty %s was sent to the source", key)
+						}
+					} else {
+						wantKeys++
+						if !exists || len(values) != 1 || values[0] != geography[i] {
+							t.Fatalf("nonempty %s changed: %v", key, values)
+						}
+					}
+				}
+				if len(query) != wantKeys || query.Get("userId") != "101" || query.Get("pageNumber") != "2" || query.Get("pageSize") != "20" {
+					t.Fatalf("unexpected geography request: %s", r.URL)
+				}
+				fmt.Fprint(w, "[]")
+				return true
+			}
+			page, err := crawler.Service.Client.LocationsFrozen(context.Background(), 1, Session{UserID: 101, Generation: "1"}, geography[0], geography[1], 2)
+			if err != nil || calls != 1 || page.Country != geography[0] || page.City != geography[1] {
+				t.Fatalf("geography request failed: %+v %v", page, err)
+			}
+		})
+	}
+}
+
+func TestLocationsFrozenStopsFreshlyFrozenAccount(t *testing.T) {
+	crawler, _, source := locationFixture(t)
+	source.before = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Path == "/user/getMe" {
+			fmt.Fprint(w, `{"userId":101,"type":1,"freezeState":true}`)
+			return true
+		}
+		return false
+	}
+	_, err := crawler.Service.Client.LocationsFrozen(context.Background(), 1, Session{UserID: 101, Generation: "1"}, "", "", 1)
+	if !errors.Is(err, ErrAccountFrozen) || len(source.calls) != 1 || source.calls[0] != "/user/getMe" {
+		t.Fatalf("frozen source account reached catalogue: %v %v", source.calls, err)
+	}
 }
 
 func locationBody(total int, ids ...int64) string {

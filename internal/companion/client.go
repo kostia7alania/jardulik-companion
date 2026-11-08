@@ -48,6 +48,9 @@ func (c *Client) lock(owner int64) *sync.Mutex {
 }
 
 func (c *Client) exchange(ctx context.Context, method, path, token string, payload any) ([]byte, error) {
+	if method == http.MethodGet && crawlShouldYield(ctx) {
+		return nil, errCrawlYield
+	}
 	var body io.Reader
 	if payload != nil {
 		b, err := json.Marshal(payload)

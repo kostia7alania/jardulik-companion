@@ -24,7 +24,7 @@ const crawlSchema = `
 CREATE TABLE IF NOT EXISTS feed_crawls (
  owner_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
  run_id TEXT NOT NULL, upstream_id INTEGER NOT NULL, generation TEXT NOT NULL,
- filters_json TEXT NOT NULL, include_others INTEGER NOT NULL, include_locations INTEGER NOT NULL DEFAULT 0, mode INTEGER NOT NULL DEFAULT 0,
+ filters_json TEXT NOT NULL, include_others INTEGER NOT NULL, include_locations INTEGER NOT NULL DEFAULT 0, unfiltered INTEGER NOT NULL DEFAULT 0, mode INTEGER NOT NULL DEFAULT 0,
  page INTEGER NOT NULL DEFAULT 1, next_request INTEGER NOT NULL, state TEXT NOT NULL,
  reason TEXT NOT NULL DEFAULT '', pages INTEGER NOT NULL DEFAULT 0, received INTEGER NOT NULL DEFAULT 0,
  catalog_pages INTEGER NOT NULL DEFAULT 0, catalog_received INTEGER NOT NULL DEFAULT 0, catalog_profiles INTEGER NOT NULL DEFAULT 0,
@@ -46,6 +46,7 @@ type CrawlJob struct {
 	Filters          FeedFilters `json:"filters"`
 	IncludeOthers    bool        `json:"include_others"`
 	IncludeLocations bool        `json:"include_locations"`
+	Unfiltered       bool        `json:"unfiltered"`
 	Mode             int         `json:"all_mode"`
 	Page             int         `json:"next_page"`
 	NextRequest      int64       `json:"next_request"`
@@ -64,12 +65,12 @@ type CrawlJob struct {
 
 func (j CrawlJob) active() bool { return j.State == "queued" || j.State == "running" }
 
-const crawlColumns = "owner_id,run_id,upstream_id,generation,filters_json,include_others,include_locations,mode,page,next_request,state,reason,pages,received,catalog_pages,catalog_received,catalog_profiles,hydrated,unavailable,started_at,updated_at"
+const crawlColumns = "owner_id,run_id,upstream_id,generation,filters_json,include_others,include_locations,unfiltered,mode,page,next_request,state,reason,pages,received,catalog_pages,catalog_received,catalog_profiles,hydrated,unavailable,started_at,updated_at"
 
 func scanCrawl(row interface{ Scan(...any) error }) (*CrawlJob, error) {
 	var j CrawlJob
 	var raw string
-	err := row.Scan(&j.Owner, &j.RunID, &j.UserID, &j.Generation, &raw, &j.IncludeOthers, &j.IncludeLocations, &j.Mode, &j.Page, &j.NextRequest, &j.State, &j.Reason, &j.Pages, &j.Received, &j.CatalogPages, &j.CatalogReceived, &j.CatalogProfiles, &j.Hydrated, &j.Unavailable, &j.StartedAt, &j.UpdatedAt)
+	err := row.Scan(&j.Owner, &j.RunID, &j.UserID, &j.Generation, &raw, &j.IncludeOthers, &j.IncludeLocations, &j.Unfiltered, &j.Mode, &j.Page, &j.NextRequest, &j.State, &j.Reason, &j.Pages, &j.Received, &j.CatalogPages, &j.CatalogReceived, &j.CatalogProfiles, &j.Hydrated, &j.Unavailable, &j.StartedAt, &j.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +151,7 @@ func (s *Store) migrateCrawl(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, name := range []string{"include_locations", "catalog_pages", "catalog_received", "catalog_profiles", "hydrated", "unavailable"} {
+	for _, name := range []string{"include_locations", "unfiltered", "catalog_pages", "catalog_received", "catalog_profiles", "hydrated", "unavailable"} {
 		if !columns[name] {
 			if _, err = tx.ExecContext(ctx, "ALTER TABLE feed_crawls ADD COLUMN "+name+" INTEGER NOT NULL DEFAULT 0"); err != nil {
 				return err
@@ -192,11 +193,29 @@ func (c *FeedCrawler) Request(ctx context.Context, owner int64, includeOthers bo
 	if len(includeLocations) > 1 {
 		return nil, errors.New("invalid crawl options")
 	}
-	locations := len(includeLocations) == 1 && includeLocations[0]
-	s := c.Service
-	mu := s.userLock(owner)
+	mu := c.Service.userLock(owner)
 	mu.Lock()
 	defer mu.Unlock()
+	return c.requestLocked(ctx, owner, includeOthers, includeLocations...)
+}
+
+type crawlLifecycleError struct{ state string }
+
+func (e *crawlLifecycleError) Error() string {
+	switch e.state {
+	case "paused":
+		return "аккаунт на паузе; сначала /resume, затем новый запрос обхода"
+	case "active":
+		return "обход уже выполняется; смотри crawl-status"
+	default:
+		return "для обхода нужна подключённая сессия Jardulik"
+	}
+}
+
+// Caller holds userLock to serialize explicit requests and daily scheduling.
+func (c *FeedCrawler) requestLocked(ctx context.Context, owner int64, includeOthers bool, includeLocations ...bool) (*CrawlJob, error) {
+	locations := len(includeLocations) == 1 && includeLocations[0]
+	s := c.Service
 	if err := c.init(ctx); err != nil {
 		return nil, err
 	}
@@ -223,11 +242,27 @@ func (c *FeedCrawler) Request(ctx context.Context, owner int64, includeOthers bo
 		return nil, err
 	}
 	if paused {
-		return nil, errors.New("аккаунт на паузе; сначала /resume, затем новый запрос обхода")
+		return nil, &crawlLifecycleError{state: "paused"}
+	}
+	expectedDaily, daily := ctx.Value(dailyCrawlRequestKey{}).(dailyCrawlIdentity)
+	if daily {
+		var blocked bool
+		if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM meta WHERE key=? AND value='1')", dailyCrawlBlockKey(owner)).Scan(&blocked); err != nil {
+			return nil, err
+		}
+		if blocked {
+			return nil, &crawlLifecycleError{state: "paused"}
+		}
 	}
 	session, err := crawlSession(ctx, tx, s.Store, owner)
-	if err != nil || session.State != "connected" || session.Generation == "" {
-		return nil, errors.New("для обхода нужна подключённая сессия Jardulik")
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if errors.Is(err, sql.ErrNoRows) || session.State != "connected" || session.Generation == "" {
+		return nil, &crawlLifecycleError{state: "session_unavailable"}
+	}
+	if daily && (session.UserID != expectedDaily.UserID || session.Generation != expectedDaily.Generation) {
+		return nil, &crawlLifecycleError{state: "session_changed"}
 	}
 	var oldState string
 	err = tx.QueryRowContext(ctx, "SELECT state FROM feed_crawls WHERE owner_id=?", owner).Scan(&oldState)
@@ -235,7 +270,7 @@ func (c *FeedCrawler) Request(ctx context.Context, owner int64, includeOthers bo
 		return nil, err
 	}
 	if oldState == "queued" || oldState == "running" {
-		return nil, errors.New("обход уже выполняется; смотри crawl-status")
+		return nil, &crawlLifecycleError{state: "active"}
 	}
 	now := c.now().UnixMilli()
 	var next int64
@@ -251,13 +286,16 @@ func (c *FeedCrawler) Request(ctx context.Context, owner int64, includeOthers bo
 	if _, err = tx.ExecContext(ctx, "DELETE FROM meta WHERE key=?", crawlRetryKey(owner)); err != nil {
 		return nil, err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO feed_crawls(owner_id,run_id,upstream_id,generation,filters_json,include_others,include_locations,next_request,state,started_at,updated_at)
-	 VALUES(?,?,?,?,?,?,?,?,'queued',?,?)
+	_, err = tx.ExecContext(ctx, `INSERT INTO feed_crawls(owner_id,run_id,upstream_id,generation,filters_json,include_others,include_locations,unfiltered,next_request,state,started_at,updated_at)
+	 VALUES(?,?,?,?,?,?,?,1,?,'queued',?,?)
 	 ON CONFLICT(owner_id) DO UPDATE SET run_id=excluded.run_id,upstream_id=excluded.upstream_id,generation=excluded.generation,
-	 filters_json=excluded.filters_json,include_others=excluded.include_others,include_locations=excluded.include_locations,mode=0,page=1,next_request=excluded.next_request,
+	 filters_json=excluded.filters_json,include_others=excluded.include_others,include_locations=excluded.include_locations,unfiltered=excluded.unfiltered,mode=0,page=1,next_request=excluded.next_request,
 	 state='queued',reason='',pages=0,received=0,catalog_pages=0,catalog_received=0,catalog_profiles=0,hydrated=0,unavailable=0,started_at=excluded.started_at,updated_at=excluded.updated_at`,
 		owner, run, session.UserID, session.Generation, string(raw), includeOthers, locations, next, now, now)
 	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM meta WHERE key=?", dailyCrawlBlockKey(owner)); err != nil {
 		return nil, err
 	}
 	if err = initCrawlPresenceTx(ctx, tx, owner, run); err != nil {
@@ -280,6 +318,12 @@ func (c *FeedCrawler) Run(ctx context.Context) {
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	for ctx.Err() == nil {
+		if _, err := c.ScheduleDaily(ctx); err != nil {
+			if ctx.Err() == nil {
+				slog.Warn("daily crawl scheduler stopped", "kind", safeError(err))
+			}
+			return
+		}
 		if _, err := c.Step(ctx); err != nil {
 			if ctx.Err() == nil {
 				slog.Warn("feed crawl worker stopped", "kind", safeError(err))
@@ -343,6 +387,9 @@ func crawlFingerprint(profiles []Profile) (string, error) {
 }
 
 func crawlErrorReason(err error) string {
+	if errors.Is(err, ErrAccountFrozen) {
+		return "account_frozen"
+	}
 	if errors.Is(err, ErrFiltersPremium) {
 		return "premium_required"
 	}
@@ -466,6 +513,9 @@ func (c *FeedCrawler) retryGET(ctx context.Context, j *CrawlJob, target int64, u
 
 // Step handles at most one source page or catalog-proven full profile across all owners.
 func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
+	if c.Service.foregroundPending() {
+		return false, nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -491,8 +541,13 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	ownerMu := s.userLock(j.Owner)
-	ownerMu.Lock()
+	if !ownerMu.TryLock() {
+		return false, nil
+	}
 	defer ownerMu.Unlock()
+	if s.foregroundPending() {
+		return false, nil
+	}
 	if reason, e := c.invalid(ctx, j); e != nil {
 		return true, e
 	} else if reason != "" {
@@ -565,14 +620,19 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 	var locations LocationPage
 	var requestErr error
 	expected := Session{UserID: j.UserID, Generation: j.Generation}
+	requestCtx := withCrawlPriority(ctx, s)
 	switch j.Mode {
 	case 0, 1:
-		profiles, requestErr = s.Client.UsersFrozen(ctx, j.Owner, expected, j.Filters, j.Page, j.Mode == 1)
+		if j.Unfiltered {
+			profiles, requestErr = s.Client.UsersUnfilteredFrozen(requestCtx, j.Owner, expected, j.Page, j.Mode == 1)
+		} else {
+			profiles, requestErr = s.Client.UsersFrozen(requestCtx, j.Owner, expected, j.Filters, j.Page, j.Mode == 1)
+		}
 	case 2:
-		locations, requestErr = s.Client.LocationsFrozen(ctx, j.Owner, expected, "", "", j.Page)
+		locations, requestErr = s.Client.LocationsFrozen(requestCtx, j.Owner, expected, "", "", j.Page)
 	case 3:
 		var profile Profile
-		profile, requestErr = s.Client.FullProfileFrozen(ctx, j.Owner, expected, target)
+		profile, requestErr = s.Client.FullProfileFrozen(requestCtx, j.Owner, expected, target)
 		if requestErr == nil {
 			profiles = []Profile{profile}
 		}
@@ -591,6 +651,9 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 			reason = crawlErrorReason(requestErr)
 		}
 		return true, c.stop(ctx, j, reason)
+	}
+	if errors.Is(requestErr, errCrawlYield) {
+		return true, nil
 	}
 	if requestErr != nil && !(j.Mode == 3 && errors.Is(requestErr, ErrProfileUnavailable)) {
 		if upstream, retryable := crawlRetryableGET(requestErr); retryable {
@@ -854,7 +917,7 @@ func (j CrawlJob) shortStatus() string {
 	if j.Reason != "" && j.Reason != "empty_page" {
 		reason := map[string]string{
 			"paused": "пауза", "disconnected": "сессия отключена", "session_changed": "сессия изменилась",
-			"session_unavailable": "сессия недоступна", "auth_required": "нужно повторное подключение",
+			"session_unavailable": "сессия недоступна", "auth_required": "нужно повторное подключение", "account_frozen": "анкета заморожена в Jardulik",
 			"filters_changed": "фильтры изменены", "premium_required": "Premium недоступен",
 			"repeated_page": "сервис повторяет уже полученную страницу", "page_cap": "лимит 1000 страниц",
 			"disk_reserve": "недостаточно свободного места", "challenge": "сервис запросил дополнительную проверку",

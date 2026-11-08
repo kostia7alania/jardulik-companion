@@ -41,13 +41,26 @@ func crawlFixture(t *testing.T, response func(mode, page int) ([]Profile, int)) 
 			fmt.Fprintf(w, `{"userId":%s,"type":1,"minAge":18,"maxAge":25}`, r.URL.Query().Get("userId"))
 		case "/user/getUsers":
 			q := r.URL.Query()
-			if q.Get("ageMin") != "0" || q.Get("ageMax") != "100" || q.Get("heightMin") != "100" || q.Get("heightMax") != "250" || q.Get("pageSize") != "150" {
-				t.Fatalf("frozen source bounds were clamped/substituted: %s", r.URL)
+			var unfiltered bool
+			upstream, _ := strconv.ParseInt(q.Get("userId"), 10, 64)
+			requestService, _ := r.Context().Value(crawlPriorityKey{}).(*Service)
+			if requestService == nil {
+				t.Fatal("crawl request lost its worker context")
 			}
-			for _, key := range []string{"goal", "children", "worldview", "country", "city"} {
-				if values, ok := q[key]; !ok || len(values) != 1 || values[0] != "" {
-					t.Fatalf("unexpected %s query: %v", key, q)
+			if err := requestService.Store.DB.QueryRow("SELECT unfiltered FROM feed_crawls WHERE owner_id=?", upstream-100).Scan(&unfiltered); err != nil {
+				t.Fatal(err)
+			}
+			if unfiltered {
+				if len(q) != 4 || q.Get("pageSize") != "150" {
+					t.Fatalf("broad crawl sent personal filters: %s", r.URL)
 				}
+				for _, key := range []string{"ageMin", "ageMax", "heightMin", "heightMax", "goal", "children", "worldview", "country", "city"} {
+					if _, ok := q[key]; ok {
+						t.Fatalf("unexpected %s query: %v", key, q)
+					}
+				}
+			} else if q.Get("ageMin") != "0" || q.Get("ageMax") != "100" || q.Get("heightMin") != "100" || q.Get("heightMax") != "250" || q.Get("pageSize") != "150" {
+				t.Fatalf("legacy frozen filter contract changed: %s", r.URL)
 			}
 			if q.Get("userId") != "101" && q.Get("userId") != "102" {
 				t.Fatal("queried an unrelated user")
@@ -788,5 +801,48 @@ func TestCrawlMigrationSerializesIndependentStoresBeforeSchemaRead(t *testing.T)
 		if err = store.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('feed_crawls') WHERE name IN ('include_locations','catalog_pages','catalog_received','catalog_profiles','hydrated','unavailable')").Scan(&count); err != nil || count != 6 {
 			t.Fatalf("partial schema after concurrent migration: %d %v", count, err)
 		}
+	}
+}
+
+func TestCrawlLegacyActiveCursorKeepsFrozenQueryUntilExplicitNewRun(t *testing.T) {
+	c, now, _, _ := crawlFixture(t, func(int, int) ([]Profile, int) { return nil, 200 })
+	ctx := context.Background()
+	if _, err := c.Service.Store.DB.Exec(legacyCrawlTable); err != nil {
+		t.Fatal(err)
+	}
+	filters := DefaultFeedFilters()
+	filters.AgeMin, filters.AgeMax = 22, 44
+	raw, _ := json.Marshal(filters)
+	if _, err := c.Service.Store.DB.Exec(`INSERT INTO feed_crawls(owner_id,run_id,upstream_id,generation,filters_json,include_others,page,next_request,state,started_at,updated_at)
+ VALUES(1,'legacy-page-two',101,'1',?,0,2,0,'running',1,1)`, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	job := crawlJob(t, c)
+	if job.Unfiltered || job.Page != 2 || job.RunID != "legacy-page-two" {
+		t.Fatalf("migration changed the legacy cursor or query contract: %+v", job)
+	}
+	var queries []map[string][]string
+	c.Service.Client.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/getMe":
+			fmt.Fprint(w, `{"userId":101,"type":1,"freezeState":false}`)
+		case "/user/getUsers":
+			queries = append(queries, r.URL.Query())
+			fmt.Fprint(w, "[]")
+		default:
+			t.Fatalf("unexpected endpoint: %s", r.URL)
+		}
+	})}
+	crawlStep(t, c, now)
+	if len(queries) != 1 || queries[0]["pageNumber"][0] != "2" || queries[0]["ageMin"][0] != "22" || queries[0]["ageMax"][0] != "44" {
+		t.Fatalf("legacy page resumed with a different query: %v", queries)
+	}
+	job, err := c.Request(ctx, 1, true)
+	if err != nil || !job.Unfiltered || job.Page != 1 {
+		t.Fatalf("explicit new run did not persist the raw query contract: %+v err=%v", job, err)
+	}
+	crawlStep(t, c, now)
+	if len(queries) != 2 || len(queries[1]) != 4 || queries[1]["pageNumber"][0] != "1" || queries[1]["userId"][0] != "101" || queries[1]["pageSize"][0] != "150" || queries[1]["all"][0] != "0" {
+		t.Fatalf("new run retained legacy filters: %v", queries)
 	}
 }

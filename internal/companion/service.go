@@ -17,17 +17,18 @@ import (
 )
 
 type Service struct {
-	Config    Config
-	Store     *Store
-	Client    *Client
-	TG        *Telegram
-	Media     *MediaManager
-	Archiver  *Archiver
-	Watcher   *ProfileWatcher
-	Crawler   *FeedCrawler
-	Autoliker *Autoliker
-	locks     sync.Map
-	runs      sync.Map
+	Config     Config
+	Store      *Store
+	Client     *Client
+	TG         *Telegram
+	Media      *MediaManager
+	Archiver   *Archiver
+	Watcher    *ProfileWatcher
+	Crawler    *FeedCrawler
+	Autoliker  *Autoliker
+	foreground foregroundPriority
+	locks      sync.Map
+	runs       sync.Map
 }
 
 func NewService(c Config) (*Service, error) {
@@ -88,12 +89,12 @@ func (s *Service) Run(ctx context.Context) error {
 	go func() { defer background.Done(); s.Watcher.Run(ctx) }()
 	go func() { defer background.Done(); s.Crawler.Run(ctx) }()
 	go func() { defer background.Done(); s.Autoliker.Run(ctx) }()
-	queues := make([]chan Update, 4)
+	queues := make([]chan queuedUpdate, 4)
 	var workers sync.WaitGroup
 	for i := range queues {
-		queues[i] = make(chan Update, 16)
+		queues[i] = make(chan queuedUpdate, 16)
 		workers.Add(1)
-		go func(jobs <-chan Update) {
+		go func(jobs <-chan queuedUpdate) {
 			defer workers.Done()
 			for {
 				select {
@@ -103,8 +104,7 @@ func (s *Service) Run(ctx context.Context) error {
 					if !ok {
 						return
 					}
-					s.Handle(ctx, u)
-					s.Store.FinishUpdate(ctx, u.ID)
+					s.handleQueuedUpdate(ctx, u)
 				}
 			}
 		}(queues[i])
@@ -115,6 +115,9 @@ func (s *Service) Run(ctx context.Context) error {
 			close(q)
 		}
 		workers.Wait()
+		for _, q := range queues {
+			s.discardQueuedUpdates(q)
+		}
 		background.Wait()
 	}()
 	offset, _ := strconv.ParseInt(s.Store.Meta(ctx, "telegram_offset"), 10, 64)
@@ -138,6 +141,7 @@ func (s *Service) Run(ctx context.Context) error {
 				return err
 			}
 			if claimed {
+				job := s.prepareQueuedUpdate(u)
 				// Pause is not queued behind a long-running profile fetch.
 				if isPrivatePause(u.Message) {
 					s.Store.Pause(ctx, u.Message.From.ID, true)
@@ -150,9 +154,7 @@ func (s *Service) Run(ctx context.Context) error {
 				if isPrivateCommand(u.Message, "/autolike_off") {
 					_ = s.DisableAutolike(ctx, u.Message.From.ID, "user_off")
 				}
-				select {
-				case queues[updateShard(u, len(queues))] <- u:
-				case <-ctx.Done():
+				if !s.enqueueUpdate(ctx, queues[updateShard(u, len(queues))], job) {
 					return nil
 				}
 			}
@@ -220,6 +222,15 @@ func truncate(s string, n int) string {
 	return s
 }
 func (s *Service) Handle(ctx context.Context, u Update) {
+	foreground := s.isForegroundUpdate(u)
+	if foreground {
+		s.beginForeground()
+		defer s.endForeground()
+	}
+	s.handle(ctx, u)
+}
+
+func (s *Service) handle(ctx context.Context, u Update) {
 	var owner int64
 	var m Message
 	if u.Callback != nil {
@@ -575,6 +586,11 @@ func (s *Service) status(ctx context.Context, owner int64) {
 	}
 	if job, err := s.Store.CrawlStatus(ctx, owner); err == nil && job != nil {
 		text += "\n" + job.shortStatus()
+	}
+	if s.Crawler != nil {
+		if daily := s.Crawler.DailyStatus(ctx, owner); daily != "" {
+			text += "\n" + daily
+		}
 	}
 	_ = s.say(ctx, owner, text, nil)
 }
