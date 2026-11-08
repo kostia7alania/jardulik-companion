@@ -29,13 +29,22 @@ func selectedProfilePhotos(jobs []MediaJob) []MediaJob {
 	return photos
 }
 
-func photoMetadataRows(photos []MediaJob) []string {
+func photoMetadataRows(photos []MediaJob, full ...bool) []string {
 	var rows []string
 	for i, j := range photos {
-		metadata, _ := ReadPhotoMetadata(j.Path)
-		fields := metadata.TechnicalRows()
-		for k := range fields {
-			fields[k] = strings.Join(strings.Fields(fields[k]), " ")
+		metadata, err := ReadPhotoMetadata(j.Path)
+		fields := metadata.compactTechnicalFields()
+		if len(full) > 0 && full[0] {
+			fields = metadata.TechnicalRows()
+		} else {
+			for k := range fields {
+				fields[k] = strings.Join(strings.Fields(fields[k]), " ")
+			}
+		}
+		if metadata.HasGPS {
+			fields = append(fields, "GPS: есть")
+		} else if err == nil {
+			fields = append(fields, "GPS: нет")
 		}
 		row := fmt.Sprintf("Фото %d", i+1)
 		if len(fields) > 0 {
@@ -60,11 +69,19 @@ func compactPhotoRows(rows []string, budget int) string {
 	}
 	var compact []string
 	for _, row := range rows {
-		prefix, rest := telegramPrefix(row, per-1)
+		tail := ""
+		for _, gps := range []string{" · GPS: есть", " · GPS: нет"} {
+			if strings.HasSuffix(row, gps) {
+				tail = gps
+				row = strings.TrimSuffix(row, gps)
+				break
+			}
+		}
+		prefix, rest := telegramPrefix(row, per-textUnits(tail)-1)
 		if rest != "" {
 			prefix = strings.TrimSpace(prefix) + "…"
 		}
-		compact = append(compact, prefix)
+		compact = append(compact, prefix+tail)
 	}
 	return "О фото\n" + strings.Join(compact, "\n")
 }

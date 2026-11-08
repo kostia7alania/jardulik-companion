@@ -123,7 +123,7 @@ func (s *Service) fullText(ctx context.Context, chat int64, p StoredProfile) {
 	if err != nil {
 		return
 	}
-	value := fullPhotoText(s.cardText(ctx, chat, p), photoMetadataRows(selectedProfilePhotos(jobs)))
+	value := fullPhotoText(s.cardText(ctx, chat, p), photoMetadataRows(selectedProfilePhotos(jobs), true))
 	for value.Text != "" {
 		part, rest := photoTextPart(value, 3900)
 		if _, err := s.TG.SendText(ctx, chat, 0, part.Text, nil, part.Entities); err != nil {

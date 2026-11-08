@@ -77,6 +77,46 @@ func (m PhotoMetadata) TechnicalRows() []string {
 	return rows
 }
 
+func (m PhotoMetadata) compactTechnicalFields() []string {
+	var fields []string
+	if m.Width > 0 && m.Height > 0 {
+		fields = append(fields, fmt.Sprintf("%d×%d", m.Width, m.Height))
+	}
+	camera := strings.TrimSpace(m.Make + " " + m.Model)
+	if m.Make != "" && strings.HasPrefix(strings.ToLower(m.Model), strings.ToLower(m.Make)+" ") {
+		camera = m.Model
+	}
+	if camera != "" {
+		fields = append(fields, camera)
+	}
+	if m.DateOriginal != "" {
+		date := m.DateOriginal
+		if m.OffsetOriginal != "" {
+			date += " " + m.OffsetOriginal
+		}
+		fields = append(fields, date)
+	}
+	if m.Lens != "" {
+		fields = append(fields, m.Lens)
+	}
+	if m.Exposure != "" {
+		fields = append(fields, m.Exposure)
+	}
+	if m.FNumber > 0 {
+		fields = append(fields, "f/"+strconv.FormatFloat(m.FNumber, 'f', -1, 64))
+	}
+	if m.ISO > 0 {
+		fields = append(fields, fmt.Sprintf("ISO %d", m.ISO))
+	}
+	if m.FocalLength > 0 {
+		fields = append(fields, strconv.FormatFloat(m.FocalLength, 'f', -1, 64)+" мм")
+	}
+	if m.Software != "" {
+		fields = append(fields, m.Software)
+	}
+	return fields
+}
+
 type photoMetaParser struct {
 	r     io.ReaderAt
 	size  int64
