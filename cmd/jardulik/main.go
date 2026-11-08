@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,15 +26,19 @@ func run() error {
 		fmt.Println(companion.Version)
 		return nil
 	}
-	c, err := companion.LoadConfig()
-	if err != nil {
-		return err
-	}
 	if command == "restore" {
 		if len(os.Args) != 4 {
 			return errors.New("usage: jardulik restore <encrypted-archive> <new-empty-directory>")
 		}
-		return companion.RestoreArchive(os.Args[2], os.Args[3], c.BackupKey)
+		key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(os.Getenv("BACKUP_KEY")))
+		if err != nil || len(key) != 32 {
+			return errors.New("BACKUP_KEY must be base64-encoded 32 bytes")
+		}
+		return companion.RestoreArchive(os.Args[2], os.Args[3], key)
+	}
+	c, err := companion.LoadConfig()
+	if err != nil {
+		return err
 	}
 	if command == "restore-media" {
 		if len(os.Args) != 3 {
