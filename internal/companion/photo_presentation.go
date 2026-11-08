@@ -1,6 +1,7 @@
 package companion
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -28,6 +29,64 @@ func selectedProfilePhotos(jobs []MediaJob) []MediaJob {
 	}
 	sort.SliceStable(photos, func(i, j int) bool { return photos[i].Position < photos[j].Position })
 	return photos
+}
+
+// Each record follows the displayed full-size photo order. Only values read
+// from bounded, whitelisted technical tags are included; GPS is presence only.
+func photoMetadataJSON(photos []MediaJob) string {
+	if len(photos) == 0 {
+		return ""
+	}
+	type record struct {
+		Photo          int     `json:"Фото"`
+		Width          int     `json:"ImageWidth,omitempty"`
+		Height         int     `json:"ImageHeight,omitempty"`
+		Make           string  `json:"Make,omitempty"`
+		Model          string  `json:"Model,omitempty"`
+		Lens           string  `json:"LensModel,omitempty"`
+		Software       string  `json:"Software,omitempty"`
+		DateOriginal   string  `json:"DateTimeOriginal,omitempty"`
+		DateDigitized  string  `json:"DateTimeDigitized,omitempty"`
+		DateModified   string  `json:"DateTime,omitempty"`
+		OffsetOriginal string  `json:"OffsetTimeOriginal,omitempty"`
+		Exposure       string  `json:"ExposureTime,omitempty"`
+		FNumber        float64 `json:"FNumber,omitempty"`
+		FocalLength    float64 `json:"FocalLength,omitempty"`
+		ISO            int     `json:"ISO,omitempty"`
+		Orientation    int     `json:"Orientation,omitempty"`
+		GPS            string  `json:"GPS,omitempty"`
+	}
+	rows := make([]string, 0, len(photos))
+	for i, photo := range photos {
+		m, err := ReadPhotoMetadata(photo.Path)
+		gps := ""
+		if m.HasGPS {
+			gps = "есть"
+		} else if err == nil {
+			gps = "нет"
+		}
+		value := record{Photo: i + 1, Width: m.Width, Height: m.Height, Make: m.Make, Model: m.Model,
+			Lens: m.Lens, Software: m.Software, DateOriginal: m.DateOriginal, DateDigitized: m.DateDigitized,
+			DateModified: m.DateModified, OffsetOriginal: m.OffsetOriginal, Exposure: m.Exposure,
+			FNumber: m.FNumber, FocalLength: m.FocalLength, ISO: m.ISO, Orientation: m.Orientation, GPS: gps}
+		b, _ := json.Marshal(value) // The bounded record contains no unsupported JSON types.
+		rows = append(rows, string(b))
+	}
+	return "[" + strings.Join(rows, ",\n") + "]"
+}
+
+// JSON is never truncated. Oversized captions retain the compact photo rows;
+// the existing full-text action exposes every available technical JSON value.
+func photoJSONCardText(text string, photos []MediaJob, tail string, limit int) photoText {
+	value := fullPhotoText(text, []string{photoMetadataJSON(photos)})
+	if tail != "" {
+		_, _, _, link := splitPhotoFooter(text)
+		value.Text = strings.TrimSuffix(value.Text, link) + tail + link
+	}
+	if textUnits(value.Text) <= limit {
+		return value
+	}
+	return photoCardText(text, photoMetadataRows(photos), tail, limit)
 }
 
 func photoMetadataRows(photos []MediaJob, full ...bool) []string {

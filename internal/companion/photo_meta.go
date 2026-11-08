@@ -34,6 +34,8 @@ type PhotoMetadata struct {
 	Lens           string  `json:"lens,omitempty"`
 	Software       string  `json:"software,omitempty"`
 	DateOriginal   string  `json:"date_original,omitempty"`
+	DateDigitized  string  `json:"date_digitized,omitempty"`
+	DateModified   string  `json:"date_modified,omitempty"`
 	OffsetOriginal string  `json:"offset_original,omitempty"`
 	Exposure       string  `json:"exposure,omitempty"`
 	FNumber        float64 `json:"f_number,omitempty"`
@@ -56,6 +58,7 @@ func (m PhotoMetadata) TechnicalRows() []string {
 	for _, field := range []struct{ key, value string }{
 		{"Make", m.Make}, {"Model", m.Model}, {"LensModel", m.Lens},
 		{"Software", m.Software}, {"DateTimeOriginal", m.DateOriginal},
+		{"DateTimeDigitized", m.DateDigitized}, {"DateTime", m.DateModified},
 		{"OffsetTimeOriginal", m.OffsetOriginal}, {"ExposureTime", m.Exposure},
 	} {
 		if field.value != "" {
@@ -452,6 +455,10 @@ func (p *photoMetaParser) tiff(start, size int64) error {
 				target = &p.meta.Software
 			case 0x9003:
 				target = &p.meta.DateOriginal
+			case 0x9004:
+				target = &p.meta.DateDigitized
+			case 0x0132:
+				target = &p.meta.DateModified
 			case 0x9011:
 				target = &p.meta.OffsetOriginal
 			}
@@ -464,7 +471,7 @@ func (p *photoMetaParser) tiff(start, size int64) error {
 					}
 				}
 				textValue := photoTechnicalString(text)
-				if tag == 0x9003 {
+				if tag == 0x9003 || tag == 0x9004 || tag == 0x0132 {
 					if _, e := time.Parse("2006:01:02 15:04:05", textValue); e != nil || len(textValue) != 19 {
 						textValue = ""
 					}

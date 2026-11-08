@@ -45,7 +45,7 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 	if len(photos) > 1 {
 		tail = fmt.Sprintf("\n\nТекст: /text_%d\nИзбранное: /fav_%d · /next", p.ID, p.ID)
 	}
-	card := photoCardText(text, photoMetadataRows(photos), tail, 1024)
+	card := photoJSONCardText(text, photos, tail, 1024)
 	caption := card.Text
 	var ids []int64
 	for start := 0; start < len(photos); {
@@ -119,7 +119,7 @@ func (s *Service) fullText(ctx context.Context, chat int64, p StoredProfile) {
 	if err != nil {
 		return
 	}
-	value := fullPhotoText(s.cardText(ctx, chat, p), photoMetadataRows(selectedProfilePhotos(jobs), true))
+	value := fullPhotoText(s.cardText(ctx, chat, p), []string{photoMetadataJSON(selectedProfilePhotos(jobs))})
 	for value.Text != "" {
 		part, rest := photoTextPart(value, 3900)
 		if _, err := s.TG.SendText(ctx, chat, 0, part.Text, nil, part.Entities); err != nil {
@@ -391,7 +391,7 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 			if len(photos) == 0 && len(jobs) > 0 {
 				text += "\n\nФотографии пока недоступны."
 			}
-			card := photoCardText(text, photoMetadataRows(photos), tail, limit)
+			card := photoJSONCardText(text, photos, tail, limit)
 			payload := map[string]any{"chat_id": v.owner, "message_id": ids[0], "caption": card.Text, "caption_entities": card.Entities}
 			if len(photos) == 0 {
 				delete(payload, "caption")

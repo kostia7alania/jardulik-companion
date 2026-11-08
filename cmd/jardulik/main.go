@@ -126,13 +126,17 @@ func run() error {
 		return nil
 	case "repair-zips":
 		return s.Archiver.RequestZIPRepair(ctx)
+	case "refresh-captions":
+		result, err := s.RefreshCaptions(ctx)
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return err
 	case "reconcile-albums":
 		if err = s.Archiver.ReconcileCaptionedAlbums(ctx); err != nil {
 			return err
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, restore, restore-media, repair-posts, repair-zips, reconcile-albums, version")
+		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, restore, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
 	}
 }
 func main() {

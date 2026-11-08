@@ -719,7 +719,7 @@ func (a *Archiver) profileCardContent(p StoredProfile, missing int, thread int64
 	if link := forumTopicURL(a.Config.BackupChatID, thread); link != "" {
 		tail = "\n\n📍 " + link
 	}
-	return photoCardText(text, photoMetadataRows(photos), tail, limit)
+	return photoJSONCardText(text, photos, tail, limit)
 }
 
 func (a *Archiver) profileCardText(p StoredProfile, missing int, thread int64, limit int, noPhotos bool) string {

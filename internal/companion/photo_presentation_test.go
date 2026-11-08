@@ -224,7 +224,7 @@ func TestFullTextIncludesMetadataAsExpandableQuote(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(payload.Text, "Фото 1: FileType: PNG · ImageWidth: 2 · ImageHeight: 3 · GPS: нет") || len(payload.Entities) != 1 || filepath.Base(r.URL.Path) != "sendMessage" {
+		if !strings.Contains(payload.Text, `[{"Фото":1,"ImageWidth":2,"ImageHeight":3,"GPS":"нет"}]`) || len(payload.Entities) != 1 || filepath.Base(r.URL.Path) != "sendMessage" {
 			t.Fatalf("full safe text missing metadata: %+v", payload)
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`)
@@ -232,6 +232,52 @@ func TestFullTextIncludesMetadataAsExpandableQuote(t *testing.T) {
 	s.fullText(context.Background(), 1, p)
 	if calls != 1 {
 		t.Fatal("full metadata was not delivered")
+	}
+}
+
+func TestPhotoJSONCaptionAndFullTextKeepValidTechnicalJSON(t *testing.T) {
+	tiff, _ := photoMetaTIFF(binary.LittleEndian)
+	first := MediaJob{Role: "photos", Position: 0, State: "complete", SHA: "test", Path: photoMetaWrite(t, photoMetaWebP(tiff))}
+	second := photoPresentationSource(t, 1, 4, 5)
+	photos := selectedProfilePhotos([]MediaJob{second, first})
+	const footer = "\n\nНе указано: рост\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
+	card := photoJSONCardText("Ира, 25"+footer, photos, "\nТекст: /text_99", 1024)
+	quote := photoQuoteText(t, card)
+	var values []map[string]any
+	if err := json.NewDecoder(strings.NewReader(quote)).Decode(&values); err != nil {
+		t.Fatalf("caption does not start with complete JSON: %v: %s", err, quote)
+	}
+	if len(values) != 2 || values[0]["Фото"] != float64(1) || values[0]["DateTimeOriginal"] != "2021:08:09 10:11:12" || values[0]["DateTimeDigitized"] != "2021:08:09 10:11:14" || values[0]["DateTime"] != "2022:09:10 11:12:13" || values[0]["GPS"] != "есть" || values[1]["Фото"] != float64(2) || values[1]["GPS"] != "нет" {
+		t.Fatalf("JSON lost photo order or source dates: %v", values)
+	}
+	if textUnits(card.Text) > 1024 || strings.Contains(quote, "UTC+3") || !strings.HasSuffix(quote, "Не указано: рост\nJardulik: 99") || !strings.HasSuffix(card.Text, "https://t.me/c/123/55") || strings.Count(card.Text, "https://t.me/c/123/55") != 1 {
+		t.Fatalf("JSON caption misplaced details or footer: %+v", card)
+	}
+	for _, noise := range []string{"PRIVATE_", "FileType", "has_exif", "has_icc", "Фото 1:"} {
+		if strings.Contains(quote, noise) {
+			t.Fatalf("JSON contains private data or duplicate presentation: %s", noise)
+		}
+	}
+	long := photoJSONCardText(strings.Repeat("🙂Биография ", 150)+footer, photos, "", 1024)
+	if textUnits(long.Text) > 1024 || strings.HasPrefix(photoQuoteText(t, long), "[") || !strings.Contains(photoQuoteText(t, long), "Фото 1:") {
+		t.Fatal("oversized JSON caption was clipped instead of using compact fallback")
+	}
+	full := fullPhotoText("Ира, 25"+footer, []string{photoMetadataJSON(photos)})
+	var complete []map[string]any
+	if err := json.NewDecoder(strings.NewReader(photoQuoteText(t, full))).Decode(&complete); err != nil || len(complete) != 2 {
+		t.Fatal("full-text action lost complete JSON")
+	}
+}
+
+func TestPhotoJSONOmitsUnavailableDatesAndUnknownGPS(t *testing.T) {
+	photos := []MediaJob{photoPresentationSource(t, 0, 4, 5), {Path: filepath.Join(t.TempDir(), "missing")}}
+	value := photoMetadataJSON(photos)
+	var rows []map[string]any
+	if err := json.Unmarshal([]byte(value), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0]["GPS"] != "нет" || rows[1]["GPS"] != nil || strings.Contains(value, "DateTime") {
+		t.Fatalf("missing source values were invented: %s", value)
 	}
 }
 
