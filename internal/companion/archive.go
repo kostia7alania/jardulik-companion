@@ -782,10 +782,10 @@ func (a *Archiver) sendProfileCard(ctx context.Context, p StoredProfile, jobs []
 		return save(ids)
 	}
 	if len(selected) == 0 {
-		body := a.profileCardText(p, missing, thread, 4096, true)
+		body := a.profileCardContent(p, missing, thread, 4096, true, nil)
 		var m SentMessage
 		err := a.groupCall(ctx, func() (err error) {
-			m, err = a.TG.SendText(ctx, a.Config.BackupChatID, thread, body, keyboard)
+			m, err = a.TG.SendText(ctx, a.Config.BackupChatID, thread, body.Text, keyboard, body.Entities)
 			return err
 		})
 		if err != nil {
@@ -1301,6 +1301,30 @@ func (a *Archiver) ReconcileCaptionedAlbums(ctx context.Context) error {
 	return nil
 }
 
+func (a *Archiver) editKnownText(ctx context.Context, id int64, value photoText) error {
+	if id <= 0 {
+		return errors.New("known message id is missing")
+	}
+	if err := validMessageEntities(value.Text, value.Entities); err != nil {
+		return err
+	}
+	var edited SentMessage
+	err := a.groupCall(ctx, func() error {
+		return a.TG.Call(ctx, "editMessageText", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": id, "text": value.Text, "entities": value.Entities, "link_preview_options": map[string]bool{"is_disabled": true}}, &edited)
+	})
+	var rejected *TelegramError
+	if errors.As(err, &rejected) && rejected.Code == 400 && strings.Contains(strings.ToLower(rejected.Description), "message is not modified") {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if edited.ID != id {
+		return errors.New("known text edit is unconfirmed")
+	}
+	return nil
+}
+
 func (a *Archiver) editKnownCaption(ctx context.Context, id int64, caption string, keyboard any, entities ...[]MessageEntity) error {
 	if id <= 0 {
 		return errors.New("known message id is missing")
@@ -1676,7 +1700,10 @@ func (a *Archiver) refreshConfirmedProfileCaption(ctx context.Context, version, 
 		}
 	}
 	if expected == 0 {
-		return nil
+		if len(ids) != 1 {
+			return errors.New("confirmed text card inventory is invalid")
+		}
+		return a.editKnownText(ctx, ids[0], a.profileCardContent(p, missing, thread, 4096, true, nil))
 	}
 	if expected != len(ids) {
 		return errors.New("confirmed profile photo inventory is incomplete")

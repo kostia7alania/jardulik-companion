@@ -53,7 +53,7 @@ func TestPhotoCaptionQuotePreservesFooterAndSafeNumberedOrder(t *testing.T) {
 	text := strings.Repeat("🙂<blockquote>О фото</blockquote>", 300) + "\n\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
 	card := photoCardText(text, rows, "\nТекст: /text_99", 1024)
 	quote := photoQuoteText(t, card)
-	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "Фото 1:") || !strings.Contains(quote, "Фото 2:") || strings.Contains(quote, "Jardulik:") || !strings.Contains(card.Text, "Jardulik: 99") || !strings.Contains(card.Text, "UTC+3") || !strings.HasSuffix(card.Text, "https://t.me/c/123/55") {
+	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "Фото 1:") || !strings.Contains(quote, "Фото 2:") || !strings.Contains(quote, "Jardulik: 99") || !strings.Contains(card.Text, "Jardulik: 99") || !strings.Contains(card.Text, "UTC+3") || !strings.HasSuffix(card.Text, "https://t.me/c/123/55") {
 		t.Fatalf("caption/entity/footer invalid: %+v", card)
 	}
 }
@@ -117,12 +117,12 @@ func TestPhotoQuoteClippingKeepsGPSAtEndOfEveryRow(t *testing.T) {
 		t.Fatal("compact photo quote exceeded its UTF-16 budget")
 	}
 	lines := strings.Split(quote, "\n")
-	if len(lines) != 5 {
+	if len(lines) != 4 {
 		t.Fatal("photo quote lost a row")
 	}
 	for i, gps := range []string{"есть", "нет", "есть", "нет"} {
-		if !strings.HasPrefix(lines[i+1], fmt.Sprintf("Фото %d:", i+1)) || !strings.HasSuffix(lines[i+1], " · GPS: "+gps) {
-			t.Fatalf("clipping lost photo number or GPS: %s", lines[i+1])
+		if !strings.HasPrefix(lines[i], fmt.Sprintf("Фото %d:", i+1)) || !strings.HasSuffix(lines[i], " · GPS: "+gps) {
+			t.Fatalf("clipping lost photo number or GPS: %s", lines[i])
 		}
 	}
 }
@@ -232,5 +232,87 @@ func TestFullTextIncludesMetadataAsExpandableQuote(t *testing.T) {
 	s.fullText(context.Background(), 1, p)
 	if calls != 1 {
 		t.Fatal("full metadata was not delivered")
+	}
+}
+
+func TestPhotoQuoteContainsDetailsWhileSnapshotAndLinkStayOutside(t *testing.T) {
+	const snapshot = "8.11.26, 01:10 (вс, UTC+3)"
+	const link = "https://t.me/c/123/55"
+	text := "Ира🙂\n\nБиография\n\nНе указано: возраст, рост, город\n" + snapshot + "\nJardulik: 99\n📍 " + link
+	for _, rows := range [][]string{nil, {"Фото 1: 2×3 · GPS: нет", "Фото 2: 4×5 · GPS: есть"}} {
+		for _, full := range []bool{false, true} {
+			card := photoCardText(text, rows, "", 1024)
+			if full {
+				card = fullPhotoText(text, rows)
+			}
+			quote := photoQuoteText(t, card)
+			if strings.Contains(quote, "О фото") || !strings.HasSuffix(quote, "Не указано: возраст, рост, город\nJardulik: 99") || strings.Contains(quote, snapshot) || strings.Contains(quote, link) || strings.Count(card.Text, "Jardulik: 99") != 1 || strings.Count(card.Text, "Не указано:") != 1 || !strings.HasSuffix(card.Text, link) {
+				t.Fatalf("details/outer footer misplaced: %+v", card)
+			}
+		}
+	}
+}
+
+func TestPhotoQuoteDetailsSurviveLongBioManyMissingAndPlainLookalikes(t *testing.T) {
+	missing := "Не указано: фамилия, возраст, рост, страна, город, цель знакомства, мировоззрение, дети, занятие, языки, родственные фамилии, о себе"
+	text := strings.Repeat("🙂Биография\n", 500) + "\n\n" + missing + "\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99"
+	rows := []string{"Фото 1: " + strings.Repeat("Модель ", 100) + " · GPS: нет", "Фото 2: " + strings.Repeat("Модель ", 100) + " · GPS: есть"}
+	card := photoCardText(text, rows, "\n📍 https://t.me/c/123/55", 1024)
+	quote := photoQuoteText(t, card)
+	if textUnits(card.Text) > 1024 || !strings.Contains(quote, missing) || !strings.HasSuffix(quote, "Jardulik: 99") || !strings.Contains(quote, "Фото 1:") || !strings.Contains(quote, "Фото 2:") {
+		t.Fatalf("fixed details budget lost: %+v", card)
+	}
+	plain := "Ира\n\nНе указано: текст из биографии\nJardulik: 666\n\nБиография продолжается\n\nJardulik: 99"
+	card = photoCardText(plain, nil, "", 1024)
+	quote = photoQuoteText(t, card)
+	if quote != "Jardulik: 99" || !strings.Contains(card.Text, "Не указано: текст из биографии\nJardulik: 666") {
+		t.Fatalf("biography lookalike was parsed as generated details: %+v", card)
+	}
+}
+
+func TestNoPhotoPrivateCardUsesTextEntity(t *testing.T) {
+	s, p := cardFixture(t, 0)
+	s.TG.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text     string          `json:"text"`
+			Entities []MessageEntity `json:"entities"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if filepath.Base(r.URL.Path) != "sendMessage" || photoQuoteText(t, photoText{Text: payload.Text, Entities: payload.Entities}) != "Jardulik: 10" {
+			t.Fatal("no-photo details were not quoted")
+		}
+		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`)
+	})}
+	if _, err := s.sendProfileCard(context.Background(), 1, p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNoPhotoArchiveCardUsesTextEntityAndRefreshMethod(t *testing.T) {
+	c, _, a, p, _ := archivePresentationFixture(t)
+	var methods []string
+	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+		methods = append(methods, call.method)
+		raw, _ := json.Marshal(call.json["entities"])
+		var entities []MessageEntity
+		if err := json.Unmarshal(raw, &entities); err != nil {
+			t.Fatal(err)
+		}
+		text, _ := call.json["text"].(string)
+		if photoQuoteText(t, photoText{Text: text, Entities: entities}) != fmt.Sprintf("Jardulik: %d", p.ID) {
+			t.Fatal("archive text details missing")
+		}
+		return `{"ok":true,"result":{"message_id":101,"chat":{"id":-100123}}}`, nil
+	})
+	if _, err := a.sendProfileCard(context.Background(), p, nil, 55, func([]int64) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.editKnownText(context.Background(), 101, a.profileCardContent(p, 0, 55, 4096, true, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(methods) != "[sendMessage editMessageText]" {
+		t.Fatalf("no-photo card used caption-only API: %v", methods)
 	}
 }

@@ -31,12 +31,8 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		if len(jobs) > 0 {
 			text += "\n\nФотографии пока недоступны."
 		}
-		prefix, rest := telegramPrefix(text, 4000)
-		if rest != "" {
-			prefix, _ = telegramPrefix(text, 3900)
-			prefix += "\n\nПолный текст по кнопке."
-		}
-		m, e := s.TG.SendText(ctx, owner, 0, prefix, buttons)
+		card := photoCardText(text, nil, "", 4096)
+		m, e := s.TG.SendText(ctx, owner, 0, card.Text, buttons, card.Entities)
 		if e != nil {
 			return nil, e
 		}
@@ -386,13 +382,29 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 			if len(ids) > 1 {
 				tail = fmt.Sprintf("\n\nТекст: /text_%d\nИзбранное: /fav_%d · /next", p.ID, p.ID)
 			}
-			card := photoCardText(s.cardText(ctx, v.owner, p), photoMetadataRows(selectedProfilePhotos(jobs)), tail, 1024)
+			photos := selectedProfilePhotos(jobs)
+			limit, method := 1024, "editMessageCaption"
+			if len(photos) == 0 {
+				limit, method = 4096, "editMessageText"
+			}
+			text := s.cardText(ctx, v.owner, p)
+			if len(photos) == 0 && len(jobs) > 0 {
+				text += "\n\nФотографии пока недоступны."
+			}
+			card := photoCardText(text, photoMetadataRows(photos), tail, limit)
 			payload := map[string]any{"chat_id": v.owner, "message_id": ids[0], "caption": card.Text, "caption_entities": card.Entities}
+			if len(photos) == 0 {
+				delete(payload, "caption")
+				delete(payload, "caption_entities")
+				payload["text"] = card.Text
+				payload["entities"] = card.Entities
+				payload["link_preview_options"] = map[string]bool{"is_disabled": true}
+			}
 			if len(ids) == 1 {
 				payload["reply_markup"] = profileButtons(p)
 			}
 			var out SentMessage
-			err = s.TG.Call(ctx, "editMessageCaption", payload, &out)
+			err = s.TG.Call(ctx, method, payload, &out)
 			var te *TelegramError
 			if errors.As(err, &te) && te.Code == 400 && strings.Contains(strings.ToLower(te.Description), "message is not modified") {
 				return nil
