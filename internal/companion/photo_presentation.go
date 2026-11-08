@@ -1,6 +1,7 @@
 package companion
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -9,10 +10,11 @@ import (
 )
 
 type photoText struct {
-	Text             string
-	Entities         []MessageEntity
-	Truncated        bool
-	SourceJSONInline bool
+	Text                 string
+	Entities             []MessageEntity
+	Truncated            bool
+	SourceJSONInline     bool
+	SourceJSONProjection string
 }
 
 func selectedProfilePhotos(jobs []MediaJob) []MediaJob {
@@ -67,26 +69,69 @@ func photoExifBlocks(photos []MediaJob) []string {
 // The main caption always keeps the compact summary, not a synthesized JSON dump.
 func photoJSONCardText(text string, photos []MediaJob, tail string, limit int, sourceJSON ...string) photoText {
 	value := photoCardText(text, photoMetadataRows(photos), tail, limit)
-	if len(sourceJSON) > 0 && sourceJSON[0] != "" && textUnits(value.Text)+textUnits(sourceJSON[0])+1 <= limit {
+	if len(sourceJSON) > 0 && sourceJSON[0] != "" {
+		display, projection := photoSourceJSONFit(sourceJSON[0], limit-textUnits(value.Text)-1)
+		if display == "" {
+			return value
+		}
 		for i, e := range value.Entities {
 			if e.Type != "expandable_blockquote" {
 				continue
 			}
 			at := e.Offset + e.Length
 			prefix, rest := telegramPrefix(value.Text, at)
-			added := 1 + textUnits(sourceJSON[0])
-			value.Text = prefix + "\n" + sourceJSON[0] + rest
+			added := 1 + textUnits(display)
+			value.Text = prefix + "\n" + display + rest
 			value.Entities[i].Length += added
 			for j := range value.Entities {
 				if j != i && value.Entities[j].Offset >= at {
 					value.Entities[j].Offset += added
 				}
 			}
-			value.SourceJSONInline = true
+			value.SourceJSONInline = projection == "full"
+			value.SourceJSONProjection = projection
 			break
 		}
 	}
 	return value
+}
+
+// Caption-only projections keep the complete stored JSON available by its action.
+func photoSourceJSONFit(source string, budget int) (string, string) {
+	pretty, err := prettyProfileJSON(source)
+	if err != nil || budget <= 0 {
+		return "", ""
+	}
+	if textUnits(pretty) <= budget {
+		return pretty, "full"
+	}
+	decoder := json.NewDecoder(strings.NewReader(source))
+	decoder.UseNumber()
+	var fields map[string]any
+	if err := decoder.Decode(&fields); err != nil || fields == nil {
+		return "", ""
+	}
+	for _, step := range []struct{ key, projection string }{
+		{"photos", "without_photos"},
+		{"miniPhotos", "without_photos_and_miniPhotos"},
+	} {
+		if _, exists := fields[step.key]; !exists {
+			continue
+		}
+		delete(fields, step.key)
+		var display bytes.Buffer
+		encoder := json.NewEncoder(&display)
+		encoder.SetEscapeHTML(false)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(fields); err != nil {
+			return "", ""
+		}
+		projected := strings.TrimSuffix(display.String(), "\n")
+		if textUnits(projected) <= budget {
+			return projected, step.projection
+		}
+	}
+	return "", ""
 }
 
 func photoMetadataRows(photos []MediaJob) []string {
@@ -212,6 +257,7 @@ func photoCardText(text string, rows []string, tail string, limit int) photoText
 		}
 		quote += details
 	}
+	quote = photoQuoteLanguagesFirst(quote)
 	bodyBudget := limit - textUnits("\n\n"+quote+footer+tail)
 	prefix, rest := telegramPrefix(body, bodyBudget)
 	if rest != "" {
@@ -224,6 +270,22 @@ func photoCardText(text string, rows []string, tail string, limit int) photoText
 		result.Entities = []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(quote)}}
 	}
 	return withPostLinkEntity(result, link)
+}
+
+func photoQuoteLanguagesFirst(quote string) string {
+	const target = "Не указано: языки"
+	lines := strings.Split(quote, "\n")
+	if lines[0] == target {
+		return quote
+	}
+	for i := 1; i < len(lines); i++ {
+		if lines[i] == target {
+			copy(lines[1:i+1], lines[:i])
+			lines[0] = target
+			return strings.Join(lines, "\n")
+		}
+	}
+	return quote
 }
 
 func fullPhotoText(text string, rows []string) photoText {
@@ -294,12 +356,6 @@ func appendPostLink(value photoText, link string) photoText {
 	}
 	return value
 }
-func privateAlbumActionTail(p StoredProfile, photos int) string {
-	if photos < 2 {
-		return ""
-	}
-	return fmt.Sprintf("\n\nТекст: /text_%d\nJSON: /json_%d\n❤️ /like_%d · Избранное: /fav_%d · /next", p.ID, p.VersionID, p.ID, p.ID)
-}
 func unavailableMediaCount(jobs []MediaJob) int {
 	n := 0
 	for _, j := range jobs {
@@ -310,8 +366,7 @@ func unavailableMediaCount(jobs []MediaJob) int {
 	return n
 }
 
-// Both destinations reserve the same body budget. Only private albums append
-// their contextual commands; the configured post link remains the final line.
+// Both destinations reserve the same body budget; actions live in the bot menu.
 func renderProfileCard(p StoredProfile, photos []MediaJob, missing int, noPhotos bool, link string, limit int, private bool) (photoText, error) {
 	pretty, err := prettyProfileJSON(p.RawJSON)
 	if err != nil {
@@ -324,10 +379,6 @@ func renderProfileCard(p StoredProfile, photos []MediaJob, missing int, noPhotos
 	if noPhotos {
 		text += "\nФотографии пока недоступны."
 	}
-	actions := privateAlbumActionTail(p, len(photos))
-	card := photoJSONCardText(text, photos, "", limit-textUnits(actions+"\n🔗 пост"), pretty)
-	if private {
-		card.Text += actions
-	}
+	card := photoJSONCardText(text, photos, "", limit-textUnits("\n🔗 пост"), pretty)
 	return appendPostLink(card, link), nil
 }

@@ -28,16 +28,61 @@ done
 base=/opt/jardulik-companion
 data_dir=/var/lib/jardulik-companion
 env_file=/etc/jardulik-companion.env
-unit_names=(jardulik-companion.service jardulik-companion-backup.service jardulik-companion-backup.timer)
+unit_dir=/etc/systemd/system
+runtime_units=(jardulik-companion.service jardulik-companion-poster.service)
+unit_names=("${runtime_units[@]}" jardulik-companion-backup.service jardulik-companion-backup.timer)
 
-require_inactive() {
-    local state
-    state=$(systemctl show --property=ActiveState --value jardulik-companion.service) || return 1
-    if [[ $state != inactive ]]; then
-        printf 'install: service must already be inactive for --no-start\n' >&2
-        return 1
+# BEGIN runtime unit helpers
+runtime_info() {
+    local details line load='' state='' pid=''
+    details=$(systemctl show --property=LoadState --property=ActiveState --property=MainPID "$1") || true
+    while IFS= read -r line; do
+        case $line in
+            LoadState=*) load=${line#*=} ;;
+            ActiveState=*) state=${line#*=} ;;
+            MainPID=*) pid=${line#*=} ;;
+        esac
+    done <<< "$details"
+    [[ $load == loaded || $load == not-found ]] || return 1
+    # A not-yet-installed service may omit service-specific properties.
+    if [[ $load == not-found && $state == inactive && -z $pid ]]; then pid=0; fi
+    [[ $pid =~ ^[0-9]+$ ]] || return 1
+    if [[ $load == not-found ]]; then
+        [[ $state == inactive && $pid == 0 ]] || return 1
+    else
+        [[ $state == active || $state == inactive || $state == failed ]] || return 1
     fi
+    printf '%s %s %s\n' "$load" "$state" "$pid"
 }
+require_inactive() {
+    local unit info load state pid
+    for unit in "${runtime_units[@]}"; do
+        info=$(runtime_info "$unit") || return 1
+        read -r load state pid <<< "$info"
+        if [[ $state != inactive || $pid != 0 ]]; then
+            printf 'install: %s must already be inactive for --no-start/switch\n' "$unit" >&2
+            return 1
+        fi
+    done
+}
+stop_runtime() {
+    local unit info load state pid
+    for unit in "${runtime_units[@]}"; do
+        info=$(runtime_info "$unit") || return 1
+        read -r load state pid <<< "$info"
+        if [[ $load == loaded ]]; then systemctl stop "$unit" || return 1; fi
+    done
+    require_inactive
+}
+verify_running() {
+    local unit info load state pid
+    for unit in "${runtime_units[@]}"; do
+        info=$(runtime_info "$unit") || return 1
+        read -r load state pid <<< "$info"
+        [[ $load == loaded && $state == active && $pid != 0 ]] || return 1
+    done
+}
+# END runtime unit helpers
 
 # Validate secrets and capacity before creating users, changing releases or restarting.
 [[ -f $env_file && ! -L $env_file ]] || die "create $env_file before deploying"
@@ -144,46 +189,122 @@ else
     candidate=''
 fi
 
+# BEGIN controlled activation
+if $no_start; then require_inactive; fi
+systemd-analyze verify "${unit_names[@]/#/$source_dir/deploy/}"
+[[ ! -L $base/deployments ]] || die 'deployment state directory must not be a symlink'
+install -d -o root -g root -m 0700 "$base/deployments"
+state_dir=$(mktemp -d "$base/deployments/$revision.XXXXXX")
+mkdir "$state_dir/units"
+chmod 0700 "$state_dir" "$state_dir/units"
+printf '%s\n' "$previous_target" > "$state_dir/previous-target"
 for unit in "${unit_names[@]}"; do
-    install -o root -g root -m 0644 "$source_dir/deploy/$unit" "/etc/systemd/system/$unit"
+    if [[ -e $unit_dir/$unit || -L $unit_dir/$unit ]]; then
+        [[ -f $unit_dir/$unit && ! -L $unit_dir/$unit ]] || die "existing unit is not a regular file: $unit"
+        cp -p -- "$unit_dir/$unit" "$state_dir/units/$unit"
+    fi
+    enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    case $enabled in
+        enabled|enabled-runtime|disabled|static|indirect|not-found) ;;
+        *) die "unsupported existing enablement state: $unit" ;;
+    esac
+    printf '%s\n' "$enabled" > "$state_dir/$unit.enabled"
 done
-systemctl daemon-reload
+for unit in "${runtime_units[@]}"; do
+    info=$(runtime_info "$unit") || die "could not read runtime state: $unit"
+    read -r load state pid <<< "$info"
+    printf '%s\n' "$state" > "$state_dir/$unit.active"
+done
+timer_state=$(systemctl show --property=ActiveState --value jardulik-companion-backup.timer) || die 'could not read timer state'
+printf '%s\n' "$timer_state" > "$state_dir/timer-active"
 
 switched=false
+units_changed=false
+stopped=false
+enabled_changed=false
 rollback() {
     code=$?
     trap - ERR
-    if $switched; then
-        printf 'install: activation failed; restoring the previous release\n' >&2
-        if [[ -n $previous_target ]]; then
-            ln -s "$previous_target" "$base/.current.rollback.$$"
-            mv -Tf -- "$base/.current.rollback.$$" "$base/current"
-            if ! $no_start; then
-                if ! systemctl restart jardulik-companion.service; then
-                    printf 'install: previous release restored, but its service restart failed\n' >&2
+    printf 'install: activation failed; restoring previous release and units (%s)\n' "$state_dir" >&2
+    local unit before stop_ok=true
+    if ! $no_start && $stopped; then
+        if ! stop_runtime; then
+            stop_ok=false
+            printf 'install: runtime stop failed; previous roles will not be started\n' >&2
+        fi
+    fi
+    if ! $no_start && $enabled_changed; then
+        systemctl disable "${runtime_units[@]}" jardulik-companion-backup.timer >/dev/null 2>&1 || true
+        if [[ $(cat "$state_dir/timer-active") != active ]]; then
+            systemctl stop jardulik-companion-backup.timer || true
+        fi
+    fi
+    if $units_changed; then
+        for unit in "${unit_names[@]}"; do
+            if [[ -f $state_dir/units/$unit ]]; then
+                if ! cp -p -- "$state_dir/units/$unit" "$unit_dir/$unit"; then
+                    stop_ok=false
+                    printf 'install: could not restore previous unit: %s\n' "$unit" >&2
+                fi
+            else
+                if ! rm -f -- "$unit_dir/$unit"; then
+                    stop_ok=false
+                    printf 'install: could not remove newly introduced unit: %s\n' "$unit" >&2
                 fi
             fi
-        else
-            if ! $no_start; then
-                systemctl disable --now jardulik-companion.service jardulik-companion-backup.timer || true
+        done
+    fi
+    if $switched; then
+        if [[ -n $previous_target ]]; then
+            if ! ln -s "$previous_target" "$base/.current.rollback.$$" || ! mv -Tf -- "$base/.current.rollback.$$" "$base/current"; then
+                stop_ok=false
+                printf 'install: could not restore previous release symlink\n' >&2
             fi
-            rm -f -- "$base/current"
+        else
+            if ! rm -f -- "$base/current"; then stop_ok=false; fi
         fi
+    fi
+    if ! systemctl daemon-reload; then stop_ok=false; fi
+    if ! $no_start && $enabled_changed; then
+        for unit in "${unit_names[@]}"; do
+            before=$(cat "$state_dir/$unit.enabled")
+            if [[ $before == enabled ]]; then systemctl enable "$unit" || true; fi
+            if [[ $before == enabled-runtime ]]; then systemctl enable --runtime "$unit" || true; fi
+        done
+    fi
+    if ! $no_start && $enabled_changed && $stop_ok && [[ $(cat "$state_dir/timer-active") == active ]]; then
+        systemctl start jardulik-companion-backup.timer || printf 'install: prior backup timer restart failed\n' >&2
+    fi
+    if ! $no_start && $stopped && $stop_ok; then
+        for unit in "${runtime_units[@]}"; do
+            if [[ $(cat "$state_dir/$unit.active") == active ]]; then
+                systemctl start "$unit" || printf 'install: prior role restart failed: %s\n' "$unit" >&2
+            fi
+        done
     fi
     exit "$code"
 }
 trap rollback ERR
-if $no_start; then require_inactive; fi
-ln -s "$release_dir" "$base/.current.$$"
-mv -Tf -- "$base/.current.$$" "$base/current"
-switched=true
-systemd-analyze verify "${unit_names[@]/#/$source_dir/deploy/}"
 if $no_start; then
     require_inactive
 else
-    systemctl restart jardulik-companion.service
+    stopped=true
+    stop_runtime
+fi
+units_changed=true
+for unit in "${unit_names[@]}"; do
+    install -o root -g root -m 0644 "$source_dir/deploy/$unit" "$unit_dir/$unit"
+done
+ln -s "$release_dir" "$base/.current.$$"
+mv -Tf -- "$base/.current.$$" "$base/current"
+switched=true
+systemctl daemon-reload
+if $no_start; then
+    require_inactive
+else
+    systemctl start "${runtime_units[@]}"
     sleep 2
-    systemctl is-active --quiet jardulik-companion.service
+    verify_running
     systemd-run --quiet --wait --pipe --collect \
         --unit="jardulik-companion-health-$$" \
         --property=User=jardulik --property=Group=jardulik \
@@ -193,8 +314,9 @@ else
         --property=MemoryMax=128M --property=TasksMax=32 \
         --setenv=GOMEMLIMIT=64MiB --setenv=GOMAXPROCS=1 \
         "$base/current/jardulik" status >/dev/null
-    systemctl is-active --quiet jardulik-companion.service
-    systemctl enable jardulik-companion.service
+    verify_running
+    enabled_changed=true
+    systemctl enable "${runtime_units[@]}"
     systemctl enable --now jardulik-companion-backup.timer
 fi
 if [[ -n $previous_target && $previous_target != "$release_dir" ]]; then
@@ -203,7 +325,8 @@ if [[ -n $previous_target && $previous_target != "$release_dir" ]]; then
 fi
 trap - ERR
 if $no_start; then
-    printf 'Installed %s without starting the service or backup timer.\n' "$revision"
+    printf 'Installed %s; both roles remain stopped; previous units: %s\n' "$revision" "$state_dir"
 else
-    printf 'Deployed %s; service active; daily Telegram backup timer enabled.\n' "$revision"
+    printf 'Deployed %s; bot/parser and poster active; previous units: %s\n' "$revision" "$state_dir"
 fi
+# END controlled activation

@@ -264,6 +264,9 @@ func (s *Service) repairPrivateCard(ctx context.Context, deliveryID, owner, vers
 	if e != nil {
 		return e
 	}
+	if err := s.clearActiveCard(ctx, owner); err != nil {
+		return err
+	}
 	record := privateCardRepair{State: "sending", OldIDs: old}
 	if err := s.savePrivateRepair(ctx, key, record); err != nil {
 		return err
@@ -391,6 +394,17 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 			}
 			jobs, err := s.Store.MediaJobs(ctx, v.owner, p.VersionID)
 			if err != nil {
+				return err
+			}
+			marker, err := loadRichCardMarker(ctx, s.Store, v.owner, ids[0])
+			if err != nil {
+				return err
+			}
+			if marker != nil {
+				if len(ids) != 1 {
+					return errors.New("rich card inventory is invalid")
+				}
+				_, err := richProfileEdit(ctx, s.Store, s.TG, v.owner, v.owner, 0, ids[0], p, jobs, s.profilePostURL(ctx, v.owner, p))
 				return err
 			}
 			photos := selectedProfilePhotos(jobs)

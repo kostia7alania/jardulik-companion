@@ -246,8 +246,10 @@ func TestAlbumKeepsFullTextAccessibleWithoutMarkup(t *testing.T) {
 			t.Fatal(err)
 		}
 		caption := media[0].Caption
-		if !strings.Contains(caption, "/text_10") || !strings.Contains(caption, "/fav_10") {
-			t.Fatal("full text inaccessible")
+		for _, command := range []string{"/text_", "/json_", "/like_", "/fav_", "/next"} {
+			if strings.Contains(caption, command) {
+				t.Fatal("album contains command tail")
+			}
 		}
 		if _, rest := telegramPrefix(caption, 1024); rest != "" {
 			t.Fatal("caption too long")
@@ -260,6 +262,66 @@ func TestAlbumKeepsFullTextAccessibleWithoutMarkup(t *testing.T) {
 	}
 	if !strings.Contains(profileText(p), "FULL-END") {
 		t.Fatal("full original description lost")
+	}
+	// The explicit menu exposes the full text after an album, without an
+	// automatic extra message or unsupported media-group reply markup.
+	ctx := context.Background()
+	raw, err := json.Marshal(p.Profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Store.DB.ExecContext(ctx, "UPDATE versions SET raw_json=? WHERE id=?", string(raw), p.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Store.SaveSession(ctx, 1, Session{Token: "test", UserID: 101, Generation: "album-test"}); err != nil {
+		t.Fatal(err)
+	}
+	pin, err := svc.keyboardSessionPin(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.setActiveCard(ctx, 1, p, pin, ids); err != nil {
+		t.Fatal(err)
+	}
+	var explicit []uxMessage
+	svc.TG.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if filepath.Base(r.URL.Path) == "answerCallbackQuery" {
+			fmt.Fprint(w, `{"ok":true,"result":true}`)
+			return
+		}
+		if filepath.Base(r.URL.Path) != "sendMessage" {
+			t.Fatal("unexpected menu/full-text method")
+		}
+		var m uxMessage
+		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
+			t.Fatal(err)
+		}
+		explicit = append(explicit, m)
+		fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d,"chat":{"id":1}}}`, 100+len(explicit))
+	})}
+	m := keyboardMessage(1, 33, keyboardMenu)
+	svc.Handle(ctx, Update{Message: &m})
+	if len(explicit) != 1 {
+		t.Fatal("keyboard menu did not open")
+	}
+	var textRoute string
+	for _, row := range explicit[0].Markup.Rows {
+		for _, button := range row {
+			if button.Text == "📄 Полный текст" {
+				textRoute = button.Data
+			}
+		}
+	}
+	if textRoute != "t:10" {
+		t.Fatal("album full text missing from menu")
+	}
+	uxTap(svc, 1, textRoute)
+	var complete strings.Builder
+	for _, message := range explicit[1:] {
+		complete.WriteString(message.Text)
+	}
+	if !strings.Contains(complete.String(), "FULL-END") {
+		t.Fatal("menu full-text action lost original description")
 	}
 }
 

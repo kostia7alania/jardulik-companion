@@ -123,6 +123,7 @@ cp "$1" "$DEPLOY_TEST_PACKAGE"
             self.assertEqual(archive.extractfile("telegram-transfer").read(), b"test-binary:telegram-transfer")
         self.assertEqual(names, {"jardulik", "telegram-transfer", "deploy", "deploy/install.sh",
                                  "deploy/jardulik-companion.service",
+                                 "deploy/jardulik-companion-poster.service",
                                  "deploy/jardulik-companion-backup.service",
                                  "deploy/jardulik-companion-backup.timer"})
         self.assertNotIn("fixture-only", result.stdout + result.stderr)
@@ -204,53 +205,163 @@ for line in sys.stdin:
             if not success:
                 self.assertIn("helper checksum mismatch", result.stderr)
 
-    def test_atomic_activation_and_failed_start_restore_complete_binary_pair(self):
+    def run_activation_fixture(self, *, no_start=False, split=False, main="active", poster="missing", fail="", missing_pid=False):
         script = (SOURCE / "deploy/install.sh").read_text()
-        activation = script.split("switched=false\n", 1)[1]
+        helpers = script.split("# BEGIN runtime unit helpers\n", 1)[1].split("# END runtime unit helpers", 1)[0]
+        activation = script.split("# BEGIN controlled activation\n", 1)[1]
+        base = self.base / ("activation-" + str(len(list(self.base.glob("activation-*")))))
+        old = base / "releases" / ("a" * 40)
+        new = base / "releases" / ("b" * 40)
+        old.mkdir(parents=True)
+        new.mkdir()
+        for folder, label in ((old, "old"), (new, "new")):
+            for binary in ("jardulik", "telegram-transfer"):
+                (folder / binary).write_text(label + ":" + binary)
+        (base / "current").symlink_to(old)
+        unit_dir = base / "systemd"
+        unit_dir.mkdir()
+        main_name = "jardulik-companion.service"
+        poster_name = "jardulik-companion-poster.service"
+        units = [main_name, poster_name, "jardulik-companion-backup.service", "jardulik-companion-backup.timer"]
+        old_files = {main_name: "old split serve-bot-parser\n" if split else "old all-in-one serve\n",
+                     units[2]: "old backup-daily\n", units[3]: "old timer\n"}
+        if split or poster != "missing":
+            old_files[poster_name] = "old split serve-poster\n"
+        for name, body in old_files.items():
+            (unit_dir / name).write_text(body)
+        states = {name: {"state": "inactive", "pid": "0", "enabled": "disabled"} for name in units}
+        states[main_name].update(state=main, pid="123" if main == "active" else "0", enabled="enabled")
+        states[poster_name].update(state="inactive" if poster == "missing" else poster,
+                                  pid="124" if poster == "active" else "0", enabled="enabled" if split else "disabled")
+        states[units[3]].update(state="active", enabled="enabled")
+        state_file = base / "states.json"
+        state_file.write_text(json.dumps(states))
+        control_log = base / "control.jsonl"
+        env = dict(self.env, DEPLOY_TEST_BASE=str(base), DEPLOY_TEST_STATE=str(state_file),
+                   DEPLOY_TEST_CONTROL_LOG=str(control_log), DEPLOY_TEST_UNITS=str(unit_dir),
+                   DEPLOY_TEST_FAIL=fail, DEPLOY_TEST_NO_START="1" if no_start else "0",
+                   DEPLOY_TEST_MISSING_PID="1" if missing_pid else "0")
         self.write_mock("mv", """#!/usr/bin/env python3
 import os, sys
 paths = [arg for arg in sys.argv[1:] if not arg.startswith('-')]
 os.replace(paths[0], paths[1])
 """)
         self.write_mock("systemctl", """#!/usr/bin/env python3
-import os, pathlib, sys
-if sys.argv[1] == 'restart':
-    path = pathlib.Path(os.environ['DEPLOY_TEST_RESTART_COUNT'])
-    count = int(path.read_text()) + 1 if path.exists() else 1
-    path.write_text(str(count))
-    if count == 1 and os.environ.get('DEPLOY_TEST_FAIL_RESTART') == '1':
-        raise SystemExit(1)
+import json, os, pathlib, sys
+base = pathlib.Path(os.environ['DEPLOY_TEST_BASE'])
+state_file = pathlib.Path(os.environ['DEPLOY_TEST_STATE'])
+unit_dir = pathlib.Path(os.environ['DEPLOY_TEST_UNITS'])
+data = json.loads(state_file.read_text())
+args = sys.argv[1:]
+current = (base / 'current').resolve().name
+with pathlib.Path(os.environ['DEPLOY_TEST_CONTROL_LOG']).open('a') as f:
+    f.write(json.dumps({'args':args,'current':current}) + '\\n')
+op = args[0]
+if op == 'show':
+    name = args[-1]
+    row = data[name]
+    values = {'LoadState':'loaded' if (unit_dir/name).exists() else 'not-found',
+              'ActiveState':row['state'],'MainPID':row['pid']}
+    properties = [a.split('=',1)[1] for a in args if a.startswith('--property=')]
+    for prop in properties:
+        if prop=='MainPID' and values['LoadState']=='not-found' and os.environ['DEPLOY_TEST_MISSING_PID']=='1':continue
+        print(values[prop] if '--value' in args else prop+'='+values[prop])
+elif op == 'is-enabled':
+    name = args[-1]
+    print(data[name]['enabled'] if (unit_dir/name).exists() else 'not-found')
+    if not (unit_dir/name).exists() or data[name]['enabled'] == 'disabled': sys.exit(1)
+elif op == 'daemon-reload':
+    if os.environ['DEPLOY_TEST_FAIL'] == 'after-switch' and current == 'b'*40:
+        sys.exit(1)
+elif op in ('stop','start','enable','disable'):
+    if os.environ['DEPLOY_TEST_NO_START'] == '1': sys.exit(98)
+    names = [a for a in args[1:] if not a.startswith('-')]
+    if op=='enable' and os.environ['DEPLOY_TEST_FAIL']=='enable-timer' and current=='b'*40 and 'jardulik-companion-backup.timer' in names:
+        data['jardulik-companion-backup.timer']['state']='failed';state_file.write_text(json.dumps(data));sys.exit(1)
+    for name in names:
+        if op == 'start':
+            if not (unit_dir/name).exists(): sys.exit(97)
+            if current == 'a'*40 and name.endswith('-poster.service') and 'old split' not in (unit_dir/name).read_text(): sys.exit(96)
+            if os.environ['DEPLOY_TEST_FAIL'] == 'poster-start' and current == 'b'*40 and name.endswith('-poster.service'):
+                data[name].update(state='failed',pid='0');state_file.write_text(json.dumps(data));sys.exit(1)
+            data[name].update(state='active',pid='456')
+        elif op == 'stop': data[name].update(state='inactive',pid='0')
+        elif op == 'enable':
+            data[name]['enabled']='enabled'
+            if '--now' in args: data[name].update(state='active')
+        else: data[name]['enabled']='disabled'
+    state_file.write_text(json.dumps(data))
+else: sys.exit(95)
 """)
-        for name in ("systemd-run", "systemd-analyze", "sleep"):
+        self.write_mock("install", """#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
+args=sys.argv[1:];paths=[];directory=False;i=0
+while i<len(args):
+    if args[i] in ('-o','-g','-m'):i+=2;continue
+    if args[i]=='-d':directory=True;i+=1;continue
+    paths.append(pathlib.Path(args[i]));i+=1
+if directory:
+    for p in paths:p.mkdir(parents=True,exist_ok=True)
+else:
+    source,target=paths
+    states=json.loads(pathlib.Path(os.environ['DEPLOY_TEST_STATE']).read_text())
+    if target.parent==pathlib.Path(os.environ['DEPLOY_TEST_UNITS']):
+        if any(states[n]['state']=='active' for n in ('jardulik-companion.service','jardulik-companion-poster.service')):sys.exit(94)
+        if os.environ['DEPLOY_TEST_FAIL']=='unit-copy' and target.name.endswith('-poster.service'):
+            print('fixture unit-copy failure',file=sys.stderr);sys.exit(1)
+    shutil.copyfile(source,target)
+""")
+        self.write_mock("systemd-run", """#!/usr/bin/env python3
+import json,os,pathlib,sys
+with pathlib.Path(os.environ['DEPLOY_TEST_CONTROL_LOG']).open('a') as f:f.write(json.dumps({'args':['systemd-run']})+'\\n')
+if os.environ['DEPLOY_TEST_NO_START']=='1':sys.exit(99)
+""")
+        for name in ("systemd-analyze", "sleep"):
             self.write_mock(name, "#!/bin/sh\nexit 0\n")
-        for fail in (False, True):
-            with self.subTest(failed_activation=fail):
-                base = self.base / ("rollback" if fail else "activation")
-                old = base / "releases" / ("a" * 40)
-                new = base / "releases" / ("b" * 40)
-                old.mkdir(parents=True)
-                new.mkdir()
-                for folder, label in ((old, "old"), (new, "new")):
-                    for binary in ("jardulik", "telegram-transfer"):
-                        (folder / binary).write_text(label + ":" + binary)
-                (base / "current").symlink_to(old)
-                counter = base / "restart-count"
-                env = dict(self.env, DEPLOY_TEST_RESTART_COUNT=str(counter),
-                           DEPLOY_TEST_FAIL_RESTART="1" if fail else "0")
-                setup = "set -Eeuo pipefail\nbase=$1; release_dir=$2; previous_target=$3; source_dir=$4; revision=" + "b" * 40 + "\n"
-                setup += "data_dir=/unused; env_file=/unused; unit_names=(jardulik-companion.service)\nno_start=false\nswitched=false\n"
-                result = subprocess.run(["bash", "-c", setup + activation,
-                                         "activate", str(base), str(new), str(old), str(self.repo)],
-                                        env=env, capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode == 0, not fail, result.stderr)
-                expected = old if fail else new
-                self.assertEqual((base / "current").resolve(), expected.resolve())
-                for binary in ("jardulik", "telegram-transfer"):
-                    self.assertEqual((base / "current" / binary).read_text(),
-                                     ("old:" if fail else "new:") + binary)
-                self.assertEqual(counter.read_text(), "2" if fail else "1")
-                if not fail:
-                    self.assertEqual((base / "previous").resolve(), old.resolve())
+        setup = 'set -Eeuo pipefail\ndie(){ echo "$*" >&2; exit 1; }\nbase=$1; release_dir=$2; previous_target=$3; source_dir=$4; unit_dir=$5; revision=' + "b" * 40 + "\n"
+        setup += "data_dir=/unused; env_file=/unused; runtime_units=(jardulik-companion.service jardulik-companion-poster.service)\n"
+        setup += 'unit_names=("${runtime_units[@]}" jardulik-companion-backup.service jardulik-companion-backup.timer)\nno_start=' + ("true" if no_start else "false") + "\n"
+        result = subprocess.run(["bash", "-c", setup + helpers + activation, "activate", str(base), str(new), str(old), str(self.repo), str(unit_dir)],
+                                env=env,capture_output=True,text=True,timeout=15)
+        calls = [json.loads(line) for line in control_log.read_text().splitlines()] if control_log.exists() else []
+        return result,base,unit_dir,old_files,json.loads(state_file.read_text()),calls
+
+    def test_split_migration_stops_old_role_before_switch_and_starts_two_roles(self):
+        result,base,unit_dir,old_files,states,calls=self.run_activation_fixture()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((base/'current').resolve().name,'b'*40)
+        self.assertEqual((base/'previous').resolve().name,'a'*40)
+        self.assertIn('serve-bot-parser',(unit_dir/'jardulik-companion.service').read_text())
+        self.assertIn('serve-poster',(unit_dir/'jardulik-companion-poster.service').read_text())
+        self.assertEqual(states['jardulik-companion.service']['state'],'active')
+        self.assertEqual(states['jardulik-companion-poster.service']['state'],'active')
+        stops=[c for c in calls if c['args'][0]=='stop']
+        self.assertTrue(stops)
+        self.assertTrue(all(c['current']=='a'*40 for c in stops))
+        self.assertEqual(len(list((base/'deployments').glob('*/units/jardulik-companion.service'))),1)
+
+    def test_failed_split_migration_restores_legacy_or_split_units_and_binary_pair(self):
+        for split in (False,True):
+            for fail in ('poster-start','unit-copy','after-switch','enable-timer'):
+                with self.subTest(old_split=split,failure=fail):
+                    result,base,unit_dir,old_files,states,calls=self.run_activation_fixture(split=split,poster='active' if split else 'missing',fail=fail)
+                    self.assertNotEqual(result.returncode,0)
+                    if fail=='unit-copy':self.assertIn('fixture unit-copy failure',result.stderr)
+                    if fail=='poster-start':self.assertTrue(any(c['args'][0]=='start' and c['current']=='b'*40 for c in calls),calls)
+                    if fail=='after-switch':self.assertTrue(any(c['args'][0]=='daemon-reload' and c['current']=='b'*40 for c in calls),calls)
+                    if fail=='enable-timer':self.assertTrue(any(c['args'][0]=='enable' and '--now' in c['args'] and c['current']=='b'*40 for c in calls),calls)
+                    self.assertEqual((base/'current').resolve().name,'a'*40,result.stderr)
+                    for name,body in old_files.items():self.assertEqual((unit_dir/name).read_text(),body)
+                    if not split:self.assertFalse((unit_dir/'jardulik-companion-poster.service').exists())
+                    for binary in ('jardulik','telegram-transfer'):self.assertEqual((base/'current'/binary).read_text(),'old:'+binary)
+                    self.assertEqual(states['jardulik-companion.service']['state'],'active',result.stderr)
+                    self.assertEqual(states['jardulik-companion.service']['enabled'],'enabled',result.stderr)
+                    self.assertEqual(states['jardulik-companion-poster.service']['enabled'],'enabled' if split else 'disabled',result.stderr)
+                    self.assertEqual(states['jardulik-companion-backup.timer']['enabled'],'enabled',result.stderr)
+                    self.assertEqual(states['jardulik-companion-backup.timer']['state'],'active',result.stderr)
+                    if split:self.assertEqual(states['jardulik-companion-poster.service']['state'],'active',result.stderr)
+                    old_starts=[c for c in calls if c['args'][0]=='start' and c['current']=='a'*40 and any(name in c['args'] for name in ('jardulik-companion.service','jardulik-companion-poster.service'))]
+                    self.assertEqual(len(old_starts),2 if split else 1,result.stderr)
 
     def test_no_start_mode_reaches_remote_installer_and_rejects_unknown_mode(self):
         self.commit_and_publish_locally()
@@ -265,66 +376,47 @@ if sys.argv[1] == 'restart':
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid installation mode", result.stderr)
 
-    def test_no_start_requires_inactive_and_rolls_back_without_starting_units(self):
-        script = (SOURCE / "deploy/install.sh").read_text()
-        guard = "require_inactive() {\n" + script.split("require_inactive() {\n", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
-        activation = script.split("switched=false\n", 1)[1]
-        self.write_mock("mv", """#!/usr/bin/env python3
-import os, sys
-paths = [arg for arg in sys.argv[1:] if not arg.startswith('-')]
-os.replace(paths[0], paths[1])
-""")
-        self.write_mock("systemctl", """#!/usr/bin/env python3
-import os, pathlib, sys
-with pathlib.Path(os.environ['DEPLOY_TEST_CONTROL_LOG']).open('a') as f:
-    f.write(' '.join(sys.argv[1:]) + '\\n')
-if sys.argv[1] == 'show':
-    print(os.environ['DEPLOY_TEST_SERVICE_STATE'])
-else:
-    raise SystemExit(99)
-""")
-        self.write_mock("systemd-analyze", """#!/bin/sh
-if [ "$DEPLOY_TEST_FAIL_VERIFY" = 1 ]; then exit 1; fi
-""")
-        for name in ("systemd-run", "sleep"):
-            self.write_mock(name, "#!/bin/sh\nexit 99\n")
-        cases = (("inactive", False), ("inactive", True), ("active", False),
-                 ("activating", False), ("failed", False))
-        for index, (state, fail_verify) in enumerate(cases):
-            with self.subTest(service_state=state, failed_verification=fail_verify):
-                base = self.base / ("no-start-" + str(index))
-                old = base / "releases" / ("a" * 40)
-                new = base / "releases" / ("b" * 40)
-                old.mkdir(parents=True)
-                new.mkdir()
-                for folder, label in ((old, "old"), (new, "new")):
-                    for binary in ("jardulik", "telegram-transfer"):
-                        (folder / binary).write_text(label + ":" + binary)
-                (base / "current").symlink_to(old)
-                control_log = base / "control.log"
-                env = dict(self.env, DEPLOY_TEST_CONTROL_LOG=str(control_log),
-                           DEPLOY_TEST_SERVICE_STATE=state,
-                           DEPLOY_TEST_FAIL_VERIFY="1" if fail_verify else "0")
-                setup = "set -Eeuo pipefail\nbase=$1; release_dir=$2; previous_target=$3; source_dir=$4; revision=" + "b" * 40 + "\n"
-                setup += "data_dir=/unused; env_file=/unused; unit_names=(jardulik-companion.service)\nno_start=true\nswitched=false\n"
-                result = subprocess.run(["bash", "-c", setup + guard + activation,
-                                         "install-stopped", str(base), str(new), str(old), str(self.repo)],
-                                        env=env, capture_output=True, text=True, timeout=10)
-                success = state == "inactive" and not fail_verify
-                self.assertEqual(result.returncode == 0, success, result.stderr)
-                expected, label = (new, "new") if success else (old, "old")
-                self.assertEqual((base / "current").resolve(), expected.resolve())
-                for binary in ("jardulik", "telegram-transfer"):
-                    self.assertEqual((base / "current" / binary).read_text(), label + ":" + binary)
-                calls = control_log.read_text().splitlines()
-                self.assertTrue(calls)
-                self.assertTrue(all(line.startswith("show ") for line in calls), calls)
-                self.assertEqual(len(calls), 2 if success else 1)
-                if success:
-                    self.assertIn("without starting", result.stdout)
-                    self.assertEqual((base / "previous").resolve(), old.resolve())
-                if state != "inactive":
-                    self.assertIn("must already be inactive", result.stderr)
+    def test_no_start_requires_both_roles_stopped_and_never_starts_on_rollback(self):
+        cases=(('inactive','missing',''),('inactive','inactive',''),('inactive','missing','after-switch'),
+               ('inactive','inactive','after-switch'),('active','missing',''),('inactive','active',''),
+               ('inactive','failed',''))
+        for main,poster,fail in cases:
+            with self.subTest(main=main,poster=poster,failure=fail):
+                result,base,unit_dir,old_files,states,calls=self.run_activation_fixture(no_start=True,main=main,poster=poster,fail=fail)
+                success=main=='inactive' and poster in ('missing','inactive') and not fail
+                self.assertEqual(result.returncode==0,success,result.stderr)
+                self.assertEqual((base/'current').resolve().name,('b' if success else 'a')*40)
+                forbidden={'start','restart','stop','enable','disable','systemd-run'}
+                self.assertFalse(any(c['args'][0] in forbidden for c in calls),calls)
+                if not success:
+                    for name,body in old_files.items():self.assertEqual((unit_dir/name).read_text(),body)
+                    if poster=='missing':self.assertFalse((unit_dir/'jardulik-companion-poster.service').exists())
+                else:
+                    self.assertIn('both roles remain stopped',result.stdout)
+                    self.assertEqual(states['jardulik-companion.service']['state'],'inactive')
+                    self.assertEqual(states['jardulik-companion-poster.service']['state'],'inactive')
+
+    def test_first_migration_accepts_missing_poster_without_mainpid_property(self):
+        result,base,unit_dir,old_files,states,calls=self.run_activation_fixture(no_start=True,main='inactive',poster='missing',missing_pid=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((base/'current').resolve().name,'b'*40)
+        self.assertFalse(any(c['args'][0] in {'start','restart','stop','enable','disable','systemd-run'} for c in calls),calls)
+
+    def test_units_are_independent_and_backup_only_queues(self):
+        main=(SOURCE/'deploy/jardulik-companion.service').read_text()
+        poster=(SOURCE/'deploy/jardulik-companion-poster.service').read_text()
+        self.assertIn('current/jardulik serve-bot-parser\n',main)
+        self.assertIn('current/jardulik serve-poster\n',poster)
+        for text in (main,poster):
+            self.assertNotIn('PartOf=',text)
+            self.assertNotIn('Requires=',text)
+            self.assertIn('MemoryMax=128M\n',text)
+            self.assertIn('Environment=GOMEMLIMIT=64MiB\n',text)
+        self.assertNotIn('jardulik-companion.service',poster)
+        self.assertNotIn('jardulik-companion-poster.service',main)
+        backup=(SOURCE/'deploy/jardulik-companion-backup.service').read_text()
+        self.assertIn('current/jardulik backup-daily\n',backup)
+        self.assertNotIn('serve',backup)
 
     def test_environment_gate_rejects_unsafe_values_without_disclosing_secrets(self):
         script = (SOURCE / "deploy/install.sh").read_text()

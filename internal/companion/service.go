@@ -50,6 +50,14 @@ func (s *Service) userLock(id int64) *sync.Mutex {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	return s.runBot(ctx, RuntimeAll)
+}
+
+func (s *Service) RunBotParser(ctx context.Context) error {
+	return s.runBot(ctx, RuntimeBotParser)
+}
+
+func (s *Service) runBot(ctx context.Context, role RuntimeRole) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if s.Config.Token == "" {
@@ -76,19 +84,13 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.TG.Call(ctx, "setMyCommands", map[string]any{"commands": commands}, nil); err != nil {
 		return err
 	}
-	var background sync.WaitGroup
-	background.Add(6)
-	go func() { defer background.Done(); s.Media.Run(ctx) }()
-	go func() {
-		defer background.Done()
-		if !s.Config.ArchivePaused {
-			s.Archiver.Run(ctx)
-		}
-	}()
-	go func() { defer background.Done(); s.runPrivateCardRepair(ctx) }()
-	go func() { defer background.Done(); s.Watcher.Run(ctx) }()
-	go func() { defer background.Done(); s.Crawler.Run(ctx) }()
-	go func() { defer background.Done(); s.Autoliker.Run(ctx) }()
+	waitBackground, err := s.RunBackground(ctx, role)
+	if err != nil {
+		return err
+	}
+	if err := s.bootstrapKeyboards(ctx); err != nil {
+		slog.Warn("keyboard installation incomplete", "kind", safeError(err))
+	}
 	queues := make([]chan queuedUpdate, 4)
 	var workers sync.WaitGroup
 	for i := range queues {
@@ -118,7 +120,7 @@ func (s *Service) Run(ctx context.Context) error {
 		for _, q := range queues {
 			s.discardQueuedUpdates(q)
 		}
-		background.Wait()
+		waitBackground()
 	}()
 	offset, _ := strconv.ParseInt(s.Store.Meta(ctx, "telegram_offset"), 10, 64)
 	slog.Info("bot started", "username", me.Username, "version", Version, "reactions_enabled", s.Config.AllowReactions)
@@ -281,6 +283,12 @@ func (s *Service) handle(ctx context.Context, u Update) {
 				s.list(ctx, owner, parts[0] == "lf", id)
 				return
 			}
+			if parts[0] == "ai" {
+				if id <= int64(^uint(0)>>1) {
+					s.showAgeIndex(ctx, owner, int(id))
+				}
+				return
+			}
 			if id == 0 {
 				return
 			}
@@ -330,6 +338,9 @@ func (s *Service) handle(ctx context.Context, u Update) {
 				_ = s.say(ctx, owner, shortHelp, mainButtons())
 			}
 		}
+		return
+	}
+	if s.handleReplyKeyboardLocked(ctx, owner, m) {
 		return
 	}
 	fields := strings.Fields(m.Text)
@@ -383,7 +394,10 @@ func (s *Service) handle(ctx context.Context, u Update) {
 		}
 		_, _ = s.Store.DB.ExecContext(ctx, "UPDATE users SET source=CASE WHEN source='' THEN ? ELSE source END WHERE id=?", source, owner)
 		s.Store.Event(ctx, owner, "start")
-		_ = s.say(ctx, owner, welcomeText, mainButtons())
+		_ = s.say(ctx, owner, welcomeText, keyboardReplyMarkup())
+		s.showKeyboardMenuLocked(ctx, owner)
+	case "/ageindex":
+		s.showAgeIndex(ctx, owner, 0)
 	case "/help":
 		_ = s.say(ctx, owner, shortHelp, mainButtons())
 	case "/support":
@@ -680,7 +694,7 @@ func profileText(p StoredProfile) string {
 		}
 	}
 	if family := profileValue(v, "familyNames"); meaningfulProfileValue(family) {
-		b.WriteString("\nРодственные фамилии: " + family)
+		b.WriteString("\n👪 Родственные фамилии: " + family)
 	}
 	if bio := profileValue(v, "description"); meaningfulProfileValue(bio) {
 		b.WriteString("\n\n" + bio)
@@ -702,18 +716,18 @@ func profileText(p StoredProfile) string {
 }
 
 // manualLike is called only after Handle verifies the private chat and locks its owner.
-func (s *Service) manualLike(ctx context.Context, owner, id int64) {
+func (s *Service) manualLike(ctx context.Context, owner, id int64, guards ...func(context.Context) error) bool {
 	if !s.Config.AllowReactions || !s.Store.cfg.AllowReactions {
 		_ = s.say(ctx, owner, "Лайки сейчас выключены.", nil)
-		return
+		return false
 	}
 	if s.Store.Paused(ctx, owner) {
 		_ = s.say(ctx, owner, "Действия приостановлены: /resume", nil)
-		return
+		return false
 	}
 	if _, err := s.Store.Profile(ctx, owner, id); err != nil {
 		_ = s.say(ctx, owner, "Анкета недоступна.", nil)
-		return
+		return false
 	}
 	// Avoid even an account refresh on a repeated click. Like still owns the
 	// authoritative action claim, including races with other reaction callers.
@@ -725,20 +739,25 @@ func (s *Service) manualLike(ctx context.Context, owner, id int64) {
 			message = "Лайк уже отправлен."
 		}
 		_ = s.say(ctx, owner, message, nil)
-		return
+		return false
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		_ = s.say(ctx, owner, "Не удалось проверить предыдущие действия. Лайк не отправлен.", nil)
-		return
+		return false
 	}
 	// LikeGuarded rechecks the personal budget around its fresh account check
 	// and action claim, without enabling an automatic mode.
 	result, err := s.Client.LikeGuarded(ctx, owner, id, func(guardCtx context.Context) error {
+		for _, guard := range guards {
+			if err := guard(guardCtx); err != nil {
+				return err
+			}
+		}
 		return s.ManualLikeBudgetGuard(guardCtx, owner)
 	})
 	if err != nil {
 		_ = s.say(ctx, owner, s.manualLikeFailure(ctx, owner, id, err), nil)
-		return
+		return false
 	}
 	message := "Лайк не подтверждён. Повторно не отправляю."
 	switch result.Decision {
@@ -763,6 +782,7 @@ func (s *Service) manualLike(ctx context.Context, owner, id int64) {
 		message += " Анкеты закончились. Попробуйте позже."
 	}
 	_ = s.say(ctx, owner, message, nil)
+	return result.Decision == ReactionSuccess
 }
 
 func (s *Service) manualLikeFailure(ctx context.Context, owner, id int64, err error) string {
@@ -812,6 +832,10 @@ func (s *Service) Deliver(ctx context.Context, owner int64, p StoredProfile) err
 	if _, err := s.Store.Version(ctx, owner, p.VersionID); err != nil {
 		return err
 	}
+	pin, pinErr := s.keyboardSessionPin(ctx, owner)
+	if err := s.clearActiveCard(ctx, owner); err != nil {
+		return err
+	}
 	_ = s.Media.EnsureProfile(ctx, owner, p.VersionID)
 	r, err := s.Store.DB.ExecContext(ctx, "INSERT INTO deliveries(owner_id,version_id,state) VALUES(?,?,'pending')", owner, p.VersionID)
 	if err != nil {
@@ -824,14 +848,21 @@ func (s *Service) Deliver(ctx context.Context, owner int64, p StoredProfile) err
 		b, _ := json.Marshal(ids)
 		_, _ = s.Store.DB.ExecContext(context.WithoutCancel(ctx), "UPDATE deliveries SET state=?,message_ids=? WHERE id=?", state, string(b), deliveryID)
 	}()
-	ids, err = s.sendProfileCard(ctx, owner, p)
+	ids, err = s.sendCurrentProfileCard(ctx, owner, p)
 	if err != nil {
 		return err
 	}
 	state = "sent"
-	_ = s.Store.SetMeta(ctx, fmt.Sprintf("card_layout:%d", deliveryID), "v2")
-	s.Store.Delivered(ctx, owner, p.ID)
-	s.Store.Event(ctx, owner, "card_delivered")
+	writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelWrite()
+	if pinErr == nil {
+		if err := s.setActiveCard(writeCtx, owner, p, pin, ids); err != nil {
+			slog.Warn("active keyboard card not set", "kind", safeError(err))
+		}
+	}
+	_ = s.Store.SetMeta(writeCtx, fmt.Sprintf("card_layout:%d", deliveryID), "v2")
+	s.Store.Delivered(writeCtx, owner, p.ID)
+	s.Store.Event(writeCtx, owner, "card_delivered")
 	return nil
 }
 func (s *Service) list(ctx context.Context, owner int64, favorites bool, before int64) {

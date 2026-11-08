@@ -104,10 +104,11 @@ func validMessageEntities(text string, entities []MessageEntity) error {
 }
 
 type SentMessage struct {
-	ID       int64     `json:"message_id"`
-	ThreadID int64     `json:"message_thread_id"`
-	Document *Document `json:"document"`
-	Chat     TGChat    `json:"chat"`
+	Rich     json.RawMessage `json:"rich_message,omitempty"`
+	ID       int64           `json:"message_id"`
+	ThreadID int64           `json:"message_thread_id"`
+	Document *Document       `json:"document"`
+	Chat     TGChat          `json:"chat"`
 }
 type Message struct {
 	ID            int64  `json:"message_id"`
@@ -494,4 +495,115 @@ func (t *Telegram) Download(ctx context.Context, fileID, path string) error {
 	defer file.Close()
 	_, err = io.Copy(file, io.LimitReader(res.Body, 21<<20))
 	return err
+}
+
+// A confirmed rich delivery is one message for the entire card. Never retries.
+func (t *Telegram) SendRichProfileCard(ctx context.Context, chat, thread int64, card RichProfileCard, keyboard any) (SentMessage, error) {
+	var out SentMessage
+	if chat == 0 || thread < 0 || card.Content == nil {
+		return out, errors.New("invalid rich delivery target")
+	}
+	payload := map[string]any{"chat_id": chat, "rich_message": card.Content, "disable_notification": true}
+	if thread > 0 {
+		payload["message_thread_id"] = thread
+	}
+	if keyboard != nil {
+		payload["reply_markup"] = keyboard
+	}
+	if len(card.Photos) == 0 {
+		if err := t.Call(ctx, "sendRichMessage", payload, &out); err != nil {
+			return out, err
+		}
+	} else {
+		rich, err := json.Marshal(card.Content)
+		if err != nil {
+			return out, err
+		}
+		var markup []byte
+		if keyboard != nil {
+			markup, err = json.Marshal(keyboard)
+			if err != nil {
+				return out, err
+			}
+		}
+		reader, writer := io.Pipe()
+		defer reader.Close()
+		form := multipart.NewWriter(writer)
+		done := make(chan error, 1)
+		go func() {
+			upload := func() error {
+				for _, field := range [][2]string{{"chat_id", strconv.FormatInt(chat, 10)}, {"disable_notification", "true"}, {"rich_message", string(rich)}} {
+					if err := form.WriteField(field[0], field[1]); err != nil {
+						return err
+					}
+				}
+				if thread > 0 {
+					if err := form.WriteField("message_thread_id", strconv.FormatInt(thread, 10)); err != nil {
+						return err
+					}
+				}
+				if markup != nil {
+					if err := form.WriteField("reply_markup", string(markup)); err != nil {
+						return err
+					}
+				}
+				for i, path := range card.Photos {
+					file, err := os.Open(path)
+					if err != nil {
+						return err
+					}
+					info, err := file.Stat()
+					if err != nil || !info.Mode().IsRegular() || info.Size() > 9<<20 {
+						file.Close()
+						return errors.New("rich photo changed before upload")
+					}
+					part, err := form.CreateFormFile(fmt.Sprintf("p%d", i), "photo"+strconv.Itoa(i)+filepath.Ext(path))
+					if err == nil {
+						_, err = io.Copy(part, file)
+					}
+					closeErr := file.Close()
+					if err != nil {
+						return err
+					}
+					if closeErr != nil {
+						return closeErr
+					}
+				}
+				return form.Close()
+			}
+			err := upload()
+			_ = writer.CloseWithError(err)
+			done <- err
+		}()
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, t.Base+"/bot"+t.Token+"/sendRichMessage", reader)
+		if err != nil {
+			_ = reader.Close()
+			<-done
+			return out, errors.New("invalid rich Telegram request")
+		}
+		request.Header.Set("Content-Type", form.FormDataContentType())
+		response, err := t.HTTP.Do(request)
+		if err != nil {
+			_ = reader.Close()
+			<-done
+			return out, fmt.Errorf("rich Telegram transport: %w", redactedTransportError(err))
+		}
+		decodeErr := t.decode(response, &out)
+		_ = reader.Close()
+		writeErr := <-done
+		if decodeErr != nil {
+			return out, decodeErr
+		}
+		if writeErr != nil {
+			return out, errors.New("rich Telegram upload interrupted")
+		}
+	}
+	if out.ID <= 0 || out.Chat.ID != chat || out.ThreadID != thread || len(out.Rich) == 0 {
+		return out, errors.New("unconfirmed rich Telegram message")
+	}
+	refs, err := richPhotoFileIDs(out.Rich)
+	if err != nil || len(refs) != len(card.Photos) {
+		return out, errors.New("unconfirmed rich Telegram media")
+	}
+	return out, nil
 }

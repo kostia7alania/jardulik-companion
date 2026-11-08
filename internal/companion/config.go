@@ -26,6 +26,7 @@ type Config struct {
 	OwnerID, SourceBotID, BackupChatID, BackupThreadID int64
 	SessionKey, BackupKey                              []byte
 	AllowReactions                                     bool
+	RichCards                                          bool
 	ArchivePaused                                      bool
 	DailyCrawl                                         bool
 	MinFreeBytes                                       uint64
@@ -105,6 +106,7 @@ func LoadConfig() (Config, error) {
 	}
 	c.FullBackupEnabled = os.Getenv("FULL_BACKUP_TRANSFER_ENABLED") == "true"
 	c.AllowReactions = os.Getenv("ALLOW_REACTIONS") == "true"
+	c.RichCards = os.Getenv("TELEGRAM_RICH_CARDS") == "true"
 	c.ArchivePaused = os.Getenv("ARCHIVE_WORKER_PAUSED") == "true"
 	c.DailyCrawl = os.Getenv("DAILY_CRAWL_ENABLED") == "true"
 	if s := os.Getenv("MIN_FREE_BYTES"); s != "" {

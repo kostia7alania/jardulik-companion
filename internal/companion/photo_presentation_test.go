@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf16"
@@ -30,7 +31,7 @@ func photoPresentationSource(t *testing.T, index, width, height int) MediaJob {
 	return MediaJob{Role: "photos", Position: index, State: "complete", SHA: sha, Path: path, Size: int64(b.Len())}
 }
 
-func TestPrivateAlbumLikeTailSharesBodyBudget(t *testing.T) {
+func TestPrivateAndArchiveCaptionShareBodyBudgetWithoutActionTail(t *testing.T) {
 	for _, long := range []bool{false, true} {
 		p := StoredProfile{ID: 99, VersionID: 123, RawJSON: `{"userId":99,"name":"Ира🙂","large":9007199254740993}`, Profile: Profile{"name": "Ира🙂"}}
 		if long {
@@ -45,8 +46,10 @@ func TestPrivateAlbumLikeTailSharesBodyBudget(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(private.Text, "❤️ /like_99 · Избранное: /fav_99") || !strings.Contains(private.Text, "/json_123") || strings.Contains(archive.Text, "/like_") {
-			t.Fatal("album command identity or private scope lost")
+		for _, command := range []string{"/like_", "/fav_", "/json_", "/text_", "/next"} {
+			if strings.Contains(private.Text, command) || strings.Contains(archive.Text, command) {
+				t.Fatal("card action commands escaped the persistent menu")
+			}
 		}
 		quote := photoQuoteText(t, private)
 		if quote != photoQuoteText(t, archive) || private.Truncated != archive.Truncated || private.SourceJSONInline != archive.SourceJSONInline || !strings.Contains(quote, "1-3:2×3") || strings.Contains(quote, "GPS:нет") {
@@ -417,5 +420,88 @@ func TestNoPhotoArchiveCardUsesTextEntityAndRefreshMethod(t *testing.T) {
 	}
 	if fmt.Sprint(methods) != "[sendMessage editMessageText]" {
 		t.Fatalf("no-photo card used caption-only API: %v", methods)
+	}
+}
+
+func TestPhotoQuoteMovesOnlyExactLanguagesLineFirst(t *testing.T) {
+	const target = "Не указано: языки"
+	const opaque = "opaque-a\t🙂\n\nopaque-b:{unchanged}\nopaque-c  "
+	for _, test := range []struct{ name, before, after string }{
+		{"middle", "opaque-a\n" + target + "\nopaque-b", target + "\nopaque-a\nopaque-b"},
+		{"last", opaque + "\n" + target, target + "\n" + opaque},
+		{"first", target + "\n" + opaque, target + "\n" + opaque},
+		{"already first with duplicate", target + "\nopaque\n" + target, target + "\nopaque\n" + target},
+		{"only", target, target},
+		{"near matches", " " + target + "\n" + target + " \nopaque", " " + target + "\n" + target + " \nopaque"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := photoQuoteLanguagesFirst(test.before); got != test.after {
+				t.Fatal("targeted line transposition changed opaque content")
+			}
+		})
+	}
+	card := photoCardText("body\n\n"+target+"\nJardulik: 99", []string{opaque}, "", 4096)
+	quote := photoQuoteText(t, card)
+	if !strings.HasPrefix(quote, target+"\n") || digest([]byte(strings.TrimPrefix(quote, target+"\n"))) != digest([]byte(opaque+"\nJardulik: 99")) {
+		t.Fatal("rendered caption changed non-target quote bytes")
+	}
+}
+
+func TestPhotoSourceJSONDisplayProjectionKeepsOriginalValues(t *testing.T) {
+	const text = "body\n\nНе указано: языки\nJardulik: 99"
+	for _, test := range []struct {
+		name, projection           string
+		photos, mini, other, limit int
+	}{
+		{"whole", "full", 20, 20, 20, 4096},
+		{"without photos", "without_photos", 900, 20, 20, 512},
+		{"without both", "without_photos_and_miniPhotos", 900, 900, 20, 512},
+		{"still too large", "", 900, 900, 900, 512},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := fmt.Sprintf(`{"userId":99,"large":9007199254740993,"precise":1.00,"keep":{"photos":"nested","miniPhotos":"nested","text":"<opaque>"},"photos":[%q],"miniPhotos":[%q],"other":%q,"nil":null}`, strings.Repeat("p", test.photos), strings.Repeat("m", test.mini), strings.Repeat("x", test.other))
+			base := photoCardText(text, nil, "", test.limit)
+			card := photoJSONCardText(text, nil, "", test.limit, raw)
+			if card.SourceJSONProjection != test.projection || card.SourceJSONInline != (test.projection == "full") || textUnits(card.Text) > test.limit {
+				t.Fatal("display projection or complete-source flag incorrect")
+			}
+			quote := photoQuoteText(t, card)
+			baseQuote := photoQuoteText(t, base)
+			if test.projection == "" {
+				if quote != baseQuote {
+					t.Fatal("oversized JSON changed the existing fallback")
+				}
+				return
+			}
+			if !strings.HasPrefix(quote, baseQuote+"\n") {
+				t.Fatal("JSON insertion changed existing quote content")
+			}
+			display := strings.TrimPrefix(quote, baseQuote+"\n")
+			decode := func(value string) map[string]any {
+				decoder := json.NewDecoder(strings.NewReader(value))
+				decoder.UseNumber()
+				var result map[string]any
+				if err := decoder.Decode(&result); err != nil {
+					t.Fatal(err)
+				}
+				return result
+			}
+			want := decode(raw)
+			if test.projection != "full" {
+				delete(want, "photos")
+			}
+			if test.projection == "without_photos_and_miniPhotos" {
+				delete(want, "miniPhotos")
+			}
+			if !json.Valid([]byte(display)) || !reflect.DeepEqual(decode(display), want) || !strings.Contains(display, "9007199254740993") || !strings.Contains(display, "1.00") {
+				t.Fatal("display projection changed other source keys or numeric precision")
+			}
+			if test.projection == "full" {
+				pretty, err := prettyProfileJSON(raw)
+				if err != nil || display != pretty {
+					t.Fatal("whole source was filtered or reserialized")
+				}
+			}
+		})
 	}
 }

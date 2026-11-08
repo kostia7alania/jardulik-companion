@@ -32,3 +32,17 @@ func TestRestoreRejectsInvalidBackupKeyWithoutServiceConfig(t *testing.T) {
 		t.Fatalf("expected the recovery-key error: %v", err)
 	}
 }
+
+func TestServiceRoleCommandsRejectArgumentsBeforeLoadingConfig(t *testing.T) {
+	args := os.Args
+	t.Cleanup(func() { os.Args = args })
+	t.Setenv("SESSION_KEY", "")
+	for _, command := range []string{"serve-bot-parser", "serve-poster"} {
+		t.Run(command, func(t *testing.T) {
+			os.Args = []string{"jardulik", command, "unexpected"}
+			if err := run(); err == nil || err.Error() != "usage: jardulik "+command {
+				t.Fatalf("invalid role command reached config or worker startup: %v", err)
+			}
+		})
+	}
+}

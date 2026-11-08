@@ -89,8 +89,10 @@ func TestSharedProfileRendererPrivateArchiveParity(t *testing.T) {
 						t.Fatal("other tenant received operator private topic URL")
 					}
 				}
-				if count > 1 && (!strings.Contains(private.Text, "/json_") || strings.Contains(archive.Text, "/json_")) {
-					t.Fatal("contextual private actions lost")
+				for _, command := range []string{"/text_", "/json_", "/like_", "/fav_", "/next"} {
+					if strings.Contains(private.Text, command) || strings.Contains(archive.Text, command) {
+						t.Fatalf("command tail returned: %s", command)
+					}
 				}
 			})
 		}

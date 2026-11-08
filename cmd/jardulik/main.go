@@ -22,6 +22,9 @@ func run() error {
 	if len(os.Args) > 1 {
 		command = os.Args[1]
 	}
+	if (command == "serve-bot-parser" || command == "serve-poster") && len(os.Args) != 2 {
+		return errors.New("usage: jardulik " + command)
+	}
 	if command == "version" {
 		fmt.Println(companion.Version)
 		return nil
@@ -84,6 +87,10 @@ func run() error {
 	switch command {
 	case "serve":
 		return s.Run(ctx)
+	case "serve-bot-parser":
+		return s.RunBotParser(ctx)
+	case "serve-poster":
+		return s.RunPoster(ctx)
 	case "status":
 		if err = s.Store.Check(ctx); err != nil {
 			return err
@@ -206,7 +213,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, connect (URL on stdin), account, fetch, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, connect (URL on stdin), account, fetch, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
 	}
 }
 func main() {

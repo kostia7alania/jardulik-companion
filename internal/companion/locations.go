@@ -3,6 +3,7 @@ package companion
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -228,7 +229,52 @@ func (s *Store) saveCrawlLocations(ctx context.Context, job *CrawlJob, page Loca
 }
 
 func (s *Store) nextCrawlLocation(ctx context.Context, job *CrawlJob) (int64, error) {
+	var retryTarget int64
+	var retryRaw string
+	err := s.DB.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", crawlRetryKey(job.Owner)).Scan(&retryRaw)
+	if err == nil {
+		var retry crawlRetry
+		if err = json.Unmarshal([]byte(retryRaw), &retry); err != nil {
+			return 0, errors.New("invalid crawl retry checkpoint")
+		}
+		if retry.RunID == job.RunID && retry.Mode == job.Mode && retry.Page == job.Page && retry.Target > 0 {
+			retryTarget = retry.Target
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT r.profile_id,json_extract(v.raw_json,'$.birthday')
+ FROM crawl_location_results r JOIN location_batches b ON b.id=r.first_batch_id AND b.owner_id=r.owner_id AND b.run_id=r.run_id
+ LEFT JOIN queue q ON q.owner_id=r.owner_id AND q.profile_id=r.profile_id
+ LEFT JOIN versions v ON v.id=q.version_id AND v.owner_id=r.owner_id AND v.profile_id=r.profile_id
+ WHERE r.owner_id=? AND r.run_id=? AND r.state='pending' AND b.generation=? AND b.upstream_id=?`, job.Owner, job.RunID, job.Generation, job.UserID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
 	var target int64
-	err := s.DB.QueryRowContext(ctx, `SELECT r.profile_id FROM crawl_location_results r JOIN location_batches b ON b.id=r.first_batch_id AND b.owner_id=r.owner_id AND b.run_id=r.run_id WHERE r.owner_id=? AND r.run_id=? AND r.state='pending' AND b.generation=? AND b.upstream_id=? ORDER BY r.profile_id LIMIT 1`, job.Owner, job.RunID, job.Generation, job.UserID).Scan(&target)
-	return target, err
+	var youngest string
+	var found, retryPending bool
+	for rows.Next() {
+		var id int64
+		var birthday any
+		if err = rows.Scan(&id, &birthday); err != nil {
+			return 0, err
+		}
+		retryPending = retryPending || id == retryTarget
+		key := profileAgeOrderKey(birthday)
+		if !found || key > youngest || key == youngest && id < target {
+			target, youngest, found = id, key, true
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return 0, err
+	}
+	if retryPending {
+		return retryTarget, nil
+	}
+	if !found {
+		return 0, sql.ErrNoRows
+	}
+	return target, nil
 }

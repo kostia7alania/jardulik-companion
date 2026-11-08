@@ -1,5 +1,5 @@
 [Unit]
-Description=Jardulik Companion Telegram bot
+Description=Jardulik Companion Telegram bot and Jardulik parser
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=300
@@ -13,7 +13,7 @@ WorkingDirectory=/var/lib/jardulik-companion
 EnvironmentFile=/etc/jardulik-companion.env
 Environment=GOMEMLIMIT=64MiB
 Environment=GOMAXPROCS=1
-ExecStart=/opt/jardulik-companion/current/jardulik serve
+ExecStart=/opt/jardulik-companion/current/jardulik serve-bot-parser
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30

@@ -933,13 +933,17 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 		return err
 	}
 	saveIDs := func(ids []int64) error {
+		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancelWrite()
 		b, _ := json.Marshal(ids)
-		_, e := a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET message_ids=? WHERE version_id=?", string(b), version)
+		_, e := a.Store.DB.ExecContext(writeCtx, "UPDATE archive_versions SET message_ids=? WHERE version_id=?", string(b), version)
 		return e
 	}
-	ids, err := a.sendProfileCard(ctx, p, jobs, thread, saveIDs)
+	ids, err := a.sendCurrentProfileCard(ctx, p, jobs, thread, saveIDs)
 	if err != nil {
-		_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='uncertain',error='source_zip_sent_card_unconfirmed',updated_at=CURRENT_TIMESTAMP WHERE version_id=?", version)
+		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancelWrite()
+		_, _ = a.Store.DB.ExecContext(writeCtx, "UPDATE archive_versions SET state='uncertain',error='source_zip_sent_card_unconfirmed',updated_at=CURRENT_TIMESTAMP WHERE version_id=?", version)
 		return err
 	}
 	missing := 0
@@ -955,21 +959,23 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 		detail = "source_media_missing"
 	}
 	idsJSON, _ := json.Marshal(ids)
-	tx, err := a.Store.DB.BeginTx(ctx, nil)
+	writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelWrite()
+	tx, err := a.Store.DB.BeginTx(writeCtx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, "UPDATE archive_versions SET state=?,error=?,message_ids=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=?", state, detail, string(idsJSON), version); err != nil {
+	if _, err = tx.ExecContext(writeCtx, "UPDATE archive_versions SET state=?,error=?,message_ids=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=?", state, detail, string(idsJSON), version); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO mirror_posts(fingerprint,profile_id,thread_id,message_ids) VALUES(?,?,?,?)", fp, p.ID, thread, string(idsJSON)); err != nil {
+	if _, err = tx.ExecContext(writeCtx, "INSERT OR IGNORE INTO mirror_posts(fingerprint,profile_id,thread_id,message_ids) VALUES(?,?,?,?)", fp, p.ID, thread, string(idsJSON)); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, "INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids) VALUES(?,'sent','[]',?)", version, string(idsJSON)); err != nil {
+	if _, err = tx.ExecContext(writeCtx, "INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids) VALUES(?,'sent','[]',?)", version, string(idsJSON)); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, "INSERT INTO archive_zip_repairs(version_id,state,old_source_sha,old_filename,old_message_id,new_source_sha,new_filename,new_message_id) VALUES(?,'skipped',?,?,?,?,?,?)", version, sha, filepath.Base(path), document.ID, sha, filepath.Base(path), document.ID); err != nil {
+	if _, err = tx.ExecContext(writeCtx, "INSERT INTO archive_zip_repairs(version_id,state,old_source_sha,old_filename,old_message_id,new_source_sha,new_filename,new_message_id) VALUES(?,'skipped',?,?,?,?,?,?)", version, sha, filepath.Base(path), document.ID, sha, filepath.Base(path), document.ID); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1664,6 +1670,19 @@ func (a *Archiver) refreshConfirmedProfileCaption(ctx context.Context, version, 
 	jobs, err := a.Store.MediaJobs(ctx, owner, version)
 	if err != nil {
 		return err
+	}
+	marker, err := loadRichCardMarker(ctx, a.Store, a.Config.BackupChatID, ids[0])
+	if err != nil {
+		return err
+	}
+	if marker != nil {
+		if len(ids) != 1 {
+			return errors.New("rich card inventory is invalid")
+		}
+		return a.groupCall(ctx, func() error {
+			_, err := richProfileEdit(ctx, a.Store, a.TG, owner, a.Config.BackupChatID, thread, ids[0], p, jobs, forumTopicURL(a.Config.BackupChatID, thread))
+			return err
+		})
 	}
 	hasFull := false
 	missing := 0

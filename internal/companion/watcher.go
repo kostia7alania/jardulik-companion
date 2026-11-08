@@ -75,8 +75,53 @@ func (w *ProfileWatcher) init(ctx context.Context) error {
 	return nil
 }
 
-func (w *ProfileWatcher) Run(ctx context.Context) {
+func (w *ProfileWatcher) Run(ctx context.Context) { w.runChecks(ctx, true) }
+
+// RunChecks owns source reads; presence delivery belongs to the poster process.
+func (w *ProfileWatcher) RunChecks(ctx context.Context) { w.runChecks(ctx, false) }
+
+func (w *ProfileWatcher) runChecks(ctx context.Context, presence bool) {
 	lock, err := os.OpenFile(filepath.Join(w.Config.DataDir, "profile-watch.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return
+	}
+	defer lock.Close()
+	if syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+		return
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	w.mu.Lock()
+	err = w.init(ctx)
+	w.mu.Unlock()
+	if err != nil {
+		return
+	}
+	if presence {
+		presenceCtx, cancelPresence := context.WithCancel(ctx)
+		presenceDone := make(chan struct{})
+		go func() {
+			defer close(presenceDone)
+			w.RunPresence(presenceCtx)
+		}()
+		defer func() { cancelPresence(); <-presenceDone }()
+	}
+	for ctx.Err() == nil {
+		if _, err = w.CheckOne(ctx); err != nil && ctx.Err() == nil {
+			_ = w.Store.SetMeta(ctx, "watch_last_error", watchErrorCode(err))
+		}
+		timer := time.NewTimer(w.Config.WatchGap)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// RunPresence sends archived presence events without calling the source client.
+func (w *ProfileWatcher) RunPresence(ctx context.Context) {
+	lock, err := os.OpenFile(filepath.Join(w.Config.DataDir, "profile-presence.lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return
 	}
@@ -91,25 +136,7 @@ func (w *ProfileWatcher) Run(ctx context.Context) {
 	if err != nil || w.recoverProfilePresence(ctx) != nil {
 		return
 	}
-	presenceCtx, cancelPresence := context.WithCancel(ctx)
-	presenceDone := make(chan struct{})
-	go func() {
-		defer close(presenceDone)
-		w.runProfilePresence(presenceCtx)
-	}()
-	defer func() { cancelPresence(); <-presenceDone }()
-	for ctx.Err() == nil {
-		if _, err = w.CheckOne(ctx); err != nil && ctx.Err() == nil {
-			_ = w.Store.SetMeta(ctx, "watch_last_error", watchErrorCode(err))
-		}
-		timer := time.NewTimer(w.Config.WatchGap)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-	}
+	w.runProfilePresence(ctx)
 }
 
 // CheckOne consumes at most one due check, including failed or disconnected responses.

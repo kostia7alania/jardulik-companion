@@ -1,5 +1,5 @@
 [Unit]
-Description=Back up Jardulik Companion to private Telegram storage
+Description=Queue the daily Jardulik Companion backup
 Wants=network-online.target
 After=network-online.target
 ConditionPathExists=/etc/jardulik-companion.env

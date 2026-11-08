@@ -143,6 +143,82 @@ func TestLocationsFrozenStopsFreshlyFrozenAccount(t *testing.T) {
 	}
 }
 
+func TestCrawlLocationPendingOrderUsesKnownDOBAndKeepsRunFrontier(t *testing.T) {
+	crawler, now, source := locationFixture(t)
+	ctx := context.Background()
+	known := []Profile{
+		{"userId": 11, "birthday": "1990-01-01", "age": 25},
+		{"userId": 12, "birthday": "2003-01-31", "age": 25},
+		{"userId": 13, "birthday": "2003-02-01T23:30:00-07:00", "age": 25},
+		{"userId": 14, "birthday": "2003-02-01T00:30:00+14:00", "age": 25},
+		{"userId": 15, "birthday": "0001-01-01T00:00:00Z", "age": 19},
+	}
+	if _, err := crawler.Service.Store.Archive(ctx, 1, known, "age-order-test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := crawler.Service.Store.Archive(ctx, 2, []Profile{{"userId": 11, "birthday": "2020-01-01"}}, "other-owner"); err != nil {
+		t.Fatal(err)
+	}
+	source.catalog = func(*http.Request) (string, int) { return locationBody(6, 11, 12, 13, 14, 15, 16), 200 }
+	startLocationPhase(t, crawler, now)
+	crawlStep(t, crawler, now)
+	job := crawlJob(t, crawler)
+	before, _ := json.Marshal(job)
+	requestCount := len(source.calls)
+	for _, want := range []int64{13, 14, 12, 11, 15, 16} {
+		got, err := crawler.Service.Store.nextCrawlLocation(ctx, job)
+		if err != nil || got != want {
+			t.Fatalf("wrong next known source DOB: got %d, want %d: %v", got, want, err)
+		}
+		after, _ := json.Marshal(crawlJob(t, crawler))
+		if string(before) != string(after) || len(source.calls) != requestCount {
+			t.Fatal("read-only selection reset the run/frontier or performed HTTP")
+		}
+		if _, err := crawler.Service.Store.DB.Exec(`UPDATE crawl_location_results SET state='hydrated' WHERE owner_id=? AND run_id=? AND profile_id=?`, job.Owner, job.RunID, got); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := crawler.Service.Store.nextCrawlLocation(ctx, job); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("completed rows re-entered the pending frontier", err)
+	}
+}
+
+func TestCrawlLocationAgeOrderKeepsPersistedRetryTargetAndProvenance(t *testing.T) {
+	crawler, now, source := locationFixture(t)
+	ctx := context.Background()
+	if _, err := crawler.Service.Store.Archive(ctx, 1, []Profile{{"userId": 11, "birthday": "1990-01-01"}, {"userId": 12, "birthday": "2000-01-01"}}, "age-order-test"); err != nil {
+		t.Fatal(err)
+	}
+	source.catalog = func(*http.Request) (string, int) { return locationBody(2, 11, 12), 200 }
+	startLocationPhase(t, crawler, now)
+	crawlStep(t, crawler, now)
+	job := crawlJob(t, crawler)
+	retry := crawlRetry{RunID: job.RunID, Mode: job.Mode, Page: job.Page, Target: 11, Failures: 1}
+	raw, _ := json.Marshal(retry)
+	if err := crawler.Service.Store.SetMeta(ctx, crawlRetryKey(job.Owner), string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := crawler.Service.Store.nextCrawlLocation(ctx, job); err != nil || target != 11 {
+		t.Fatal("age sort replaced an existing retry target", target, err)
+	}
+	if got := crawler.Service.Store.Meta(ctx, crawlRetryKey(job.Owner)); got != string(raw) {
+		t.Fatal("read-only age selection rewrote retry metadata")
+	}
+	wrongGeneration := *job
+	wrongGeneration.Generation = "another-login"
+	if _, err := crawler.Service.Store.nextCrawlLocation(ctx, &wrongGeneration); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("saved retry bypassed source generation provenance", err)
+	}
+	retry.RunID = "previous-run"
+	raw, _ = json.Marshal(retry)
+	if err := crawler.Service.Store.SetMeta(ctx, crawlRetryKey(job.Owner), string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := crawler.Service.Store.nextCrawlLocation(ctx, job); err != nil || target != 12 {
+		t.Fatal("stale retry overrode youngest known profile", target, err)
+	}
+}
+
 func locationBody(total int, ids ...int64) string {
 	rows := make([]string, 0, len(ids))
 	for _, id := range ids {
