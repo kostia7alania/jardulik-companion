@@ -12,7 +12,7 @@ WorkingDirectory=/var/lib/jardulik-companion
 EnvironmentFile=/etc/jardulik-companion.env
 Environment=GOMEMLIMIT=64MiB
 Environment=GOMAXPROCS=1
-ExecStart=/opt/jardulik-companion/current/jardulik backup
+ExecStart=/opt/jardulik-companion/current/jardulik backup-daily
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

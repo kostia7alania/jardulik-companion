@@ -9,8 +9,10 @@ import (
 )
 
 type photoText struct {
-	Text     string
-	Entities []MessageEntity
+	Text             string
+	Entities         []MessageEntity
+	Truncated        bool
+	SourceJSONInline bool
 }
 
 func selectedProfilePhotos(jobs []MediaJob) []MediaJob {
@@ -31,16 +33,10 @@ func selectedProfilePhotos(jobs []MediaJob) []MediaJob {
 	return photos
 }
 
-// Each record follows the displayed full-size photo order. Only values read
-// from bounded, whitelisted technical tags are included; GPS is presence only.
-func photoMetadataJSON(photos []MediaJob) string {
-	if len(photos) == 0 {
-		return ""
-	}
+// Source-derived EXIF fields only. Presentation indexes, container dimensions
+// and GPS presence belong to the compact card, never to these JSON objects.
+func photoExifBlocks(photos []MediaJob) []string {
 	type record struct {
-		Photo          int     `json:"Фото"`
-		Width          int     `json:"ImageWidth,omitempty"`
-		Height         int     `json:"ImageHeight,omitempty"`
 		Make           string  `json:"Make,omitempty"`
 		Model          string  `json:"Model,omitempty"`
 		Lens           string  `json:"LensModel,omitempty"`
@@ -54,61 +50,49 @@ func photoMetadataJSON(photos []MediaJob) string {
 		FocalLength    float64 `json:"FocalLength,omitempty"`
 		ISO            int     `json:"ISO,omitempty"`
 		Orientation    int     `json:"Orientation,omitempty"`
-		GPS            string  `json:"GPS,omitempty"`
 	}
-	rows := make([]string, 0, len(photos))
+	var blocks []string
+	for i, photo := range photos {
+		m, _ := ReadPhotoMetadata(photo.Path)
+		value := record{Make: m.Make, Model: m.Model, Lens: m.Lens, Software: m.Software, DateOriginal: m.DateOriginal, DateDigitized: m.DateDigitized, DateModified: m.DateModified, OffsetOriginal: m.OffsetOriginal, Exposure: m.Exposure, FNumber: m.FNumber, FocalLength: m.FocalLength, ISO: m.ISO, Orientation: m.Orientation}
+		data, _ := json.Marshal(value)
+		if string(data) == "{}" {
+			continue
+		}
+		blocks = append(blocks, fmt.Sprintf("%d:\n%s", i+1, data))
+	}
+	return blocks
+}
+
+// The main caption always keeps the compact summary, not a synthesized JSON dump.
+func photoJSONCardText(text string, photos []MediaJob, tail string, limit int, sourceJSON ...string) photoText {
+	value := photoCardText(text, photoMetadataRows(photos), tail, limit)
+	if len(sourceJSON) > 0 && sourceJSON[0] != "" && len(value.Entities) == 1 && textUnits(value.Text)+textUnits(sourceJSON[0])+1 <= limit {
+		quote := &value.Entities[0]
+		prefix, rest := telegramPrefix(value.Text, quote.Offset+quote.Length)
+		value.Text = prefix + "\n" + sourceJSON[0] + rest
+		quote.Length += 1 + textUnits(sourceJSON[0])
+		value.SourceJSONInline = true
+	}
+	return value
+}
+
+func photoMetadataRows(photos []MediaJob) []string {
+	var rows []string
 	for i, photo := range photos {
 		m, err := ReadPhotoMetadata(photo.Path)
+		row := fmt.Sprintf("%d:", i+1)
+		if m.Width > 0 && m.Height > 0 {
+			row += fmt.Sprintf("%d×%d", m.Width, m.Height)
+		}
 		gps := ""
 		if m.HasGPS {
 			gps = "есть"
 		} else if err == nil {
 			gps = "нет"
 		}
-		value := record{Photo: i + 1, Width: m.Width, Height: m.Height, Make: m.Make, Model: m.Model,
-			Lens: m.Lens, Software: m.Software, DateOriginal: m.DateOriginal, DateDigitized: m.DateDigitized,
-			DateModified: m.DateModified, OffsetOriginal: m.OffsetOriginal, Exposure: m.Exposure,
-			FNumber: m.FNumber, FocalLength: m.FocalLength, ISO: m.ISO, Orientation: m.Orientation, GPS: gps}
-		b, _ := json.Marshal(value) // The bounded record contains no unsupported JSON types.
-		rows = append(rows, string(b))
-	}
-	return "[" + strings.Join(rows, ",\n") + "]"
-}
-
-// JSON is never truncated. Oversized captions retain the compact photo rows;
-// the existing full-text action exposes every available technical JSON value.
-func photoJSONCardText(text string, photos []MediaJob, tail string, limit int) photoText {
-	value := fullPhotoText(text, []string{photoMetadataJSON(photos)})
-	if tail != "" {
-		_, _, _, link := splitPhotoFooter(text)
-		value.Text = strings.TrimSuffix(value.Text, link) + tail + link
-	}
-	if textUnits(value.Text) <= limit {
-		return value
-	}
-	return photoCardText(text, photoMetadataRows(photos), tail, limit)
-}
-
-func photoMetadataRows(photos []MediaJob, full ...bool) []string {
-	var rows []string
-	for i, j := range photos {
-		metadata, err := ReadPhotoMetadata(j.Path)
-		fields := metadata.compactTechnicalFields()
-		if len(full) > 0 && full[0] {
-			fields = metadata.TechnicalRows()
-		} else {
-			for k := range fields {
-				fields[k] = strings.Join(strings.Fields(fields[k]), " ")
-			}
-		}
-		if metadata.HasGPS {
-			fields = append(fields, "GPS: есть")
-		} else if err == nil {
-			fields = append(fields, "GPS: нет")
-		}
-		row := fmt.Sprintf("Фото %d", i+1)
-		if len(fields) > 0 {
-			row += ": " + strings.Join(fields, " · ")
+		if gps != "" {
+			row += " · GPS:" + gps
 		}
 		rows = append(rows, row)
 	}
@@ -125,13 +109,13 @@ func compactPhotoRows(rows []string, budget int) string {
 	}
 	per := (budget - len(rows) + 1) / len(rows)
 	if per < 22 {
-		summary, _ := telegramPrefix(fmt.Sprintf("Фото 1..%d: полные технические данные по кнопке.", len(rows)), budget)
+		summary, _ := telegramPrefix(fmt.Sprintf("1..%d: технические данные по кнопке.", len(rows)), budget)
 		return summary
 	}
 	var compact []string
 	for _, row := range rows {
 		tail := ""
-		for _, gps := range []string{" · GPS: есть", " · GPS: нет"} {
+		for _, gps := range []string{" · GPS:есть", " · GPS:нет"} {
 			if strings.HasSuffix(row, gps) {
 				tail = gps
 				row = strings.TrimSuffix(row, gps)
@@ -219,7 +203,7 @@ func photoCardText(text string, rows []string, tail string, limit int) photoText
 		prefix = strings.TrimRight(prefix, " \n") + "…"
 	}
 	prefix = strings.TrimRight(prefix, " \n") + "\n\n"
-	result := photoText{Text: prefix + quote + footer + tail}
+	result := photoText{Text: prefix + quote + footer + tail, Truncated: rest != ""}
 	if quote != "" {
 		result.Entities = []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(quote)}}
 	}

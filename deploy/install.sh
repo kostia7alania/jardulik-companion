@@ -3,13 +3,16 @@ set -Eeuo pipefail
 
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 
-[[ $# -eq 3 ]] || die 'usage: install.sh <40-character-commit> <unpacked-release-directory> <binary-sha256>'
+[[ $# -eq 4 ]] || die 'usage: install.sh <40-character-commit> <unpacked-release-directory> <binary-sha256> <helper-sha256>'
 revision=$1
 source_dir=$2
 binary_sha=$3
+helper_sha=$4
 [[ $revision =~ ^[0-9a-f]{40}$ ]] || die 'invalid commit SHA'
 [[ $binary_sha =~ ^[0-9a-f]{64}$ ]] || die 'invalid binary SHA-256'
+[[ $helper_sha =~ ^[0-9a-f]{64}$ ]] || die 'invalid helper SHA-256'
 [[ -f $source_dir/jardulik && ! -L $source_dir/jardulik ]] || die 'release binary is missing or is a symlink'
+[[ -f $source_dir/telegram-transfer && ! -L $source_dir/telegram-transfer ]] || die 'release helper is missing or is a symlink'
 [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || die 'the release requires Linux x86_64'
 [[ $EUID -eq 0 ]] || die 'run the installer as root'
 
@@ -71,11 +74,12 @@ if not reserve.isdigit() or int(reserve) < 2147483648:
 PY
 
 available_bytes=$(df -PB1 /opt | awk 'NR == 2 { print $4 }')
-release_bytes=$(stat -c '%s' "$source_dir/jardulik")
+release_bytes=$(( $(stat -c '%s' "$source_dir/jardulik") + $(stat -c '%s' "$source_dir/telegram-transfer") ))
 reserve_bytes=$(awk -F= '/^[[:space:]]*MIN_FREE_BYTES=/ { value=$2; gsub(/[^0-9]/, "", value); found=1 } END { if (found) print value; else print "2147483648" }' "$env_file")
 [[ $available_bytes =~ ^[0-9]+$ ]] || die 'could not read available disk space'
 (( available_bytes >= reserve_bytes + release_bytes * 2 + 1048576 )) || die 'insufficient disk space to preserve the configured reserve'
 printf '%s  %s\n' "$binary_sha" "$source_dir/jardulik" | sha256sum --check --status || die 'binary checksum mismatch'
+printf '%s  %s\n' "$helper_sha" "$source_dir/telegram-transfer" | sha256sum --check --status || die 'helper checksum mismatch'
 for unit in "${unit_names[@]}"; do
     [[ -f $source_dir/deploy/$unit && ! -L $source_dir/deploy/$unit ]] || die "release unit is missing: $unit"
 done
@@ -108,12 +112,18 @@ cleanup_candidate() {
 trap cleanup_candidate EXIT
 if [[ -e $release_dir ]]; then
     [[ -d $release_dir && ! -L $release_dir ]] || die 'release path is not a regular directory'
+    [[ -f $release_dir/jardulik && ! -L $release_dir/jardulik ]] || die 'the existing release binary is missing or is a symlink'
+    [[ -f $release_dir/telegram-transfer && ! -L $release_dir/telegram-transfer ]] || die 'the existing release helper is missing or is a symlink'
     printf '%s  %s\n' "$binary_sha" "$release_dir/jardulik" | sha256sum --check --status || die 'the existing release has a different checksum'
+    printf '%s  %s\n' "$helper_sha" "$release_dir/telegram-transfer" | sha256sum --check --status || die 'the existing release helper has a different checksum'
 else
     candidate=$(mktemp -d "$base/releases/.$revision.XXXXXX")
     install -o root -g root -m 0755 "$source_dir/jardulik" "$candidate/jardulik"
+    install -o root -g root -m 0755 "$source_dir/telegram-transfer" "$candidate/telegram-transfer"
+    printf '%s  %s\n' "$binary_sha" "$candidate/jardulik" | sha256sum --check --status
+    printf '%s  %s\n' "$helper_sha" "$candidate/telegram-transfer" | sha256sum --check --status
     printf '%s\n' "$revision" > "$candidate/VERSION"
-    printf '%s  jardulik\n' "$binary_sha" > "$candidate/SHA256SUMS"
+    printf '%s  jardulik\n%s  telegram-transfer\n' "$binary_sha" "$helper_sha" > "$candidate/SHA256SUMS"
     chmod 0755 "$candidate"
     mv -T -- "$candidate" "$release_dir"
     candidate=''

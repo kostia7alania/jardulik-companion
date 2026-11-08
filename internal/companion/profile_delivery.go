@@ -11,11 +11,18 @@ import (
 	"time"
 )
 
-func profileButtons(p StoredProfile) any {
-	return map[string]any{"inline_keyboard": [][]map[string]string{
-		{{"text": "В избранное", "callback_data": fmt.Sprintf("f:%d", p.ID)}, {"text": "История", "callback_data": fmt.Sprintf("h:%d", p.ID)}},
-		{{"text": "Полный текст", "callback_data": fmt.Sprintf("t:%d", p.ID)}, {"text": "Следующая анкета", "callback_data": "next"}},
-	}}
+func profileButtons(p StoredProfile, full, jsonSource bool) any {
+	rows := [][]map[string]string{{{"text": "В избранное", "callback_data": fmt.Sprintf("f:%d", p.ID)}, {"text": "История", "callback_data": fmt.Sprintf("h:%d", p.ID)}}}
+	var actions []map[string]string
+	if full {
+		actions = append(actions, map[string]string{"text": "Полный текст", "callback_data": fmt.Sprintf("t:%d", p.ID)})
+	}
+	actions = append(actions, map[string]string{"text": "Следующая анкета", "callback_data": "next"})
+	rows = append(rows, actions)
+	if jsonSource {
+		rows = append(rows, []map[string]string{{"text": "JSON Jardulik", "callback_data": fmt.Sprintf("jv:%d", p.VersionID)}})
+	}
+	return map[string]any{"inline_keyboard": rows}
 }
 
 // Each profile is a captioned photo/album, without an automatic second text post.
@@ -26,13 +33,16 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 	}
 	photos := selectedProfilePhotos(jobs)
 	text := s.cardText(ctx, owner, p)
-	buttons := profileButtons(p)
+	pretty, err := storedProfileJSON(ctx, s.Store, owner, p.VersionID)
+	if err != nil {
+		return nil, err
+	}
 	if len(photos) == 0 {
 		if len(jobs) > 0 {
 			text += "\n\nФотографии пока недоступны."
 		}
-		card := photoCardText(text, nil, "", 4096)
-		m, e := s.TG.SendText(ctx, owner, 0, card.Text, buttons, card.Entities)
+		card := photoJSONCardText(text, nil, "", 4096, pretty)
+		m, e := s.TG.SendText(ctx, owner, 0, card.Text, profileButtons(p, card.Truncated, !card.SourceJSONInline), card.Entities)
 		if e != nil {
 			return nil, e
 		}
@@ -43,9 +53,10 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 	}
 	tail := ""
 	if len(photos) > 1 {
-		tail = fmt.Sprintf("\n\nТекст: /text_%d\nИзбранное: /fav_%d · /next", p.ID, p.ID)
+		tail = fmt.Sprintf("\n\nТекст: /text_%d\nJSON: /json_%d\nИзбранное: /fav_%d · /next", p.ID, p.VersionID, p.ID)
 	}
-	card := photoJSONCardText(text, photos, tail, 1024)
+	card := photoJSONCardText(text, photos, tail, 1024, pretty)
+	buttons := profileButtons(p, card.Truncated || len(photoExifBlocks(photos)) > 0, !card.SourceJSONInline)
 	caption := card.Text
 	var ids []int64
 	for start := 0; start < len(photos); {
@@ -115,20 +126,19 @@ func (s *Service) fullText(ctx context.Context, chat int64, p StoredProfile) {
 	if err := s.Store.DB.QueryRowContext(ctx, "SELECT owner_id FROM versions WHERE id=? AND profile_id=?", p.VersionID, p.ID).Scan(&owner); err != nil {
 		return
 	}
+	if chat != owner && chat != s.Config.OwnerID {
+		return
+	}
 	jobs, err := s.Store.MediaJobs(ctx, owner, p.VersionID)
 	if err != nil {
 		return
 	}
-	value := fullPhotoText(s.cardText(ctx, chat, p), []string{photoMetadataJSON(selectedProfilePhotos(jobs))})
-	for value.Text != "" {
-		part, rest := photoTextPart(value, 3900)
-		if _, err := s.TG.SendText(ctx, chat, 0, part.Text, nil, part.Entities); err != nil {
-			return
-		}
-		value = rest
-		if value.Text != "" && !sleep(ctx, time.Second) {
-			return
-		}
+	parts, err := fullExifTextParts(s.cardText(ctx, chat, p), selectedProfilePhotos(jobs))
+	if err == nil {
+		err = s.sendKnownText(ctx, chat, p.VersionID, "full_text", parts)
+	}
+	if err != nil {
+		slog.Warn("full text delivery unavailable", "kind", safeError(err))
 	}
 }
 
@@ -167,6 +177,10 @@ func (s *Service) archiveCallback(ctx context.Context, c Callback) {
 	}
 	p, err := s.Store.Version(ctx, owner, id)
 	if err != nil {
+		return
+	}
+	if parts[0] == "aj" {
+		s.sourceJSON(ctx, s.Config.OwnerID, owner, id)
 		return
 	}
 	if parts[0] == "av" {
@@ -380,7 +394,7 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 			}
 			tail := ""
 			if len(ids) > 1 {
-				tail = fmt.Sprintf("\n\nТекст: /text_%d\nИзбранное: /fav_%d · /next", p.ID, p.ID)
+				tail = fmt.Sprintf("\n\nТекст: /text_%d\nJSON: /json_%d\nИзбранное: /fav_%d · /next", p.ID, p.VersionID, p.ID)
 			}
 			photos := selectedProfilePhotos(jobs)
 			limit, method := 1024, "editMessageCaption"
@@ -391,7 +405,11 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 			if len(photos) == 0 && len(jobs) > 0 {
 				text += "\n\nФотографии пока недоступны."
 			}
-			card := photoJSONCardText(text, photos, tail, limit)
+			pretty, err := storedProfileJSON(ctx, s.Store, v.owner, p.VersionID)
+			if err != nil {
+				return err
+			}
+			card := photoJSONCardText(text, photos, tail, limit, pretty)
 			payload := map[string]any{"chat_id": v.owner, "message_id": ids[0], "caption": card.Text, "caption_entities": card.Entities}
 			if len(photos) == 0 {
 				delete(payload, "caption")
@@ -401,7 +419,7 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 				payload["link_preview_options"] = map[string]bool{"is_disabled": true}
 			}
 			if len(ids) == 1 {
-				payload["reply_markup"] = profileButtons(p)
+				payload["reply_markup"] = profileButtons(p, card.Truncated || len(photoExifBlocks(photos)) > 0, !card.SourceJSONInline)
 			}
 			var out SentMessage
 			err = s.TG.Call(ctx, method, payload, &out)

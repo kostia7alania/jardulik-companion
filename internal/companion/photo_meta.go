@@ -46,15 +46,7 @@ type PhotoMetadata struct {
 
 func (m PhotoMetadata) TechnicalRows() []string {
 	var rows []string
-	if m.Format != "" {
-		rows = append(rows, "FileType: "+m.Format)
-	}
-	if m.Width > 0 {
-		rows = append(rows, fmt.Sprintf("ImageWidth: %d", m.Width))
-	}
-	if m.Height > 0 {
-		rows = append(rows, fmt.Sprintf("ImageHeight: %d", m.Height))
-	}
+
 	for _, field := range []struct{ key, value string }{
 		{"Make", m.Make}, {"Model", m.Model}, {"LensModel", m.Lens},
 		{"Software", m.Software}, {"DateTimeOriginal", m.DateOriginal},
@@ -78,46 +70,6 @@ func (m PhotoMetadata) TechnicalRows() []string {
 		rows = append(rows, fmt.Sprintf("Orientation: %d", m.Orientation))
 	}
 	return rows
-}
-
-func (m PhotoMetadata) compactTechnicalFields() []string {
-	var fields []string
-	if m.Width > 0 && m.Height > 0 {
-		fields = append(fields, fmt.Sprintf("%d×%d", m.Width, m.Height))
-	}
-	camera := strings.TrimSpace(m.Make + " " + m.Model)
-	if m.Make != "" && strings.HasPrefix(strings.ToLower(m.Model), strings.ToLower(m.Make)+" ") {
-		camera = m.Model
-	}
-	if camera != "" {
-		fields = append(fields, camera)
-	}
-	if m.DateOriginal != "" {
-		date := m.DateOriginal
-		if m.OffsetOriginal != "" {
-			date += " " + m.OffsetOriginal
-		}
-		fields = append(fields, date)
-	}
-	if m.Lens != "" {
-		fields = append(fields, m.Lens)
-	}
-	if m.Exposure != "" {
-		fields = append(fields, m.Exposure)
-	}
-	if m.FNumber > 0 {
-		fields = append(fields, "f/"+strconv.FormatFloat(m.FNumber, 'f', -1, 64))
-	}
-	if m.ISO > 0 {
-		fields = append(fields, fmt.Sprintf("ISO %d", m.ISO))
-	}
-	if m.FocalLength > 0 {
-		fields = append(fields, strconv.FormatFloat(m.FocalLength, 'f', -1, 64)+" мм")
-	}
-	if m.Software != "" {
-		fields = append(fields, m.Software)
-	}
-	return fields
 }
 
 type photoMetaParser struct {

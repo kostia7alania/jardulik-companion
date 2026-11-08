@@ -20,6 +20,12 @@ git -C "$repo_dir" fetch --no-tags origin
 cd "$repo_dir"
 go test -race ./...
 go vet ./...
+[[ -f tools/telegram-transfer/go.mod && -f tools/telegram-transfer/go.sum ]] || die 'Telegram transfer helper module is missing'
+(
+    cd tools/telegram-transfer
+    go test -race ./...
+    go vet ./...
+)
 
 staging_dir=$(mktemp -d "${TMPDIR:-/tmp}/jardulik-deploy.XXXXXX")
 remote_stage=''
@@ -34,25 +40,35 @@ trap cleanup EXIT
 mkdir "$staging_dir/release"
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -trimpath -ldflags='-s -w' -o "$staging_dir/release/jardulik" ./cmd/jardulik
+(
+    cd "$repo_dir/tools/telegram-transfer"
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+        go build -trimpath -ldflags='-s -w' -o "$staging_dir/release/telegram-transfer" .
+)
+[[ $(git -C "$repo_dir" rev-parse HEAD) == "$revision" && -z $(git -C "$repo_dir" status --porcelain) ]] || die 'checkout changed while building; refusing upload'
+git -C "$repo_dir" fetch --no-tags origin
+[[ $(git -C "$repo_dir" rev-parse origin/main) == "$revision" ]] || die 'origin/main changed while building; refusing upload'
 mkdir "$staging_dir/release/deploy"
 for file in install.sh jardulik-companion.service jardulik-companion-backup.service jardulik-companion-backup.timer; do
     cp "$repo_dir/deploy/$file" "$staging_dir/release/deploy/$file"
 done
 binary_sha=$(shasum -a 256 "$staging_dir/release/jardulik" | awk '{print $1}')
-COPYFILE_DISABLE=1 tar -czf "$staging_dir/release.tar.gz" -C "$staging_dir/release" jardulik deploy
+helper_sha=$(shasum -a 256 "$staging_dir/release/telegram-transfer" | awk '{print $1}')
+COPYFILE_DISABLE=1 tar -czf "$staging_dir/release.tar.gz" -C "$staging_dir/release" jardulik telegram-transfer deploy
 archive_sha=$(shasum -a 256 "$staging_dir/release.tar.gz" | awk '{print $1}')
 stage_candidate=$(ssh "${ssh_options[@]}" "$deploy_host" 'mktemp -d /tmp/jardulik-deploy.XXXXXX')
 [[ $stage_candidate =~ ^/tmp/jardulik-deploy\.[A-Za-z0-9]+$ ]] || die 'the server returned an unexpected staging path'
 remote_stage=$stage_candidate
 scp "${ssh_options[@]}" "$staging_dir/release.tar.gz" "$deploy_host:$remote_stage/release.tar.gz"
-ssh "${ssh_options[@]}" "$deploy_host" bash -s -- "$remote_stage" "$revision" "$archive_sha" "$binary_sha" <<'REMOTE'
+ssh "${ssh_options[@]}" "$deploy_host" bash -s -- "$remote_stage" "$revision" "$archive_sha" "$binary_sha" "$helper_sha" <<'REMOTE'
 set -euo pipefail
 stage=$1
 revision=$2
 archive_sha=$3
 binary_sha=$4
+helper_sha=$5
 printf '%s  %s\n' "$archive_sha" "$stage/release.tar.gz" | sha256sum --check --status
 mkdir "$stage/unpacked"
 tar --no-same-owner -xzf "$stage/release.tar.gz" -C "$stage/unpacked"
-bash "$stage/unpacked/deploy/install.sh" "$revision" "$stage/unpacked" "$binary_sha"
+bash "$stage/unpacked/deploy/install.sh" "$revision" "$stage/unpacked" "$binary_sha" "$helper_sha"
 REMOTE

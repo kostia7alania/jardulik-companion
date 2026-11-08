@@ -35,7 +35,7 @@ func NewService(c Config) (*Service, error) {
 	}
 	v := &Service{Config: c, Store: s, Client: NewClient(s, c), TG: NewTelegram(c), Media: NewMediaManager(s, c)}
 	v.Archiver = NewArchiver(c, s, v.TG, v.Media)
-	v.Watcher = NewProfileWatcher(c, s, v.Client)
+	v.Watcher = NewProfileWatcher(c, s, v.Client, v.Archiver)
 	return v, nil
 }
 func (s *Service) Close() error { return s.Store.Close() }
@@ -66,7 +66,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if wh.URL != "" {
 		return errors.New("existing webhook configured; refusing simultaneous long polling")
 	}
-	commands := []map[string]string{{"command": "next", "description": "Следующая анкета"}, {"command": "status", "description": "Аккаунт и архив"}, {"command": "connect", "description": "Подключить свой Jardulik"}, {"command": "favorites", "description": "Избранные анкеты"}, {"command": "history", "description": "История анкет"}, {"command": "pause", "description": "Остановить действия"}, {"command": "disconnect", "description": "Отключить сессию Jardulik"}, {"command": "delete", "description": "Удалить свои данные"}, {"command": "help", "description": "Подключение и команды"}}
+	commands := []map[string]string{{"command": "next", "description": "Следующая анкета"}, {"command": "status", "description": "Аккаунт и архив"}, {"command": "connect", "description": "Подключить свой Jardulik"}, {"command": "favorites", "description": "Избранные анкеты"}, {"command": "likes", "description": "Входящие лайки"}, {"command": "matches", "description": "Взаимности"}, {"command": "filters", "description": "Фильтры Jardulik"}, {"command": "history", "description": "История анкет"}, {"command": "pause", "description": "Остановить действия"}, {"command": "disconnect", "description": "Отключить сессию Jardulik"}, {"command": "delete", "description": "Удалить свои данные"}, {"command": "help", "description": "Подключение и команды"}}
 	if err := s.TG.Call(ctx, "setMyCommands", map[string]any{"commands": commands}, nil); err != nil {
 		return err
 	}
@@ -208,7 +208,7 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		return
 	}
 	if u.Callback != nil && owner == s.Config.OwnerID && m.Chat.ID == s.Config.BackupChatID && s.Config.BackupChatID != 0 {
-		if strings.HasPrefix(u.Callback.Data, "av:") || strings.HasPrefix(u.Callback.Data, "az:") {
+		if strings.HasPrefix(u.Callback.Data, "av:") || strings.HasPrefix(u.Callback.Data, "az:") || strings.HasPrefix(u.Callback.Data, "aj:") {
 			s.archiveCallback(ctx, *u.Callback)
 		}
 		return
@@ -224,6 +224,12 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 	}
 	if u.Callback != nil {
 		_ = s.TG.Call(ctx, "answerCallbackQuery", map[string]string{"callback_query_id": u.Callback.ID}, nil)
+		if s.FilterCallback(ctx, owner, u.Callback.Data) {
+			return
+		}
+		if s.HandleRelationCallback(ctx, owner, u.Callback.Data) {
+			return
+		}
 		parts := strings.Split(u.Callback.Data, ":")
 		if len(parts) == 2 {
 			id, err := strconv.ParseInt(parts[1], 10, 64)
@@ -238,6 +244,8 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 				return
 			}
 			switch parts[0] {
+			case "jv":
+				s.sourceJSON(ctx, owner, owner, id)
 			case "f":
 				if err := s.Store.Favorite(ctx, owner, id); err != nil {
 					_ = s.say(ctx, owner, "Анкета недоступна.", nil)
@@ -265,6 +273,12 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 				s.list(ctx, owner, false, 0)
 			case "status":
 				s.status(ctx, owner)
+			case "filters":
+				_ = s.OpenFilters(ctx, owner)
+			case "likes":
+				s.OpenRelations(ctx, owner, false)
+			case "matches":
+				s.OpenRelations(ctx, owner, true)
 			case "connect_help":
 				_ = s.say(ctx, owner, connectHelp, mainButtons())
 			case "help":
@@ -277,13 +291,20 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 	if len(fields) == 0 {
 		return
 	}
+	if !strings.HasPrefix(fields[0], "/") && s.FilterText(ctx, owner, m.Text) {
+		return
+	}
 	cmd := strings.Split(fields[0], "@")[0]
-	for _, prefix := range []string{"/text_", "/fav_", "/history_"} {
+	for _, prefix := range []string{"/text_", "/fav_", "/history_", "/json_"} {
 		if !strings.HasPrefix(cmd, prefix) {
 			continue
 		}
 		id, err := strconv.ParseInt(strings.TrimPrefix(cmd, prefix), 10, 64)
 		if err != nil || id <= 0 {
+			return
+		}
+		if prefix == "/json_" {
+			s.sourceJSON(ctx, owner, owner, id)
 			return
 		}
 		if prefix == "/history_" {
@@ -359,8 +380,14 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		s.next(ctx, owner)
 	case "/status":
 		s.status(ctx, owner)
+	case "/filters":
+		_ = s.OpenFilters(ctx, owner)
 	case "/favorites":
 		s.list(ctx, owner, true, 0)
+	case "/likes":
+		s.OpenRelations(ctx, owner, false)
+	case "/matches":
+		s.OpenRelations(ctx, owner, true)
 	case "/history":
 		if len(fields) > 1 {
 			id, _ := strconv.ParseInt(fields[1], 10, 64)
@@ -426,7 +453,7 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 			if err != nil {
 				_ = s.say(ctx, owner, "Не удалось поставить бэкап в очередь.", nil)
 			} else {
-				_ = s.say(ctx, owner, "Бэкап поставлен в очередь. "+s.Archiver.BackupStatus(ctx), nil)
+				_ = s.say(ctx, owner, "Полный бэкап поставлен в очередь. "+s.Archiver.BackupStatus(ctx), nil)
 			}
 		}
 	case "/register_source":
@@ -453,7 +480,9 @@ const connectHelp = "Подключение Jardulik\n\n1. Открой офиц
 func mainButtons() any {
 	return map[string]any{"inline_keyboard": [][]map[string]string{
 		{{"text": "Следующая анкета", "callback_data": "next"}, {"text": "Избранное", "callback_data": "favorites"}},
+		{{"text": "Входящие лайки", "callback_data": "likes"}, {"text": "Взаимности", "callback_data": "matches"}},
 		{{"text": "История", "callback_data": "history"}, {"text": "Аккаунт", "callback_data": "status"}},
+		{{"text": "Фильтры", "callback_data": "filters"}},
 		{{"text": "Подключение", "callback_data": "connect_help"}, {"text": "Помощь", "callback_data": "help"}},
 	}}
 }
@@ -517,14 +546,14 @@ func (s *Service) Fetch(ctx context.Context, owner int64) (int, error) {
 	if err := s.Media.CheckDisk(); err != nil {
 		return 0, err
 	}
-	if _, err := s.Client.Me(ctx, owner); err != nil {
-		return 0, err
-	}
 	profiles, err := s.Client.Users(ctx, owner, s.Store.Page(ctx, owner))
 	if err != nil {
 		return 0, err
 	}
 	if _, err = s.Store.Archive(ctx, owner, profiles, "GET /user/getUsers"); err != nil {
+		return 0, err
+	}
+	if err = s.Store.RestoreFilteredBatch(ctx, owner, profiles); err != nil {
 		return 0, err
 	}
 	s.Store.AdvancePage(ctx, owner, len(profiles) == 0)
@@ -539,7 +568,9 @@ func (s *Service) next(ctx context.Context, owner int64) {
 			return
 		}
 		if n == 0 {
-			_ = s.say(ctx, owner, "Jardulik не вернул новые анкеты по этим условиям. Фильтры автоматически не расширяем.", nil)
+			if err := s.OfferOtherProfiles(ctx, owner); err != nil {
+				_ = s.say(ctx, owner, "Не удалось предложить дополнительную выдачу. Попробуй позже.", nil)
+			}
 			return
 		}
 		p, err = s.Store.Next(ctx, owner)
@@ -581,6 +612,9 @@ func profileText(p StoredProfile) string {
 	}
 	if len(location) > 0 {
 		b.WriteString("\n📍 " + strings.Join(location, ", "))
+	}
+	if birthday := profileBirthday(v); birthday != "" {
+		b.WriteString("\n🎂 " + birthday)
 	}
 	for _, f := range []struct{ key, icon string }{{"goal", "🎯 "}, {"worldview", "🙏 "}, {"children", "👶 "}, {"profession", "💼 "}, {"languages", "🗣 "}} {
 		if v.String(f.key) == "dont_tell" {

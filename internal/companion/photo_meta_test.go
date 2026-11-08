@@ -248,17 +248,17 @@ func TestPhotoMetadataDateOffsetAndSafeText(t *testing.T) {
 	}
 }
 
-func TestPhotoMetadataCompactFieldsKeepUsefulSourceValues(t *testing.T) {
-	m := PhotoMetadata{Format: "WebP", Width: 900, Height: 1200, HasEXIF: true, HasICC: true, HasGPS: true, Make: "Example", Model: "Example Camera", Lens: "35mm lens", Software: "Editor 2", DateOriginal: "2021:08:09 10:11:12", OffsetOriginal: "+04:00", Exposure: "1/125 s", FNumber: 2.8, FocalLength: 35, ISO: 400, Orientation: 1}
-	got := strings.Join(m.compactTechnicalFields(), " · ")
-	want := "900×1200 · Example Camera · 2021:08:09 10:11:12 +04:00 · 35mm lens · 1/125 s · f/2.8 · ISO 400 · 35 мм · Editor 2"
-	if got != want {
-		t.Fatalf("compact technical values changed: %s", got)
-	}
+func TestPhotoMetadataTechnicalRowsExcludeContainerAndFlags(t *testing.T) {
+	m := PhotoMetadata{Format: "WebP", Width: 900, Height: 1200, HasEXIF: true, HasGPS: true, Make: "Example", Model: "Camera", DateOriginal: "2021:08:09 10:11:12", OffsetOriginal: "+04:00", Orientation: 1}
 	full := strings.Join(m.TechnicalRows(), "\n")
-	for _, tag := range []string{"FileType: WebP", "ImageWidth: 900", "ImageHeight: 1200", "Make: Example", "Model: Example Camera", "DateTimeOriginal: 2021:08:09 10:11:12", "OffsetTimeOriginal: +04:00", "Orientation: 1"} {
+	for _, tag := range []string{"Make: Example", "Model: Camera", "DateTimeOriginal: 2021:08:09 10:11:12", "OffsetTimeOriginal: +04:00", "Orientation: 1"} {
 		if !strings.Contains(full, tag) {
-			t.Fatalf("full technical tag lost: %s", tag)
+			t.Fatalf("source technical tag lost: %s", tag)
+		}
+	}
+	for _, noise := range []string{"FileType", "ImageWidth", "ImageHeight", "GPS", "has_exif"} {
+		if strings.Contains(full, noise) {
+			t.Fatalf("container/flags mislabeled as EXIF: %s", noise)
 		}
 	}
 }

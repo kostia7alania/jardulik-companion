@@ -52,23 +52,47 @@ func TestRefreshCaptionsOnlyEditsKnownCardsPreservingSources(t *testing.T) {
 	var targets []int64
 	tg := NewTelegram(svc.Config)
 	tg.HTTP = &http.Client{Transport: archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
-		if filepath.Base(r.URL.Path) != "editMessageCaption" {
-			t.Fatalf("caption maintenance attempted forbidden method %s", filepath.Base(r.URL.Path))
+		method := filepath.Base(r.URL.Path)
+		if method != "editMessageCaption" && method != "editMessageReplyMarkup" {
+			t.Fatalf("caption maintenance attempted forbidden method %s", method)
 		}
 		var input struct {
 			Chat     int64           `json:"chat_id"`
 			Message  int64           `json:"message_id"`
 			Caption  string          `json:"caption"`
 			Entities []MessageEntity `json:"caption_entities"`
+			Markup   struct {
+				Rows [][]map[string]string `json:"inline_keyboard"`
+			} `json:"reply_markup"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 			t.Fatal(err)
 		}
+		if method == "editMessageReplyMarkup" {
+			if input.Chat != svc.Config.BackupChatID || input.Message != 11 {
+				t.Fatalf("edited controls outside known ZIP: %+v", input)
+			}
+			var callbacks []string
+			for _, row := range input.Markup.Rows {
+				for _, button := range row {
+					callbacks = append(callbacks, button["callback_data"])
+				}
+			}
+			for _, prefix := range []string{"av:", "aj:", "az:"} {
+				want := fmt.Sprintf("%s%d", prefix, p.VersionID)
+				if !strings.Contains(strings.Join(callbacks, ","), want) {
+					t.Fatalf("missing source ZIP control: %s", want)
+				}
+			}
+			targets = append(targets, input.Message)
+			body := fmt.Sprintf(`{"ok":true,"result":{"message_id":%d,"chat":{"id":%d},"message_thread_id":55}}`, input.Message, input.Chat)
+			return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+		}
 		if (input.Chat == svc.Config.BackupChatID && input.Message != 101) || (input.Chat == 123 && input.Message != 201) || (input.Chat != svc.Config.BackupChatID && input.Chat != 123) {
 			t.Fatalf("edited a source or unknown card: %+v", input)
 		}
-		if !strings.Contains(input.Caption, `[{"Фото":1}`) || len(input.Entities) != 1 {
-			t.Fatalf("existing card did not receive expandable JSON: %+v", input)
+		if !strings.Contains(input.Caption, "1:") || strings.Contains(input.Caption, `[{"Фото":1}`) || len(input.Entities) != 1 {
+			t.Fatalf("existing card did not receive the compact expandable summary: %+v", input)
 		}
 		targets = append(targets, input.Message)
 		body := fmt.Sprintf(`{"ok":true,"result":{"message_id":%d,"chat":{"id":%d}}}`, input.Message, input.Chat)
@@ -76,7 +100,7 @@ func TestRefreshCaptionsOnlyEditsKnownCardsPreservingSources(t *testing.T) {
 	})}
 	svc.TG, svc.Archiver.TG = tg, tg
 	result, err := svc.RefreshCaptions(context.Background())
-	if err != nil || result.ArchiveCards != 1 || result.PrivateCards != 1 || fmt.Sprint(targets) != "[101 201]" {
+	if err != nil || result.ArchiveCards != 1 || result.PrivateCards != 1 || result.ArchiveControls != 1 || fmt.Sprint(targets) != "[101 11 201]" {
 		t.Fatalf("refresh failed: %+v %v %v", result, targets, err)
 	}
 	for path, sha := range before {
@@ -128,6 +152,88 @@ func TestRefreshCaptionsRejectsZIPOrServiceTopicTargets(t *testing.T) {
 			}
 			if _, err := svc.RefreshCaptions(context.Background()); err == nil {
 				t.Fatal("unsafe caption target accepted")
+			}
+		})
+	}
+}
+
+func TestRefreshCaptionsRejectsUnconfirmedZIPReceiptsBeforeMutating(t *testing.T) {
+	for _, statement := range []string{
+		"UPDATE archive_receipts SET message_id=0",
+		"UPDATE archive_receipts SET kind='service_snapshot'",
+		"UPDATE archive_receipts SET chat_id=-100999",
+		"UPDATE archive_receipts SET thread_id=7",
+		"UPDATE archive_receipts SET file_id=''",
+		"DELETE FROM archive_receipts",
+	} {
+		t.Run(statement, func(t *testing.T) {
+			svc, _, _, _ := captionRefreshFixture(t)
+			if _, err := svc.Store.DB.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+			tg := NewTelegram(svc.Config)
+			tg.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+				t.Fatalf("invalid ZIP receipt caused a mutation: %s", r.URL.Path)
+				return nil, nil
+			})
+			svc.TG, svc.Archiver.TG = tg, tg
+			result, err := svc.RefreshCaptions(context.Background())
+			if err == nil || result.ArchiveCards != 0 || result.ArchiveControls != 0 {
+				t.Fatalf("invalid ZIP receipt accepted: %+v %v", result, err)
+			}
+		})
+	}
+}
+
+func TestRefreshZIPControlsRequiresConfirmedIDChatAndThread(t *testing.T) {
+	for _, mode := range []string{"not-modified", "wrong-id", "wrong-chat", "wrong-thread", "unknown"} {
+		t.Run(mode, func(t *testing.T) {
+			svc, _, _, _ := captionRefreshFixture(t)
+			var methods []string
+			tg := NewTelegram(svc.Config)
+			tg.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+				method := filepath.Base(r.URL.Path)
+				methods = append(methods, method)
+				var input struct {
+					Chat    int64 `json:"chat_id"`
+					Message int64 `json:"message_id"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+					t.Fatal(err)
+				}
+				if method != "editMessageCaption" && method != "editMessageReplyMarkup" {
+					t.Fatalf("forbidden refresh action %s", method)
+				}
+				if method == "editMessageReplyMarkup" && (input.Chat != svc.Config.BackupChatID || input.Message != 11) {
+					t.Fatal("guessed a ZIP target")
+				}
+				body := fmt.Sprintf(`{"ok":true,"result":{"message_id":%d,"chat":{"id":%d},"message_thread_id":55}}`, input.Message, input.Chat)
+				if method == "editMessageReplyMarkup" {
+					switch mode {
+					case "not-modified":
+						body = `{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}`
+					case "wrong-id":
+						body = fmt.Sprintf(`{"ok":true,"result":{"message_id":999,"chat":{"id":%d},"message_thread_id":55}}`, input.Chat)
+					case "wrong-chat":
+						body = `{"ok":true,"result":{"message_id":11,"chat":{"id":-100999},"message_thread_id":55}}`
+					case "wrong-thread":
+						body = fmt.Sprintf(`{"ok":true,"result":{"message_id":11,"chat":{"id":%d},"message_thread_id":999}}`, input.Chat)
+					case "unknown":
+						body = `interrupted`
+					}
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+			})
+			svc.TG, svc.Archiver.TG = tg, tg
+			result, err := svc.RefreshCaptions(context.Background())
+			if mode == "not-modified" {
+				if err != nil || result.ArchiveControls != 1 || result.PrivateCards != 1 {
+					t.Fatalf("idempotent controls rejected: %+v %v", result, err)
+				}
+			} else {
+				if err == nil || result.ArchiveCards != 1 || result.ArchiveControls != 0 || fmt.Sprint(methods) != "[editMessageCaption editMessageReplyMarkup]" {
+					t.Fatalf("unconfirmed control receipt accepted/retried: %+v %v %v", result, methods, err)
+				}
 			}
 		})
 	}

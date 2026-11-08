@@ -272,6 +272,15 @@ func (p Profile) Photos(key string) []string {
 }
 func digest(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 func (s *Store) Archive(ctx context.Context, owner int64, profiles []Profile, source string) ([]int64, error) {
+	return s.archive(ctx, owner, profiles, source, false)
+}
+
+// ArchiveViewed preserves full snapshots without adding a viewed relation to discovery.
+func (s *Store) ArchiveViewed(ctx context.Context, owner int64, profiles []Profile, source string) ([]int64, error) {
+	return s.archive(ctx, owner, profiles, source, true)
+}
+
+func (s *Store) archive(ctx context.Context, owner int64, profiles []Profile, source string, viewed bool) ([]int64, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -301,7 +310,7 @@ func (s *Store) Archive(ctx context.Context, owner int64, profiles []Profile, so
 		if _, err = tx.ExecContext(ctx, "INSERT INTO observations(owner_id,version_id,source) VALUES(?,?,?)", owner, vid, source); err != nil {
 			return nil, err
 		}
-		if _, err = tx.ExecContext(ctx, "INSERT INTO queue(owner_id,profile_id,version_id) VALUES(?,?,?) ON CONFLICT(owner_id,profile_id) DO UPDATE SET version_id=excluded.version_id", owner, id, vid); err != nil {
+		if _, err = tx.ExecContext(ctx, "INSERT INTO queue(owner_id,profile_id,version_id,delivered) VALUES(?,?,?,?) ON CONFLICT(owner_id,profile_id) DO UPDATE SET version_id=excluded.version_id", owner, id, vid, viewed); err != nil {
 			return nil, err
 		}
 		for _, role := range []string{"photos", "miniPhotos"} {
@@ -336,8 +345,28 @@ func (s *Store) Version(ctx context.Context, owner, vid int64) (StoredProfile, e
 	return scanProfile(s.DB.QueryRowContext(ctx, "SELECT id,profile_id,raw_json,first_seen,last_seen FROM versions WHERE owner_id=? AND id=?", owner, vid))
 }
 func (s *Store) Delivered(ctx context.Context, owner, id int64) {
-	_, _ = s.DB.ExecContext(ctx, "UPDATE queue SET delivered=1 WHERE owner_id=? AND profile_id=?", owner, id)
-	_, _ = s.DB.ExecContext(ctx, "UPDATE users SET first_card_at=COALESCE(first_card_at,CURRENT_TIMESTAMP) WHERE id=?", owner)
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE queue SET delivered=1 WHERE owner_id=? AND profile_id=?", owner, id); err != nil {
+		return
+	}
+	// Filter tables are lazy; manual delivery also works before filters are used.
+	var filterMarkers bool
+	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='feed_filter_pending')").Scan(&filterMarkers); err != nil {
+		return
+	}
+	if filterMarkers {
+		if _, err = tx.ExecContext(ctx, "DELETE FROM feed_filter_pending WHERE owner_id=? AND profile_id=?", owner, id); err != nil {
+			return
+		}
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE users SET first_card_at=COALESCE(first_card_at,CURRENT_TIMESTAMP) WHERE id=?", owner); err != nil {
+		return
+	}
+	_ = tx.Commit()
 }
 func (s *Store) Page(ctx context.Context, owner int64) int {
 	var n int

@@ -47,62 +47,36 @@ func TestPhotoCaptionQuotePreservesFooterAndSafeNumberedOrder(t *testing.T) {
 	first := photoPresentationSource(t, 0, 2, 3)
 	second := photoPresentationSource(t, 1, 4, 5)
 	rows := photoMetadataRows(selectedProfilePhotos([]MediaJob{second, first}))
-	if len(rows) != 2 || rows[0] != "Фото 1: 2×3 · GPS: нет" || rows[1] != "Фото 2: 4×5 · GPS: нет" {
+	if len(rows) != 2 || rows[0] != "1:2×3 · GPS:нет" || rows[1] != "2:4×5 · GPS:нет" {
 		t.Fatalf("metadata order/format incorrect: %v", rows)
 	}
 	text := strings.Repeat("🙂<blockquote>О фото</blockquote>", 300) + "\n\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
 	card := photoCardText(text, rows, "\nТекст: /text_99", 1024)
 	quote := photoQuoteText(t, card)
-	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "Фото 1:") || !strings.Contains(quote, "Фото 2:") || !strings.Contains(quote, "Jardulik: 99") || !strings.Contains(card.Text, "Jardulik: 99") || !strings.Contains(card.Text, "UTC+3") || !strings.HasSuffix(card.Text, "https://t.me/c/123/55") {
+	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "1:2×3") || !strings.Contains(quote, "2:4×5") || !strings.Contains(quote, "Jardulik: 99") || !strings.Contains(card.Text, "Jardulik: 99") || !strings.Contains(card.Text, "UTC+3") || !strings.HasSuffix(card.Text, "https://t.me/c/123/55") {
 		t.Fatalf("caption/entity/footer invalid: %+v", card)
 	}
 }
 
-func TestPhotoRowsCompactAndFullPreserveBothGPSStates(t *testing.T) {
+func TestPhotoRowsAreCompactAndGPSIsOnlyAFlag(t *testing.T) {
 	tiff, _ := photoMetaTIFF(binary.LittleEndian)
 	first := MediaJob{Path: photoMetaWrite(t, photoMetaWebP(tiff))}
 	second := photoPresentationSource(t, 1, 4, 5)
 	rows := photoMetadataRows([]MediaJob{first, second})
-	if len(rows) != 2 || !strings.HasSuffix(rows[0], " · GPS: есть") || rows[1] != "Фото 2: 4×5 · GPS: нет" {
-		t.Fatalf("GPS states missing or reordered: %v", rows)
-	}
-	for _, value := range []string{"32×24", "TestMake TestModel", "2021:08:09 10:11:12 +03:00", "TestLens", "1/125 s", "f/2.8", "ISO 400", "35 мм", "TestEditor"} {
-		if !strings.Contains(rows[0], value) {
-			t.Fatalf("useful compact value missing: %s", value)
-		}
-	}
-	for _, annotation := range []string{"FileType", "WebP", "ImageWidth", "ImageHeight", "EXIF:", "Orientation", "unknown", "неизвест", "отсутств", "ошибка", "недоступ", "не извлека"} {
-		if strings.Contains(strings.Join(rows, "\n"), annotation) {
-			t.Fatalf("compact row contains annotation: %s", annotation)
-		}
-	}
-	metadata, err := ReadPhotoMetadata(first.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	full := photoMetadataRows([]MediaJob{first, second}, true)
-	wantFirst := "Фото 1: " + strings.Join(append(metadata.TechnicalRows(), "GPS: есть"), " · ")
-	if full[0] != wantFirst || !strings.HasSuffix(full[1], " · GPS: нет") || !strings.Contains(full[1], "FileType: PNG · ImageWidth: 4 · ImageHeight: 5") {
-		t.Fatalf("full safe tags were altered: %v", full)
+	if len(rows) != 2 || rows[0] != "1:32×24 · GPS:есть" || rows[1] != "2:4×5 · GPS:нет" {
+		t.Fatalf("compact photo rows incorrect: %v", rows)
 	}
 }
 
 func TestPhotoRowsDoNotClaimNoGPSWhenMetadataIsUnavailable(t *testing.T) {
-	photos := []MediaJob{
-		{Path: filepath.Join(t.TempDir(), "missing")},
-		{Path: photoMetaWrite(t, photoMetaWebP([]byte("invalid TIFF")))},
+	photos := []MediaJob{{Path: filepath.Join(t.TempDir(), "missing")}, {Path: photoMetaWrite(t, photoMetaWebP([]byte("invalid TIFF")))}}
+	rows := photoMetadataRows(photos)
+	if len(rows) != 2 || rows[0] != "1:" || !strings.HasPrefix(rows[1], "2:") {
+		t.Fatalf("partial metadata lost: %v", rows)
 	}
-	for _, full := range []bool{false, true} {
-		rows := photoMetadataRows(photos, full)
-		if len(rows) != 2 || rows[0] != "Фото 1" || !strings.HasPrefix(rows[1], "Фото 2: ") {
-			t.Fatalf("partial safe metadata lost: %v", rows)
-		}
-		for _, row := range rows {
-			for _, annotation := range []string{"GPS", "unknown", "неизвест", "ошибка", "недоступ"} {
-				if strings.Contains(row, annotation) {
-					t.Fatalf("unavailable metadata reported as known: %s", row)
-				}
-			}
+	for _, row := range rows {
+		if strings.Contains(row, "GPS") {
+			t.Fatal("unknown GPS was invented")
 		}
 	}
 }
@@ -110,7 +84,7 @@ func TestPhotoRowsDoNotClaimNoGPSWhenMetadataIsUnavailable(t *testing.T) {
 func TestPhotoQuoteClippingKeepsGPSAtEndOfEveryRow(t *testing.T) {
 	var rows []string
 	for i, gps := range []string{"есть", "нет", "есть", "нет"} {
-		rows = append(rows, fmt.Sprintf("Фото %d: %s · GPS: %s", i+1, strings.Repeat("Модель🙂 ", 40), gps))
+		rows = append(rows, fmt.Sprintf("%d: %s · GPS:%s", i+1, strings.Repeat("Модель🙂 ", 40), gps))
 	}
 	quote := compactPhotoRows(rows, 180)
 	if textUnits(quote) > 180 {
@@ -121,7 +95,7 @@ func TestPhotoQuoteClippingKeepsGPSAtEndOfEveryRow(t *testing.T) {
 		t.Fatal("photo quote lost a row")
 	}
 	for i, gps := range []string{"есть", "нет", "есть", "нет"} {
-		if !strings.HasPrefix(lines[i], fmt.Sprintf("Фото %d:", i+1)) || !strings.HasSuffix(lines[i], " · GPS: "+gps) {
+		if !strings.HasPrefix(lines[i], fmt.Sprintf("%d:", i+1)) || !strings.HasSuffix(lines[i], " · GPS:"+gps) {
 			t.Fatalf("clipping lost photo number or GPS: %s", lines[i])
 		}
 	}
@@ -224,7 +198,7 @@ func TestFullTextIncludesMetadataAsExpandableQuote(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if !strings.Contains(payload.Text, `[{"Фото":1,"ImageWidth":2,"ImageHeight":3,"GPS":"нет"}]`) || len(payload.Entities) != 1 || filepath.Base(r.URL.Path) != "sendMessage" {
+		if strings.Contains(payload.Text, "ImageWidth") || strings.Contains(payload.Text, "GPS") || strings.Contains(payload.Text, "{}") || !strings.Contains(payload.Text, "Полное описание") || len(payload.Entities) != 1 || filepath.Base(r.URL.Path) != "sendMessage" {
 			t.Fatalf("full safe text missing metadata: %+v", payload)
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`)
@@ -235,49 +209,42 @@ func TestFullTextIncludesMetadataAsExpandableQuote(t *testing.T) {
 	}
 }
 
-func TestPhotoJSONCaptionAndFullTextKeepValidTechnicalJSON(t *testing.T) {
+func TestCaptionIsCompactWhileFullEXIFContainsOnlySourceTags(t *testing.T) {
 	tiff, _ := photoMetaTIFF(binary.LittleEndian)
 	first := MediaJob{Role: "photos", Position: 0, State: "complete", SHA: "test", Path: photoMetaWrite(t, photoMetaWebP(tiff))}
-	second := photoPresentationSource(t, 1, 4, 5)
-	photos := selectedProfilePhotos([]MediaJob{second, first})
+	photos := selectedProfilePhotos([]MediaJob{photoPresentationSource(t, 1, 4, 5), first})
 	const footer = "\n\nНе указано: рост\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
 	card := photoJSONCardText("Ира, 25"+footer, photos, "\nТекст: /text_99", 1024)
 	quote := photoQuoteText(t, card)
-	var values []map[string]any
-	if err := json.NewDecoder(strings.NewReader(quote)).Decode(&values); err != nil {
-		t.Fatalf("caption does not start with complete JSON: %v: %s", err, quote)
+	if !strings.Contains(quote, "1:32×24 · GPS:есть") || !strings.Contains(quote, "2:4×5 · GPS:нет") || strings.Contains(quote, "DateTimeOriginal") || strings.Contains(quote, "{") {
+		t.Fatalf("main caption contains synthesized JSON: %s", quote)
 	}
-	if len(values) != 2 || values[0]["Фото"] != float64(1) || values[0]["DateTimeOriginal"] != "2021:08:09 10:11:12" || values[0]["DateTimeDigitized"] != "2021:08:09 10:11:14" || values[0]["DateTime"] != "2022:09:10 11:12:13" || values[0]["GPS"] != "есть" || values[1]["Фото"] != float64(2) || values[1]["GPS"] != "нет" {
-		t.Fatalf("JSON lost photo order or source dates: %v", values)
+	blocks := photoExifBlocks(photos)
+	if len(blocks) != 1 || !strings.HasPrefix(blocks[0], "1:\n{") {
+		t.Fatalf("empty EXIF was not omitted: %v", blocks)
 	}
-	if textUnits(card.Text) > 1024 || strings.Contains(quote, "UTC+3") || !strings.HasSuffix(quote, "Не указано: рост\nJardulik: 99") || !strings.HasSuffix(card.Text, "https://t.me/c/123/55") || strings.Count(card.Text, "https://t.me/c/123/55") != 1 {
-		t.Fatalf("JSON caption misplaced details or footer: %+v", card)
+	var values map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(blocks[0], "1:\n")), &values); err != nil {
+		t.Fatal(err)
 	}
-	for _, noise := range []string{"PRIVATE_", "FileType", "has_exif", "has_icc", "Фото 1:"} {
-		if strings.Contains(quote, noise) {
-			t.Fatalf("JSON contains private data or duplicate presentation: %s", noise)
+	if values["Make"] != "TestMake" || values["DateTimeOriginal"] != "2021:08:09 10:11:12" || values["DateTimeDigitized"] != "2021:08:09 10:11:14" || values["DateTime"] != "2022:09:10 11:12:13" {
+		t.Fatalf("actual EXIF values changed: %v", values)
+	}
+	for _, key := range []string{"Фото", "ImageWidth", "ImageHeight", "GPS", "FileType", "has_exif", "has_icc"} {
+		if _, ok := values[key]; ok {
+			t.Fatalf("synthetic EXIF key: %s", key)
 		}
 	}
 	long := photoJSONCardText(strings.Repeat("🙂Биография ", 150)+footer, photos, "", 1024)
-	if textUnits(long.Text) > 1024 || strings.HasPrefix(photoQuoteText(t, long), "[") || !strings.Contains(photoQuoteText(t, long), "Фото 1:") {
-		t.Fatal("oversized JSON caption was clipped instead of using compact fallback")
-	}
-	full := fullPhotoText("Ира, 25"+footer, []string{photoMetadataJSON(photos)})
-	var complete []map[string]any
-	if err := json.NewDecoder(strings.NewReader(photoQuoteText(t, full))).Decode(&complete); err != nil || len(complete) != 2 {
-		t.Fatal("full-text action lost complete JSON")
+	if textUnits(long.Text) > 1024 || !strings.HasSuffix(photoQuoteText(t, long), "Jardulik: 99") {
+		t.Fatal("caption budget/details lost")
 	}
 }
 
-func TestPhotoJSONOmitsUnavailableDatesAndUnknownGPS(t *testing.T) {
+func TestPhotoEXIFSkipsEmptyAndUnavailableMetadata(t *testing.T) {
 	photos := []MediaJob{photoPresentationSource(t, 0, 4, 5), {Path: filepath.Join(t.TempDir(), "missing")}}
-	value := photoMetadataJSON(photos)
-	var rows []map[string]any
-	if err := json.Unmarshal([]byte(value), &rows); err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 2 || rows[0]["GPS"] != "нет" || rows[1]["GPS"] != nil || strings.Contains(value, "DateTime") {
-		t.Fatalf("missing source values were invented: %s", value)
+	if blocks := photoExifBlocks(photos); len(blocks) != 0 {
+		t.Fatalf("empty technical JSON noise emitted: %v", blocks)
 	}
 }
 
@@ -285,7 +252,7 @@ func TestPhotoQuoteContainsDetailsWhileSnapshotAndLinkStayOutside(t *testing.T) 
 	const snapshot = "8.11.26, 01:10 (вс, UTC+3)"
 	const link = "https://t.me/c/123/55"
 	text := "Ира🙂\n\nБиография\n\nНе указано: возраст, рост, город\n" + snapshot + "\nJardulik: 99\n📍 " + link
-	for _, rows := range [][]string{nil, {"Фото 1: 2×3 · GPS: нет", "Фото 2: 4×5 · GPS: есть"}} {
+	for _, rows := range [][]string{nil, {"Фото 1:2×3 · GPS: нет", "Фото 2:4×5 · GPS: есть"}} {
 		for _, full := range []bool{false, true} {
 			card := photoCardText(text, rows, "", 1024)
 			if full {
@@ -326,7 +293,7 @@ func TestNoPhotoPrivateCardUsesTextEntity(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if filepath.Base(r.URL.Path) != "sendMessage" || photoQuoteText(t, photoText{Text: payload.Text, Entities: payload.Entities}) != "Jardulik: 10" {
+		if filepath.Base(r.URL.Path) != "sendMessage" || !strings.HasPrefix(photoQuoteText(t, photoText{Text: payload.Text, Entities: payload.Entities}), "Jardulik: 10") {
 			t.Fatal("no-photo details were not quoted")
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`)

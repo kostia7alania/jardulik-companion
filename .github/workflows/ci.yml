@@ -23,17 +23,32 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          cache-dependency-path: |
+            go.sum
+            tools/telegram-transfer/go.sum
           check-latest: true
       - run: go test -race ./...
       - run: go vet ./...
+      - name: Test Telegram transfer helper
+        working-directory: tools/telegram-transfer
+        run: go test -race ./...
+      - name: Vet Telegram transfer helper
+        working-directory: tools/telegram-transfer
+        run: go vet ./...
       - name: Check deployment safety gates
         run: |
           bash -n deploy/install.sh scripts/deploy.sh
           python3 scripts/test-deploy.py
-      - name: Build the VPS binary
+      - name: Build the VPS main binary
         env:
           CGO_ENABLED: '0'
           GOOS: linux
           GOARCH: amd64
         run: go build -trimpath -ldflags='-s -w' -o /tmp/jardulik ./cmd/jardulik
+      - name: Build the VPS Telegram transfer helper
+        working-directory: tools/telegram-transfer
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -trimpath -ldflags='-s -w' -o /tmp/telegram-transfer .

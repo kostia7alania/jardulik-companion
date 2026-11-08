@@ -516,7 +516,7 @@ func TestCompressibleSnapshotOverRestoreBudgetIsNotPublished(t *testing.T) {
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":42}}`)), Request: r}, nil
 	})}
 	a := NewArchiver(c, s, tg, nil)
-	if err := a.RequestBackup(ctx); err != nil {
+	if err := a.init(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.DB.ExecContext(ctx, "CREATE TABLE compressible_source(payload BLOB)"); err != nil {
@@ -525,7 +525,10 @@ func TestCompressibleSnapshotOverRestoreBudgetIsNotPublished(t *testing.T) {
 	if _, err := s.DB.ExecContext(ctx, "INSERT INTO compressible_source(payload) VALUES(zeroblob(?))", serviceRestoreLimit+4096); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.processOne(ctx); err != nil {
+	if _, err := s.DB.ExecContext(ctx, "INSERT INTO archive_backups(requested_at,state) VALUES('fixture','pending')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.processLegacyBackup(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
 	var state, path string
@@ -616,10 +619,13 @@ func TestDocumentWithoutFileIDDoesNotBecomeSentBackup(t *testing.T) {
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":10}}`)), Request: r}, nil
 	})}
 	a := NewArchiver(c, s, tg, nil)
-	if err := a.RequestBackup(ctx); err != nil {
+	if err := a.init(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.processOne(ctx); err == nil {
+	if _, err := s.DB.ExecContext(ctx, "INSERT INTO archive_backups(requested_at,state) VALUES('fixture','pending')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.processLegacyBackup(ctx, 1); err == nil {
 		t.Fatal("missing document receipt accepted")
 	}
 	var state string

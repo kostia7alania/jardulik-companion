@@ -27,16 +27,17 @@ CREATE TABLE IF NOT EXISTS profile_watch_budget (
 INSERT OR IGNORE INTO profile_watch_budget(id) VALUES(1);`
 
 type ProfileWatcher struct {
-	Config Config
-	Store  *Store
-	Client *Client
+	Config   Config
+	Store    *Store
+	Client   *Client
+	Archiver *Archiver
 
 	mu          sync.Mutex
 	initialized bool
 	now         func() time.Time
 }
 
-func NewProfileWatcher(c Config, s *Store, client *Client) *ProfileWatcher {
+func NewProfileWatcher(c Config, s *Store, client *Client, archive ...*Archiver) *ProfileWatcher {
 	if c.WatchInterval <= 0 {
 		c.WatchInterval = 24 * time.Hour
 	}
@@ -46,12 +47,16 @@ func NewProfileWatcher(c Config, s *Store, client *Client) *ProfileWatcher {
 	if c.WatchDailyLimit <= 0 {
 		c.WatchDailyLimit = 300
 	}
-	return &ProfileWatcher{Config: c, Store: s, Client: client, now: time.Now}
+	w := &ProfileWatcher{Config: c, Store: s, Client: client, now: time.Now}
+	if len(archive) > 0 {
+		w.Archiver = archive[0]
+	}
+	return w
 }
 
 func (w *ProfileWatcher) init(ctx context.Context) error {
 	if !w.initialized {
-		if _, err := w.Store.DB.ExecContext(ctx, watchSchema); err != nil {
+		if _, err := w.Store.DB.ExecContext(ctx, watchSchema+profilePresenceSchema); err != nil {
 			return err
 		}
 		w.initialized = true
@@ -69,6 +74,19 @@ func (w *ProfileWatcher) Run(ctx context.Context) {
 		return
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	w.mu.Lock()
+	err = w.init(ctx)
+	w.mu.Unlock()
+	if err != nil || w.recoverProfilePresence(ctx) != nil {
+		return
+	}
+	presenceCtx, cancelPresence := context.WithCancel(ctx)
+	presenceDone := make(chan struct{})
+	go func() {
+		defer close(presenceDone)
+		w.runProfilePresence(presenceCtx)
+	}()
+	defer func() { cancelPresence(); <-presenceDone }()
 	for ctx.Err() == nil {
 		if _, err = w.CheckOne(ctx); err != nil && ctx.Err() == nil {
 			_ = w.Store.SetMeta(ctx, "watch_last_error", watchErrorCode(err))
@@ -100,6 +118,9 @@ func (w *ProfileWatcher) CheckOne(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	defer tx.Rollback()
+	if err = seedProfilePresence(ctx, tx); err != nil {
+		return false, err
+	}
 	interval := w.Config.WatchInterval.Milliseconds()
 	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO profile_watch(owner_id,profile_id,next_check)
 	 SELECT q.owner_id,q.profile_id,COALESCE(unixepoch(v.last_seen)*1000,?)+?
@@ -179,17 +200,20 @@ func (w *ProfileWatcher) CheckOne(ctx context.Context) (bool, error) {
 		return true, errors.Join(requestErr, err)
 	}
 	if errors.Is(err, sql.ErrNoRows) || session.UserID != account {
-		return true, requestErr
+		return true, nil
 	}
 	err = w.Store.DB.QueryRowContext(ctx, "SELECT last_checked FROM profile_watch WHERE owner_id=? AND profile_id=?", owner, profile).Scan(&claim)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && claim != now.UnixMilli()) {
-		return true, requestErr
+		return true, nil
 	}
 	if err != nil {
 		return true, err
 	}
 	result := "discarded"
-	if requestErr == nil && session.State == "connected" && !w.Store.Paused(ctx, owner) {
+	if session.State == "connected" && !w.Store.Paused(ctx, owner) && errors.Is(requestErr, ErrProfileUnavailable) {
+		_, requestErr = w.recordProfilePresence(ctx, owner, profile, false, finished)
+		result = "unavailable"
+	} else if requestErr == nil && session.State == "connected" && !w.Store.Paused(ctx, owner) {
 		result = "unchanged"
 		var previous StoredProfile
 		previous, requestErr = w.Store.Profile(ctx, owner, profile)
@@ -202,6 +226,13 @@ func (w *ProfileWatcher) CheckOne(ctx context.Context) (bool, error) {
 			if requestErr == nil && oldHash != newHash {
 				_, requestErr = w.Store.Archive(ctx, owner, []Profile{p}, "profile_watch")
 				result = "changed"
+			}
+		}
+		if requestErr == nil {
+			var returned bool
+			returned, requestErr = w.recordProfilePresence(ctx, owner, profile, true, finished)
+			if returned {
+				result = "returned"
 			}
 		}
 	}

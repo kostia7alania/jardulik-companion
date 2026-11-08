@@ -40,6 +40,23 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if command == "restore-telegram" {
+		if len(os.Args) != 4 {
+			return errors.New("usage: jardulik restore-telegram <receipt.json> <new-empty-directory>")
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		work, tempErr := os.MkdirTemp("", "jardulik-telegram-restore-")
+		if tempErr != nil {
+			return tempErr
+		}
+		defer os.RemoveAll(work)
+		input := work + "/full.zip.enc"
+		if err = companion.DownloadFullBackup(ctx, c, os.Args[2], input); err != nil {
+			return err
+		}
+		return companion.RestoreArchive(input, os.Args[3], c.BackupKey)
+	}
 	if command == "restore-media" {
 		if len(os.Args) != 3 {
 			return errors.New("usage: jardulik restore-media <restored-directory>")
@@ -109,6 +126,29 @@ func run() error {
 			return err
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"user_id": p.ID(), "type": p["type"], "order_end_date": p["orderEndDate"], "freeze_state": p["freezeState"], "fire": p["fire"], "clean": p["clean"]})
+	case "backup-full":
+		if len(os.Args) > 3 || (len(os.Args) == 3 && os.Args[2] != "--if-changed") {
+			return errors.New("usage: jardulik backup-full [--if-changed] (build locally; no upload)")
+		}
+		result, buildErr := s.Archiver.BuildFullBackup(ctx, len(os.Args) == 3)
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return buildErr
+	case "backup-send-once":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik backup-send-once (requires explicit transfer activation)")
+		}
+		handled, transferErr := s.Archiver.ProcessFullBackupOnce(ctx)
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"handled": handled, "backup": s.Archiver.BackupStatus(ctx)})
+		return transferErr
+	case "backup-daily":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik backup-daily")
+		}
+		if err = s.Archiver.RequestFullBackup(ctx, true); err != nil {
+			return err
+		}
+		fmt.Println("Daily full backup requested; unchanged sources are skipped.")
+		return nil
 	case "backup":
 		if err = s.Archiver.RequestBackup(ctx); err != nil {
 			return err
@@ -136,7 +176,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, restore, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
+		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
 	}
 }
 func main() {

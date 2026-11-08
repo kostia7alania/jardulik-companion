@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -17,8 +18,11 @@ import (
 const Version = "0.1.0"
 
 type Config struct {
+	FullBackupEnabled                                  bool
 	DataDir, Token, APIBase, TelegramBase              string
 	UserAgent                                          string
+	TelegramAPIID, TransferBytesPerSecond              int64
+	TelegramAPIHash, TransferHelper, TransferSession   string
 	OwnerID, SourceBotID, BackupChatID, BackupThreadID int64
 	SessionKey, BackupKey                              []byte
 	AllowReactions                                     bool
@@ -42,6 +46,44 @@ func LoadConfig() (Config, error) {
 		c.DataDir = "./data"
 	}
 	c.DataDir, _ = filepath.Abs(c.DataDir)
+	c.TransferHelper = strings.TrimSpace(os.Getenv("TELEGRAM_TRANSFER_HELPER"))
+	if c.TransferHelper == "" {
+		c.TransferHelper = "/opt/jardulik-companion/current/telegram-transfer"
+	}
+	if !filepath.IsAbs(c.TransferHelper) || strings.ContainsAny(c.TransferHelper, "\r\n\x00") {
+		return c, errors.New("invalid TELEGRAM_TRANSFER_HELPER")
+	}
+	c.TransferSession = strings.TrimSpace(os.Getenv("TELEGRAM_TRANSFER_SESSION_FILE"))
+	if c.TransferSession == "" {
+		c.TransferSession = filepath.Join(c.DataDir, "telegram-bot-session.enc")
+	}
+	c.TransferSession, _ = filepath.Abs(c.TransferSession)
+	if relative, pathErr := filepath.Rel(c.DataDir, c.TransferSession); pathErr != nil || !filepath.IsLocal(relative) || relative == "." || strings.ContainsAny(c.TransferSession, "\r\n\x00") {
+		return c, errors.New("invalid TELEGRAM_TRANSFER_SESSION_FILE")
+	}
+	if raw := strings.TrimSpace(os.Getenv("TELEGRAM_API_ID")); raw != "" {
+		id, parseErr := strconv.ParseInt(raw, 10, 32)
+		if parseErr != nil || id <= 0 {
+			return c, errors.New("invalid TELEGRAM_API_ID")
+		}
+		c.TelegramAPIID = id
+	}
+	if raw := strings.TrimSpace(os.Getenv("TELEGRAM_TRANSFER_BYTES_PER_SECOND")); raw != "" {
+		rate, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil || rate < 0 || rate > 1<<30 {
+			return c, errors.New("invalid TELEGRAM_TRANSFER_BYTES_PER_SECOND")
+		}
+		c.TransferBytesPerSecond = rate
+	}
+	c.TelegramAPIHash = strings.TrimSpace(os.Getenv("TELEGRAM_API_HASH"))
+	if (c.TelegramAPIID == 0) != (c.TelegramAPIHash == "") {
+		return c, errors.New("TELEGRAM_API_ID and TELEGRAM_API_HASH must be configured together")
+	}
+	if c.TelegramAPIHash != "" {
+		if _, hashErr := hex.DecodeString(c.TelegramAPIHash); hashErr != nil || len(c.TelegramAPIHash) != 32 {
+			return c, errors.New("invalid TELEGRAM_API_HASH")
+		}
+	}
 	var err error
 	for name, dst := range map[string]*int64{"OWNER_TELEGRAM_ID": &c.OwnerID, "JARDULIK_BOT_ID": &c.SourceBotID, "BACKUP_CHAT_ID": &c.BackupChatID, "BACKUP_THREAD_ID": &c.BackupThreadID} {
 		if s := os.Getenv(name); s != "" {
@@ -60,6 +102,7 @@ func LoadConfig() (Config, error) {
 			return c, fmt.Errorf("%s must be base64-encoded 32 bytes", name)
 		}
 	}
+	c.FullBackupEnabled = os.Getenv("FULL_BACKUP_TRANSFER_ENABLED") == "true"
 	c.AllowReactions = os.Getenv("ALLOW_REACTIONS") == "true"
 	c.ArchivePaused = os.Getenv("ARCHIVE_WORKER_PAUSED") == "true"
 	if s := os.Getenv("MIN_FREE_BYTES"); s != "" {

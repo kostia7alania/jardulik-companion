@@ -17,10 +17,13 @@ import (
 	"time"
 )
 
+var ErrProfileUnavailable = errors.New("Jardulik profile unavailable")
+
 type UpstreamError struct {
 	Status     int
 	Kind       string
 	RetryAfter time.Duration
+	Endpoint   string
 }
 
 func (e *UpstreamError) Error() string {
@@ -34,6 +37,7 @@ type Client struct {
 	HTTP      *http.Client
 	locks     sync.Map
 	Now       func() time.Time
+	cities    filterCityCache
 }
 
 func NewClient(s *Store, c Config) *Client {
@@ -87,10 +91,10 @@ func (c *Client) exchange(ctx context.Context, method, path, token string, paylo
 		if n, _ := strconv.Atoi(res.Header.Get("Retry-After")); n > 0 {
 			d = time.Duration(n) * time.Second
 		}
-		return nil, &UpstreamError{res.StatusCode, kind, d}
+		return nil, &UpstreamError{Status: res.StatusCode, Kind: kind, RetryAfter: d, Endpoint: strings.SplitN(path, "?", 2)[0]}
 	}
 	if strings.Contains(strings.ToLower(res.Header.Get("Content-Type")), "text/html") || !json.Valid(b) {
-		return nil, &UpstreamError{res.StatusCode, "unexpected_response_or_challenge", 0}
+		return nil, &UpstreamError{Status: res.StatusCode, Kind: "unexpected_response_or_challenge", Endpoint: strings.SplitN(path, "?", 2)[0]}
 	}
 	return b, nil
 }
@@ -256,36 +260,50 @@ func (c *Client) Me(ctx context.Context, owner int64) (Profile, error) {
 	return p, err
 }
 func (c *Client) Users(ctx context.Context, owner int64, page int) ([]Profile, error) {
+	if page < 1 {
+		return nil, errors.New("invalid discovery page")
+	}
 	s, err := c.Store.Session(ctx, owner)
 	if err != nil {
 		return nil, err
 	}
-	q := url.Values{"userId": {strconv.FormatInt(s.UserID, 10)}, "pageNumber": {strconv.Itoa(page)}, "pageSize": {"150"}, "all": {"0"}, "ageMin": {"18"}, "ageMax": {"80"}, "heightMin": {"100"}, "heightMax": {"250"}}
-	for _, key := range []string{"goal", "children", "worldview", "country", "city"} {
-		q.Set(key, "")
+	state, err := c.Store.filterState(ctx, owner)
+	if err != nil {
+		return nil, err
 	}
-	var account Profile
-	_ = json.Unmarshal(s.Account, &account)
-	if n := number(account["minAge"]); n >= 18 {
-		q.Set("ageMin", strconv.FormatInt(n, 10))
+	account, err := c.Me(ctx, owner)
+	if err != nil {
+		return nil, err
 	}
-	if n := number(account["maxAge"]); n >= 18 {
-		q.Set("ageMax", strconv.FormatInt(n, 10))
+	filters := existingFeedFilters(account)
+	if state.Applied != nil {
+		if number(account["type"]) != 1 {
+			return nil, ErrFiltersPremium
+		}
+		filters = *state.Applied
 	}
+	if err := filters.validate(); err != nil {
+		return nil, err
+	}
+	q := filters.query(s.UserID, page, state.Others)
 	b, err := c.requestSession(ctx, owner, "GET", "/user/getUsers?"+q.Encode(), nil, &s)
 	if err != nil {
 		return nil, err
 	}
-	var p []Profile
+	current, err := c.Store.Session(ctx, owner)
+	if err != nil || current.Generation != s.Generation || current.UserID != s.UserID {
+		return nil, errors.New("сессия изменилась; старый ответ отменён")
+	}
+	var profiles []Profile
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.UseNumber()
-	if err = d.Decode(&p); err != nil {
+	if err := d.Decode(&profiles); err != nil {
 		return nil, errors.New("Jardulik profile list format changed")
 	}
-	return p, nil
+	return profiles, nil
 }
 func (c *Client) FullProfile(ctx context.Context, owner, id int64) (Profile, error) {
-	if _, err := c.Store.Profile(ctx, owner, id); err != nil {
+	if err := c.Store.KnownProfile(ctx, owner, id); err != nil {
 		return nil, errors.New("анкета недоступна этому аккаунту")
 	}
 	s, err := c.Store.Session(ctx, owner)
@@ -294,19 +312,37 @@ func (c *Client) FullProfile(ctx context.Context, owner, id int64) (Profile, err
 	}
 	q := url.Values{"viewerUserId": {strconv.FormatInt(s.UserID, 10)}, "targetUserId": {strconv.FormatInt(id, 10)}}
 	b, err := c.requestSession(ctx, owner, "GET", "/user/getUser?"+q.Encode(), nil, &s)
+	current, currentErr := c.Store.Session(ctx, owner)
+	if currentErr != nil || current.Generation != s.Generation || current.UserID != s.UserID {
+		return nil, errors.New("сессия изменилась; старый ответ отменён")
+	}
 	if err != nil {
+		var upstream *UpstreamError
+		if errors.As(err, &upstream) && upstream.Endpoint == "/user/getUser" && (upstream.Status == http.StatusNotFound || upstream.Status == http.StatusGone) {
+			return nil, ErrProfileUnavailable
+		}
 		return nil, err
 	}
-	if len(bytes.TrimSpace(b)) > 0 && bytes.TrimSpace(b)[0] == '[' {
+	b = bytes.TrimSpace(b)
+	if bytes.Equal(b, []byte("null")) || bytes.Equal(b, []byte("[]")) {
+		return nil, ErrProfileUnavailable
+	}
+	if len(b) > 0 && b[0] == '[' {
 		var a []json.RawMessage
-		if json.Unmarshal(b, &a) != nil || len(a) != 1 {
-			return nil, errors.New("profile unavailable")
+		if json.Unmarshal(b, &a) != nil {
+			return nil, errors.New("Jardulik profile format changed")
+		}
+		if len(a) == 0 {
+			return nil, ErrProfileUnavailable
+		}
+		if len(a) != 1 {
+			return nil, errors.New("Jardulik profile format changed")
 		}
 		b = a[0]
 	}
 	p, err := decodeProfile(b)
-	if err != nil || p.ID() != id {
-		return nil, errors.New("profile unavailable")
+	if err != nil || p == nil || p.ID() != id {
+		return nil, errors.New("Jardulik profile identity or format changed")
 	}
 	return p, nil
 }

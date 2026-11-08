@@ -117,29 +117,15 @@ func (a *Archiver) init(ctx context.Context) error {
 }
 
 func (a *Archiver) RequestBackup(ctx context.Context) error {
-	if err := a.init(ctx); err != nil {
-		return err
-	}
-	_, err := a.Store.DB.ExecContext(ctx, "INSERT INTO archive_backups(requested_at,state) VALUES(?,'pending')", a.now().UTC().Format(time.RFC3339Nano))
-	return err
+	return a.RequestFullBackup(ctx, false)
 }
 
 func (a *Archiver) BackupStatus(ctx context.Context) string {
-	if err := a.init(ctx); err != nil {
-		return "Ошибка состояния резервного копирования"
-	}
-	var state, created, detail string
-	if err := a.Store.DB.QueryRowContext(ctx, "SELECT state,created_at,error FROM archive_backups ORDER BY id DESC LIMIT 1").Scan(&state, &created, &detail); err != nil {
-		return "Бэкап ещё не запрашивался"
-	}
-	if detail != "" {
-		return fmt.Sprintf("Бэкап: %s, %s (%s)", state, displayTime(created), detail)
-	}
-	return fmt.Sprintf("Бэкап: %s, %s", state, displayTime(created))
+	return a.fullBackupStatus(ctx)
 }
 
 func (a *Archiver) Run(ctx context.Context) {
-	if err := a.init(ctx); err != nil {
+	if err := a.initFullBackup(ctx); err != nil {
 		return
 	}
 	lock, err := os.OpenFile(filepath.Join(a.Config.DataDir, "archive-worker.lock"), os.O_CREATE|os.O_RDWR, 0600)
@@ -151,6 +137,9 @@ func (a *Archiver) Run(ctx context.Context) {
 		return
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	if err := a.recoverFullBackupJobs(ctx); err != nil {
+		return
+	}
 	// Processing means an external effect might have happened before a crash.
 	// Only an operator can reconcile those records; never replay them blindly.
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_topic_jobs SET state='uncertain',error='worker_restarted_during_request' WHERE state='processing'")
@@ -251,16 +240,11 @@ func (a *Archiver) processOne(ctx context.Context) error {
 	if a.Config.BackupChatID == 0 || a.Config.BackupThreadID <= 0 {
 		return nil
 	}
-	var id int64
-	err := a.Store.DB.QueryRowContext(ctx, "SELECT id FROM archive_backups WHERE state='pending' ORDER BY id LIMIT 1").Scan(&id)
-	if err == nil {
-		return a.processBackup(ctx, id)
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if handled, err := a.processNextFullBackup(ctx); handled || err != nil {
 		return err
 	}
 	var owner, version int64
-	err = a.Store.DB.QueryRowContext(ctx, `SELECT v.owner_id,v.id FROM versions v
+	err := a.Store.DB.QueryRowContext(ctx, `SELECT v.owner_id,v.id FROM versions v
  LEFT JOIN archive_versions av ON av.version_id=v.id
  WHERE (av.version_id IS NULL OR av.state='pending')
  AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.version_id=v.id AND j.state='pending')
@@ -728,7 +712,8 @@ func (a *Archiver) profileCardText(p StoredProfile, missing int, thread int64, l
 
 func archiveProfileKeyboard(version int64) any {
 	return map[string]any{"inline_keyboard": [][]map[string]string{{
-		{"text": "Полный текст", "callback_data": fmt.Sprintf("av:%d", version)},
+		{"text": "Описание в личку", "callback_data": fmt.Sprintf("av:%d", version)},
+		{"text": "JSON Jardulik в личку", "callback_data": fmt.Sprintf("aj:%d", version)},
 		{"text": "Исходные файлы ZIP", "callback_data": fmt.Sprintf("az:%d", version)},
 	}}}
 }
@@ -2123,7 +2108,8 @@ func (a *Archiver) serviceZIPFromSnapshot(ctx context.Context, id int64, dbpath 
 	return path, manifest, nil
 }
 
-func (a *Archiver) processBackup(ctx context.Context, id int64) error {
+// Retained only for explicit legacy fixture compatibility; the worker never calls it.
+func (a *Archiver) processLegacyBackup(ctx context.Context, id int64) error {
 	if _, err := a.Store.DB.ExecContext(ctx, "UPDATE archive_backups SET state='processing' WHERE id=? AND state='pending'", id); err != nil {
 		return err
 	}
@@ -2209,6 +2195,16 @@ func (a *Archiver) notify(ctx context.Context, text string) error {
 // Large media omitted from a snapshot are recovered from the manifest's whole
 // profile documents; this function never calls that manual step "complete".
 func RestoreArchive(input, dest string, key []byte) error {
+	file, err := os.Open(input)
+	if err != nil {
+		return err
+	}
+	magic := make([]byte, len(fullBackupMagic))
+	_, peekErr := io.ReadFull(file, magic)
+	file.Close()
+	if peekErr == nil && string(magic) == fullBackupMagic {
+		return restoreFullArchive(input, dest, key)
+	}
 	info, err := os.Stat(input)
 	if err != nil {
 		return err
