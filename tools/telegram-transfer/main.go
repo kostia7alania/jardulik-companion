@@ -68,6 +68,8 @@ type receipt struct {
 	RandomID     int64  `json:"random_id"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	RetryAfter   int    `json:"retry_after,omitempty"`
+	Phase        string `json:"phase,omitempty"`
+	RPCType      string `json:"rpc_type,omitempty"`
 }
 
 type command struct {
@@ -154,6 +156,9 @@ func validSHA(value string) bool {
 }
 
 func parseCommand(args []string) (cmd command, err error) {
+	if len(args) == 1 && args[0] == "check-target" {
+		return command{Mode: "check-target"}, nil
+	}
 	if len(args) == 0 || args[0] != "upload" && args[0] != "download" {
 		return cmd, fail("invalid_arguments")
 	}
@@ -201,7 +206,7 @@ func readReceipt(path string) (value receipt, err error) {
 }
 
 func validateReceipt(value receipt, c config, cmd command) error {
-	if value.Status != "sent" || value.Transport != "mtproto" || value.ChatID != c.ChatID || value.ThreadID != c.ThreadID || value.MessageID <= 0 || int64(value.MessageID) > 1<<31-1 || value.DocumentID == 0 || value.RandomID == 0 || value.ByteSize != cmd.Size || value.SourceSHA256 != cmd.SHA || value.ErrorCode != "" || value.RetryAfter != 0 {
+	if value.Status != "sent" || value.Transport != "mtproto" || value.ChatID != c.ChatID || value.ThreadID != c.ThreadID || value.MessageID <= 0 || int64(value.MessageID) > 1<<31-1 || value.DocumentID == 0 || value.RandomID == 0 || value.ByteSize != cmd.Size || value.SourceSHA256 != cmd.SHA || value.ErrorCode != "" || value.RetryAfter != 0 || value.Phase != "" || value.RPCType != "" {
 		return fail("invalid_receipt")
 	}
 	return nil
@@ -383,8 +388,40 @@ func messageDocument(message tg.MessageClass, c config, id int, expectedSize int
 	return document, nil
 }
 
-func fetchDocument(ctx context.Context, api *tg.Client, c config, id int, expectedSize int64) (*tg.Document, error) {
-	result, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: &tg.InputChannel{ChannelID: channelID(c), AccessHash: 0}, ID: []tg.InputMessageClass{&tg.InputMessageID{ID: id}}})
+// Resolve only the allowlisted peer. A zero hash is used solely for the
+// documented bot bootstrap; subsequent operations require its full access hash.
+func resolveTarget(ctx context.Context, api *tg.Client, c config) (*tg.InputChannel, error) {
+	result, err := api.ChannelsGetChannels(ctx, []tg.InputChannelClass{&tg.InputChannel{ChannelID: channelID(c), AccessHash: 0}})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, fail("target_peer_not_confirmed")
+	}
+	chats := result.GetChats()
+	if len(chats) != 1 {
+		return nil, fail("target_peer_not_confirmed")
+	}
+	channel, ok := chats[0].(*tg.Channel)
+	if !ok || channel.ID != channelID(c) || !channel.Forum || !channel.Megagroup || channel.Left || channel.Min {
+		return nil, fail("target_peer_not_confirmed")
+	}
+	accessHash, hasHash := channel.GetAccessHash()
+	if !hasHash || accessHash == 0 {
+		return nil, fail("target_peer_not_confirmed")
+	}
+	return &tg.InputChannel{ChannelID: channel.ID, AccessHash: accessHash}, nil
+}
+
+func validResolvedTarget(c config, target *tg.InputChannel) bool {
+	return target != nil && target.ChannelID == channelID(c) && target.AccessHash != 0
+}
+
+func fetchDocument(ctx context.Context, api *tg.Client, c config, target *tg.InputChannel, id int, expectedSize int64) (*tg.Document, error) {
+	if !validResolvedTarget(c, target) {
+		return nil, fail("target_peer_not_confirmed")
+	}
+	result, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: target, ID: []tg.InputMessageClass{&tg.InputMessageID{ID: id}}})
 	if err != nil {
 		return nil, err
 	}
@@ -393,6 +430,37 @@ func fetchDocument(ctx context.Context, api *tg.Client, c config, id int, expect
 		return nil, fail("invalid_message_receipt")
 	}
 	return messageDocument(modified.GetMessages()[0], c, id, expectedSize)
+}
+
+// Probe only the configured, known topic-creation message. Its existence does
+// not establish current send permissions or the success of any earlier upload.
+func checkTarget(ctx context.Context, api *tg.Client, c config, target *tg.InputChannel) error {
+	if c.ThreadID == 1 {
+		return fail("general_target_probe_unsupported")
+	}
+	if !validResolvedTarget(c, target) {
+		return fail("target_peer_not_confirmed")
+	}
+	result, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: target, ID: []tg.InputMessageClass{&tg.InputMessageID{ID: c.ThreadID}}})
+	if err != nil {
+		return err
+	}
+	modified, ok := result.AsModified()
+	if !ok || len(modified.GetMessages()) != 1 {
+		return fail("target_topic_not_confirmed")
+	}
+	message, ok := modified.GetMessages()[0].(*tg.MessageService)
+	if !ok || message.ID != c.ThreadID {
+		return fail("target_topic_not_confirmed")
+	}
+	peer, ok := message.PeerID.(*tg.PeerChannel)
+	if !ok || peer.ChannelID != channelID(c) {
+		return fail("target_topic_not_confirmed")
+	}
+	if _, ok := message.Action.(*tg.MessageActionTopicCreate); !ok {
+		return fail("target_topic_not_confirmed")
+	}
+	return nil
 }
 
 func sentMessageID(updates tg.UpdatesClass, c config, randomID int64) (int, error) {
@@ -621,22 +689,66 @@ func safeError(err error, sendAttempted bool) (status, code string, retryAfter i
 	return status, code, 0
 }
 
+func safeRPCType(err error) string {
+	rpc, ok := tgerr.As(err)
+	if !ok {
+		return ""
+	}
+	// Literal protocol names only: never echo arbitrary server error messages,
+	// even when they happen to resemble a valid RPC name.
+	switch rpc.Type {
+	case "CHANNEL_INVALID", "CHANNEL_PRIVATE", "CHAT_ADMIN_REQUIRED", "CHAT_WRITE_FORBIDDEN",
+		"CHAT_SEND_DOCS_FORBIDDEN", "CHAT_RESTRICTED", "CHAT_FORWARDS_RESTRICTED", "PEER_ID_INVALID",
+		"TOPIC_CLOSED", "TOPIC_DELETED", "USER_BANNED_IN_CHANNEL", "REPLY_MESSAGE_ID_INVALID",
+		"MSG_ID_INVALID", "FILE_PARTS_INVALID", "FILE_PART_MISSING", "INPUT_FILE_INVALID",
+		"FILE_REFERENCE_EMPTY", "FILE_REFERENCE_EXPIRED", "DOCUMENT_INVALID", "MEDIA_EMPTY",
+		"MEDIA_INVALID", "MEDIA_FILE_INVALID", "MEDIA_CAPTION_TOO_LONG", "MESSAGE_EMPTY",
+		"MESSAGE_TOO_LONG", "RANDOM_ID_DUPLICATE", "BOT_METHOD_INVALID", "BOT_INVALID",
+		"ACCESS_TOKEN_INVALID", "ACCESS_TOKEN_EXPIRED", "API_ID_INVALID", "AUTH_KEY_INVALID",
+		"AUTH_KEY_UNREGISTERED", "SESSION_REVOKED", "SESSION_EXPIRED", "FLOOD_WAIT", "FLOOD_PREMIUM_WAIT":
+		return rpc.Type
+	}
+	return ""
+}
+
+func diagnosticFailure(result *receipt, err error, phase string, sendAttempted bool) {
+	result.Status, result.ErrorCode, result.RetryAfter = safeError(err, sendAttempted)
+	switch phase {
+	case "session", "connect", "auth", "identity", "resolve_target", "upload", "send_media", "readback", "download_lookup", "download", "check_target":
+		result.Phase = phase
+	default:
+		result.Phase = "transfer"
+	}
+	result.RPCType = safeRPCType(err)
+	if result.RPCType != "" {
+		// The main caller already persists error_code; preserve the diagnostic even
+		// if it ignores these new optional standalone receipt fields.
+		result.ErrorCode = result.Phase + "_" + strings.ToLower(result.RPCType)
+	}
+}
+
 func transfer(ctx context.Context, c config, cmd command) receipt {
 	result := receipt{Status: "failed", Transport: "mtproto", ChatID: c.ChatID, ThreadID: c.ThreadID, ByteSize: cmd.Size, SourceSHA256: cmd.SHA, RandomID: cmd.RandomID}
 	if cmd.Mode == "download" {
 		result = cmd.Saved
 		result.Status = "failed"
 	}
+	if cmd.Mode == "check-target" && c.ThreadID == 1 {
+		diagnosticFailure(&result, fail("general_target_probe_unsupported"), "check_target", false)
+		return result
+	}
 	lock, err := sessionLock(c)
 	if err != nil {
-		result.Status, result.ErrorCode, result.RetryAfter = safeError(err, false)
+		diagnosticFailure(&result, err, "session", false)
 		return result
 	}
 	defer lock.Close()
 	storage := &encryptedSession{c: c}
 	client := telegram.NewClient(c.APIID, c.APIHash, botOptions(storage))
 	sendAttempted := false
+	phase := "connect"
 	err = client.Run(ctx, func(ctx context.Context) error {
+		phase = "auth"
 		status, err := client.Auth().Status(ctx)
 		if err != nil {
 			return err
@@ -646,6 +758,7 @@ func transfer(ctx context.Context, c config, cmd command) receipt {
 				return err
 			}
 		}
+		phase = "identity"
 		self, err := client.Self(ctx)
 		if err != nil {
 			return err
@@ -653,14 +766,29 @@ func transfer(ctx context.Context, c config, cmd command) receipt {
 		if err = verifyBot(self, c); err != nil {
 			return err
 		}
+		phase = "resolve_target"
+		target, err := resolveTarget(ctx, client.API(), c)
+		if err != nil {
+			return err
+		}
+		if cmd.Mode == "check-target" {
+			phase = "check_target"
+			if err = checkTarget(ctx, client.API(), c, target); err != nil {
+				return err
+			}
+			result.Status, result.MessageID, result.Phase = "checked", c.ThreadID, "check_target"
+			return nil
+		}
 		if cmd.Mode == "download" {
-			doc, err := fetchDocument(ctx, client.API(), c, cmd.Saved.MessageID, cmd.Size)
+			phase = "download_lookup"
+			doc, err := fetchDocument(ctx, client.API(), c, target, cmd.Saved.MessageID, cmd.Size)
 			if err != nil {
 				return err
 			}
 			if doc.ID != cmd.Saved.DocumentID {
 				return fail("invalid_document_receipt")
 			}
+			phase = "download"
 			if err = downloadFile(cmd, func(w io.Writer) error {
 				_, err := downloader.NewDownloader().WithPartSize(partSize).Download(client.API(), doc.AsInputDocumentFileLocation("")).Stream(ctx, w)
 				return err
@@ -670,11 +798,12 @@ func transfer(ctx context.Context, c config, cmd command) receipt {
 			result.Status = "downloaded"
 			return nil
 		}
+		phase = "upload"
 		file, name, err := uploadFile(ctx, client.API(), cmd, c.UploadBytesPerSecond)
 		if err != nil {
 			return err
 		}
-		request := &tg.MessagesSendMediaRequest{Peer: &tg.InputPeerChannel{ChannelID: channelID(c), AccessHash: 0},
+		request := &tg.MessagesSendMediaRequest{Peer: &tg.InputPeerChannel{ChannelID: target.ChannelID, AccessHash: target.AccessHash},
 			RandomID: cmd.RandomID, Silent: true,
 			Media:   &tg.InputMediaUploadedDocument{File: file, MimeType: "application/octet-stream", ForceFile: true, Attributes: []tg.DocumentAttributeClass{&tg.DocumentAttributeFilename{FileName: name}}},
 			Message: "Jardulik Companion: полный зашифрованный архив. SHA-256: " + cmd.SHA}
@@ -682,6 +811,7 @@ func transfer(ctx context.Context, c config, cmd command) receipt {
 			request.ReplyTo = &tg.InputReplyToMessage{ReplyToMsgID: c.ThreadID}
 		}
 		sendAttempted = true
+		phase = "send_media"
 		updates, err := client.API().MessagesSendMedia(ctx, request)
 		if err != nil {
 			return err
@@ -691,18 +821,19 @@ func transfer(ctx context.Context, c config, cmd command) receipt {
 			return err
 		}
 		result.MessageID = id // A locator is still useful if readback becomes uncertain.
-		doc, err := fetchDocument(ctx, client.API(), c, id, cmd.Size)
+		phase = "readback"
+		doc, err := fetchDocument(ctx, client.API(), c, target, id, cmd.Size)
 		if err != nil {
 			return err
 		}
 		result.Status, result.MessageID, result.DocumentID = "sent", id, doc.ID
 		return nil
 	})
-	if result.Status == "sent" || result.Status == "downloaded" {
+	if result.Status == "sent" || result.Status == "downloaded" || result.Status == "checked" {
 		return result
 	}
 	if err != nil {
-		result.Status, result.ErrorCode, result.RetryAfter = safeError(err, sendAttempted)
+		diagnosticFailure(&result, err, phase, sendAttempted)
 	}
 	return result
 }
@@ -748,7 +879,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, out io.
 	if writeReceipt(out, result) != nil {
 		return 1
 	}
-	if result.Status == "sent" || result.Status == "downloaded" {
+	if result.Status == "sent" || result.Status == "downloaded" || result.Status == "checked" {
 		return 0
 	}
 	return 1

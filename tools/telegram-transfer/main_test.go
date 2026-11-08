@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
@@ -363,8 +364,13 @@ func TestUploadStreamsAndDetectsSourceChangesBeforeSending(t *testing.T) {
 	}
 	cmd := command{File: path, Size: int64(len(data)), SHA: testSHA(data)}
 	sink := &uploadSink{hash: sha256.New()}
-	if _, name, err := uploadFile(context.Background(), sink, cmd, 0); err != nil || name != "fixture.zip.enc" || sink.size != cmd.Size || hex.EncodeToString(sink.hash.Sum(nil)) != cmd.SHA {
+	uploaded, name, err := uploadFile(context.Background(), sink, cmd, 0)
+	if err != nil || name != "fixture.zip.enc" || sink.size != cmd.Size || hex.EncodeToString(sink.hash.Sum(nil)) != cmd.SHA {
 		t.Fatalf("streamed upload mismatch: %v", err)
+	}
+	big, ok := uploaded.(*tg.InputFileBig)
+	if !ok || big.ID == 0 || big.Parts != (len(data)+partSize-1)/partSize || big.Name != "fixture.zip.enc" {
+		t.Fatal("large upload did not produce the correct InputFileBig contract")
 	}
 	sink = &uploadSink{hash: sha256.New(), call: func() error {
 		f, err := os.OpenFile(path, os.O_WRONLY, 0600)
@@ -580,5 +586,157 @@ func TestUploadRateWaitStopsOnCancellation(t *testing.T) {
 	start := time.Now()
 	if err := waitUploadRate(ctx, time.Hour); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
 		t.Fatal("rate wait ignored context deadline")
+	}
+}
+
+type targetCheckRPC struct {
+	c          config
+	channel    tg.ChatClass
+	message    tg.MessageClass
+	err        error
+	resolveErr error
+	calls      int
+}
+
+func (r *targetCheckRPC) Invoke(_ context.Context, input bin.Encoder, output bin.Decoder) error {
+	r.calls++
+	if request, ok := input.(*tg.ChannelsGetChannelsRequest); ok {
+		if len(request.ID) != 1 {
+			return errors.New("unexpected peer discovery scope")
+		}
+		channel, ok := request.ID[0].(*tg.InputChannel)
+		if !ok || channel.ChannelID != channelID(r.c) || channel.AccessHash != 0 {
+			return errors.New("unexpected peer bootstrap target")
+		}
+		if r.resolveErr != nil {
+			return r.resolveErr
+		}
+		result, ok := output.(*tg.MessagesChatsBox)
+		if !ok {
+			return errors.New("unexpected peer bootstrap response")
+		}
+		result.Chats = &tg.MessagesChats{Chats: []tg.ChatClass{r.channel}}
+		return nil
+	}
+	request, ok := input.(*tg.ChannelsGetMessagesRequest)
+	if !ok {
+		return errors.New("unexpected diagnostic method")
+	}
+	channel, ok := request.Channel.(*tg.InputChannel)
+	if !ok || channel.ChannelID != channelID(r.c) || channel.AccessHash != 987654321 || len(request.ID) != 1 {
+		return errors.New("unexpected diagnostic target")
+	}
+	id, ok := request.ID[0].(*tg.InputMessageID)
+	if !ok || id.ID != r.c.ThreadID {
+		return errors.New("unexpected diagnostic message")
+	}
+	if r.err != nil {
+		return r.err
+	}
+	result, ok := output.(*tg.MessagesMessagesBox)
+	if !ok {
+		return errors.New("unexpected diagnostic response")
+	}
+	result.Messages = &tg.MessagesChannelMessages{Messages: []tg.MessageClass{r.message}}
+	return nil
+}
+
+func testFullChannel(c config) *tg.Channel {
+	channel := &tg.Channel{ID: channelID(c), Forum: true, Megagroup: true}
+	channel.SetAccessHash(987654321)
+	return channel
+}
+
+func TestResolveTargetRequiresExactAccessibleForumAndFullHash(t *testing.T) {
+	c := testConfig(t)
+	rpc := &targetCheckRPC{c: c, channel: testFullChannel(c)}
+	target, err := resolveTarget(context.Background(), tg.NewClient(rpc), c)
+	if err != nil || !validResolvedTarget(c, target) || target.AccessHash != 987654321 || rpc.calls != 1 {
+		t.Fatal("known peer resolution failed")
+	}
+	for name, mutate := range map[string]func(*tg.Channel){
+		"wrong_id": func(c *tg.Channel) { c.ID++ }, "not_forum": func(c *tg.Channel) { c.Forum = false },
+		"not_group": func(c *tg.Channel) { c.Megagroup = false }, "left": func(c *tg.Channel) { c.Left = true },
+		"min": func(c *tg.Channel) { c.Min = true }, "zero_hash": func(c *tg.Channel) { c.SetAccessHash(0) },
+		"missing_hash_flag": func(c *tg.Channel) { c.Flags.Unset(13) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			channel := testFullChannel(c)
+			mutate(channel)
+			rpc := &targetCheckRPC{c: c, channel: channel}
+			if _, err := resolveTarget(context.Background(), tg.NewClient(rpc), c); err == nil || rpc.calls != 1 {
+				t.Fatal("unsafe peer accepted or broad discovery performed")
+			}
+		})
+	}
+	for _, channel := range []tg.ChatClass{&tg.ChannelForbidden{ID: channelID(c), AccessHash: 987654321}, &tg.ChatEmpty{ID: channelID(c)}} {
+		rpc := &targetCheckRPC{c: c, channel: channel}
+		if _, err := resolveTarget(context.Background(), tg.NewClient(rpc), c); err == nil {
+			t.Fatal("forbidden or non-channel peer accepted")
+		}
+	}
+	rpc = &targetCheckRPC{c: c, resolveErr: tgerr.New(400, "CHANNEL_INVALID")}
+	_, err = resolveTarget(context.Background(), tg.NewClient(rpc), c)
+	var diagnostic receipt
+	diagnosticFailure(&diagnostic, err, "resolve_target", false)
+	if rpc.calls != 1 || diagnostic.ErrorCode != "resolve_target_channel_invalid" || diagnostic.Status != "failed" {
+		t.Fatal("failed peer bootstrap was bypassed or obscured")
+	}
+}
+
+func TestCheckTargetOnlyReadsKnownTopicCreationMessage(t *testing.T) {
+	c := testConfig(t)
+	c.ChatID, c.ThreadID = -1004401653948, 2
+	if channelID(c) != 4401653948 {
+		t.Fatal("Bot API to MTProto channel conversion truncated the ID")
+	}
+	message := &tg.MessageService{ID: 2, PeerID: &tg.PeerChannel{ChannelID: 4401653948}, Action: &tg.MessageActionTopicCreate{Title: "private title must not be printed"}}
+	rpc := &targetCheckRPC{c: c, channel: testFullChannel(c), message: message}
+	api := tg.NewClient(rpc)
+	target, err := resolveTarget(context.Background(), api, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkTarget(context.Background(), api, c, target); err != nil || rpc.calls != 2 {
+		t.Fatalf("bounded target probe failed: %v", err)
+	}
+	for _, wrong := range []tg.MessageClass{&tg.MessageEmpty{ID: 2}, &tg.Message{ID: 2}, &tg.MessageService{ID: 3, PeerID: message.PeerID, Action: message.Action}, &tg.MessageService{ID: 2, PeerID: &tg.PeerChannel{ChannelID: 7}, Action: message.Action}, &tg.MessageService{ID: 2, PeerID: message.PeerID}} {
+		rpc = &targetCheckRPC{c: c, message: wrong}
+		if err := checkTarget(context.Background(), tg.NewClient(rpc), c, target); err == nil || rpc.calls != 1 {
+			t.Fatal("unconfirmed topic probe accepted or scanned extra messages")
+		}
+	}
+	general := c
+	general.ThreadID = 1
+	if err := checkTarget(context.Background(), nil, general, nil); err == nil {
+		t.Fatal("General diagnostic guessed a creation message")
+	}
+	if cmd, err := parseCommand([]string{"check-target"}); err != nil || cmd.Mode != "check-target" {
+		t.Fatal("standalone target diagnostic command rejected")
+	}
+	for _, args := range [][]string{{"check-target", "--chat-id", "9"}, {"check-target", "--file", "/private/any"}, {"check-target", "--thread-id", "99"}} {
+		if _, err := parseCommand(args); err == nil {
+			t.Fatal("diagnostic target/file override accepted")
+		}
+	}
+}
+
+func TestDiagnosticFailureExposesOnlyPhaseAndKnownRPCNames(t *testing.T) {
+	r := receipt{MessageID: 77}
+	diagnosticFailure(&r, tgerr.New(400, "PEER_ID_INVALID"), "send_media", true)
+	if r.Status != "uncertain" || r.Phase != "send_media" || r.RPCType != "PEER_ID_INVALID" || r.ErrorCode != "send_media_peer_id_invalid" || r.MessageID != 77 {
+		t.Fatal("safe diagnostic lost phase, server locator or uncertainty")
+	}
+	diagnosticFailure(&r, tgerr.New(403, "CHAT_ADMIN_REQUIRED"), "check_target", false)
+	if r.Status != "failed" || r.ErrorCode != "check_target_chat_admin_required" {
+		t.Fatal("read-only diagnostic classification lost")
+	}
+	secret := "SENSITIVE_" + strings.Repeat("A", 32)
+	for _, err := range []error{tgerr.New(400, secret), errors.New("/bot123456:secret /private/path " + secret), tgerr.New(400, "")} {
+		diagnosticFailure(&r, err, "/private/secret-phase", true)
+		var out bytes.Buffer
+		if writeReceipt(&out, r) != nil || r.Status != "uncertain" || r.Phase != "transfer" || r.RPCType != "" || strings.Contains(out.String(), secret) || strings.Contains(out.String(), "private/") {
+			t.Fatal("diagnostic echoed untrusted error/phase data")
+		}
 	}
 }
