@@ -52,7 +52,11 @@ func (m *MediaManager) CheckDisk() error {
 	}
 	return nil
 }
-func (m *MediaManager) Ensure(ctx context.Context, j MediaJob) (resultErr error) {
+func (m *MediaManager) Ensure(ctx context.Context, j MediaJob) error {
+	return m.ensure(ctx, j, false)
+}
+
+func (m *MediaManager) ensure(ctx context.Context, j MediaJob, background bool) (resultErr error) {
 	mu := m.Store.SessionMutex(j.OwnerID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -87,6 +91,16 @@ func (m *MediaManager) Ensure(ctx context.Context, j MediaJob) (resultErr error)
 		return err
 	}
 	upstreamHeaders(r, m.Config.UserAgent, true)
+	if background {
+		// A job may have been selected just before /pause. Manual delivery stays available.
+		var paused bool
+		if err = m.Store.DB.QueryRowContext(ctx, "SELECT paused FROM users WHERE id=?", j.OwnerID).Scan(&paused); err != nil {
+			return err
+		}
+		if paused {
+			return nil
+		}
+	}
 	defer func() {
 		if resultErr != nil && ctx.Err() == nil {
 			m.Store.MediaFailure(ctx, j.ID, "download_failed")
@@ -158,7 +172,7 @@ func (m *MediaManager) Run(ctx context.Context) {
 		_ = m.Store.CollectOrphans(ctx)
 		j, err := m.Store.PendingMedia(ctx)
 		if err == nil {
-			_ = m.Ensure(ctx, j)
+			_ = m.ensure(ctx, j, true)
 		}
 		timer := time.NewTimer(time.Second)
 		select {

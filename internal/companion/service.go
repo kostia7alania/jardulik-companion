@@ -226,7 +226,17 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		_ = s.TG.Call(ctx, "answerCallbackQuery", map[string]string{"callback_query_id": u.Callback.ID}, nil)
 		parts := strings.Split(u.Callback.Data, ":")
 		if len(parts) == 2 {
-			id, _ := strconv.ParseInt(parts[1], 10, 64)
+			id, err := strconv.ParseInt(parts[1], 10, 64)
+			if err != nil || id < 0 {
+				return
+			}
+			if parts[0] == "lh" || parts[0] == "lf" {
+				s.list(ctx, owner, parts[0] == "lf", id)
+				return
+			}
+			if id == 0 {
+				return
+			}
 			switch parts[0] {
 			case "f":
 				if err := s.Store.Favorite(ctx, owner, id); err != nil {
@@ -245,8 +255,21 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 					s.fullText(ctx, owner, p)
 				}
 			}
-		} else if u.Callback.Data == "next" {
-			s.next(ctx, owner)
+		} else {
+			switch u.Callback.Data {
+			case "next":
+				s.next(ctx, owner)
+			case "favorites":
+				s.list(ctx, owner, true, 0)
+			case "history":
+				s.list(ctx, owner, false, 0)
+			case "status":
+				s.status(ctx, owner)
+			case "connect_help":
+				_ = s.say(ctx, owner, connectHelp, mainButtons())
+			case "help":
+				_ = s.say(ctx, owner, shortHelp, mainButtons())
+			}
 		}
 		return
 	}
@@ -255,19 +278,23 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		return
 	}
 	cmd := strings.Split(fields[0], "@")[0]
-	if strings.HasPrefix(cmd, "/text_") || strings.HasPrefix(cmd, "/fav_") {
-		prefix := "/text_"
-		if strings.HasPrefix(cmd, "/fav_") {
-			prefix = "/fav_"
+	for _, prefix := range []string{"/text_", "/fav_", "/history_"} {
+		if !strings.HasPrefix(cmd, prefix) {
+			continue
 		}
 		id, err := strconv.ParseInt(strings.TrimPrefix(cmd, prefix), 10, 64)
-		if err == nil && id > 0 {
-			if p, err := s.Store.Profile(ctx, owner, id); err == nil {
-				if prefix == "/text_" {
-					s.fullText(ctx, owner, p)
-				} else if s.Store.Favorite(ctx, owner, id) == nil {
-					_ = s.say(ctx, owner, "Сохранено в избранное.", nil)
-				}
+		if err != nil || id <= 0 {
+			return
+		}
+		if prefix == "/history_" {
+			s.history(ctx, owner, id)
+			return
+		}
+		if p, err := s.Store.Profile(ctx, owner, id); err == nil {
+			if prefix == "/text_" {
+				s.fullText(ctx, owner, p)
+			} else if s.Store.Favorite(ctx, owner, id) == nil {
+				_ = s.say(ctx, owner, "Сохранено в избранное.", nil)
 			}
 		}
 		return
@@ -280,23 +307,33 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		}
 		_, _ = s.Store.DB.ExecContext(ctx, "UPDATE users SET source=CASE WHEN source='' THEN ? ELSE source END WHERE id=?", source, owner)
 		s.Store.Event(ctx, owner, "start")
-		_ = s.say(ctx, owner, "Jardulik Companion\n\nАнкеты, фотографии, избранное и история в этом чате. Это независимый помощник.\n\nДля первого подключения нужен URL Jardulik из Telegram Web. Пароль, коды входа и Telegram-сессия не нужны. /connect покажет инструкцию.\n\nСохраняем все анкеты и фотографии, которые Jardulik вернул твоему аккаунту. Оператор имеет доступ к архиву для работы сервиса и модерации; бэкап находится в закрытой Telegram-группе. Другие пользователи твои действия и заметки не видят.\n\nАвтолайки сейчас выключены. /disconnect останавливает доступ к Jardulik, /delete удаляет твои данные из рабочей базы.\n\nПолитика: https://kostia7alania.ru/jardulik-companion-site/privacy.html", nil)
+		_ = s.say(ctx, owner, welcomeText, mainButtons())
 	case "/help":
-		_ = s.say(ctx, owner, connectHelp+"\n/next /status /favorites /history /pause /disconnect /delete\nСвязаться с оператором: /support текст", nil)
+		_ = s.say(ctx, owner, shortHelp, mainButtons())
 	case "/support":
 		text := strings.TrimSpace(strings.TrimPrefix(m.Text, fields[0]))
 		if text == "" {
 			_ = s.say(ctx, owner, "Отправь /support и текст обращения. Его получит оператор сервиса.", nil)
 			return
 		}
-		if owner != s.Config.OwnerID {
-			_ = s.say(ctx, s.Config.OwnerID, fmt.Sprintf("Обращение от Telegram ID %d:\n%s", owner, truncate(text, 2500)), nil)
+		if owner == s.Config.OwnerID {
+			_ = s.say(ctx, owner, "Сообщение уже в чате оператора.", nil)
+			return
+		}
+		excerpt, rest := telegramPrefix(text, 2500)
+		if rest != "" {
+			excerpt += "…"
+		}
+		sent, err := s.TG.SendText(ctx, s.Config.OwnerID, 0, fmt.Sprintf("Обращение от Telegram ID %d:\n%s", owner, excerpt), nil)
+		if err != nil || sent.ID <= 0 || sent.Chat.ID != s.Config.OwnerID {
+			_ = s.say(ctx, owner, "Доставка обращения не подтверждена. Попробуй позже.", nil)
+			return
 		}
 		_ = s.say(ctx, owner, "Обращение передано оператору.", nil)
 	case "/connect":
 		arg := strings.TrimSpace(strings.TrimPrefix(m.Text, fields[0]))
 		if arg == "" {
-			_ = s.say(ctx, owner, connectHelp, nil)
+			_ = s.say(ctx, owner, connectHelp, mainButtons())
 			return
 		}
 		// The launch URL contains a credential. Delete the submitted private message without persisting its body.
@@ -323,13 +360,13 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 	case "/status":
 		s.status(ctx, owner)
 	case "/favorites":
-		s.list(ctx, owner, true)
+		s.list(ctx, owner, true, 0)
 	case "/history":
 		if len(fields) > 1 {
 			id, _ := strconv.ParseInt(fields[1], 10, 64)
 			s.history(ctx, owner, id)
 		} else {
-			s.list(ctx, owner, false)
+			s.list(ctx, owner, false, 0)
 		}
 	case "/text":
 		if len(fields) > 1 {
@@ -374,7 +411,7 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 			n, _ = strconv.ParseInt(fields[1], 10, 64)
 		}
 		if n < 1 || n > 50 {
-			_ = s.say(ctx, owner, "Нужен явный лимит серии: /autolikes N, от 1 до 50.", nil)
+			_ = s.say(ctx, owner, "Укажи /autolikes N, от 1 до 50 обычных лайков. Это предел одной серии бота; он не обозначает Огонь или суточный лимит Jardulik.", nil)
 			return
 		}
 		s.startRun(ctx, owner, int(n))
@@ -403,11 +440,23 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		_ = s.Store.SetMeta(ctx, "source_bot_id", strconv.FormatInt(m.ForwardOrigin.Sender.ID, 10))
 		_ = s.say(ctx, owner, "Источник зарегистрирован. Конфигурация должна совпадать с этим ID.", nil)
 	default:
-		_ = s.say(ctx, owner, connectHelp+"\nКоманды: /next /status /favorites /history /pause /disconnect /delete\nОператору: отправь сообщение командой /support текст.", nil)
+		_ = s.say(ctx, owner, shortHelp, mainButtons())
 	}
 }
 
-const connectHelp = "Подключение Jardulik\n\n1. Открой официальный @jardulik_bot в Telegram Web на компьютере и запусти приложение.\n2. В инструментах разработчика браузера найди iframe с адресом mini.jardulik.app и скопируй полный src, содержащий #tgWebAppData=. Это временный ключ только к Jardulik.\n3. Отправь сюда /connect и ссылку одним сообщением. После обработки сообщение со ссылкой удаляется.\n\nНе присылай пароль, код Telegram, bot token или файлы Telegram-сессии. Ссылка должна принадлежать тому же аккаунту, с которого ты пишешь. Если нет полной ссылки, пока используй официальное приложение."
+const welcomeText = "Jardulik Companion\nНезависимый помощник: анкеты, фото, избранное и история. Выбери действие ниже.\n\nСохраняем полученные анкеты и фото. Оператор имеет доступ к архиву для работы сервиса и модерации; копия хранится в закрытой Telegram-группе. Другие пользователи твою историю не видят.\n\nПолитика: https://kostia7alania.ru/jardulik-companion-site/privacy.html"
+
+const shortHelp = "Выбери действие кнопкой. Для подключения: /connect\n\n/pause останавливает фоновые действия.\n/disconnect отключает Jardulik, архив остаётся.\n/delete удаляет данные из рабочей базы.\nОператору: /support текст"
+
+const connectHelp = "Подключение Jardulik\n\n1. Открой официальный @jardulik_bot в Telegram Web на компьютере и запусти приложение.\n2. В инструментах разработчика браузера найди iframe с адресом mini.jardulik.app и скопируй полный src, содержащий #tgWebAppData=.\n3. Отправь сюда /connect и ссылку одним сообщением. После обработки бот попробует удалить сообщение со ссылкой."
+
+func mainButtons() any {
+	return map[string]any{"inline_keyboard": [][]map[string]string{
+		{{"text": "Следующая анкета", "callback_data": "next"}, {"text": "Избранное", "callback_data": "favorites"}},
+		{{"text": "История", "callback_data": "history"}, {"text": "Аккаунт", "callback_data": "status"}},
+		{{"text": "Подключение", "callback_data": "connect_help"}, {"text": "Помощь", "callback_data": "help"}},
+	}}
+}
 
 func validSource(v string) bool {
 	if len(v) > 64 {
@@ -440,11 +489,22 @@ func (s *Service) status(ctx context.Context, owner int64) {
 	state := "Jardulik не подключён"
 	if err == nil {
 		state = accountSummary(p)
+		for _, field := range []struct{ key, label string }{{"fire", "🔥 Огонь"}, {"clean", "Чистый лист"}} {
+			if value, present := p[field.key]; present && value != nil {
+				if n, e := strconv.ParseInt(valueString(value), 10, 64); e == nil && n >= 0 {
+					state += fmt.Sprintf("\n%s: %d", field.label, n)
+				}
+			}
+		}
 	} else if session, e := s.Store.Session(ctx, owner); e == nil {
 		state = "Состояние сессии: " + session.State
 	}
 	n := s.Store.Counts(ctx, owner)
-	text := fmt.Sprintf("%s\nАнкет: %d, версий: %d\nФото сохранено: %d, в очереди: %d\nИзбранное: %d\nЛайков подтверждено: %d\nАвтолайки: %t", state, n["profiles"], n["versions"], n["photos"], n["pending_photos"], n["favorites"], n["likes"], s.Config.AllowReactions)
+	mode := "выключены"
+	if s.Config.AllowReactions {
+		mode = "включены"
+	}
+	text := fmt.Sprintf("%s\nАнкет: %d, снимков: %d\nФото сохранено: %d, в очереди: %d\nИзбранное: %d\nОтправлено лайков ботом: %d\nАвтолайки: %s", state, n["profiles"], n["versions"], n["photos"], n["pending_photos"], n["favorites"], n["likes"], mode)
 	if owner == s.Config.OwnerID {
 		text += "\nБэкап: " + s.Archiver.BackupStatus(ctx)
 	}
@@ -576,21 +636,44 @@ func (s *Service) Deliver(ctx context.Context, owner int64, p StoredProfile) err
 	s.Store.Event(ctx, owner, "card_delivered")
 	return nil
 }
-func (s *Service) list(ctx context.Context, owner int64, favorites bool) {
-	a, err := s.Store.List(ctx, owner, favorites)
+func (s *Service) list(ctx context.Context, owner int64, favorites bool, before int64) {
+	profiles, err := s.Store.List(ctx, owner, favorites, before)
 	if err != nil {
 		return
 	}
-	if len(a) == 0 {
-		_ = s.say(ctx, owner, "Пока пусто. /next покажет анкеты.", nil)
+	title, prefix := "История анкет", "lh"
+	if favorites {
+		title, prefix = "Избранное", "lf"
+	}
+	if len(profiles) == 0 {
+		_ = s.say(ctx, owner, title+": пока пусто. /next покажет анкеты.", mainButtons())
 		return
 	}
-	var b strings.Builder
-	for _, p := range a {
-		fmt.Fprintf(&b, "%s, %s · #%d\n/history %d\n\n", p.Profile.String("name"), p.Profile.String("age"), p.ID, p.ID)
+	more := len(profiles) > 10
+	if more {
+		profiles = profiles[:10]
 	}
-	_ = s.say(ctx, owner, b.String(), nil)
+	var buttons [][]map[string]string
+	for _, p := range profiles {
+		label := truncateRunes(profileHeading(p.Profile), 64)
+		if label == "" {
+			label = fmt.Sprintf("Анкета #%d", p.ID)
+		}
+		buttons = append(buttons, []map[string]string{{"text": label, "callback_data": fmt.Sprintf("p:%d", p.ID)}, {"text": "История", "callback_data": fmt.Sprintf("h:%d", p.ID)}})
+	}
+	var navigation []map[string]string
+	if before > 0 {
+		navigation = append(navigation, map[string]string{"text": "К началу", "callback_data": prefix + ":0"})
+	}
+	if more {
+		navigation = append(navigation, map[string]string{"text": "Ещё", "callback_data": fmt.Sprintf("%s:%d", prefix, profiles[len(profiles)-1].Cursor)})
+	}
+	if len(navigation) > 0 {
+		buttons = append(buttons, navigation)
+	}
+	_ = s.say(ctx, owner, title+"\nВыбери анкету:", map[string]any{"inline_keyboard": buttons})
 }
+
 func (s *Service) history(ctx context.Context, owner, id int64) {
 	a, err := s.Store.History(ctx, owner, id)
 	if err != nil || len(a) == 0 {
@@ -598,7 +681,7 @@ func (s *Service) history(ctx context.Context, owner, id int64) {
 		return
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Анкета #%d: %s\nСнимков в истории: %d\n", id, a[0].Profile.String("name"), len(a))
+	fmt.Fprintf(&b, "Анкета #%d: %s\nПоказаны последние снимки: %d\n", id, a[0].Profile.String("name"), len(a))
 	for i, p := range a {
 		fmt.Fprintf(&b, "\n%s", displayTime(p.LastSeen))
 		if i+1 < len(a) {
@@ -658,7 +741,7 @@ func (s *Service) startRun(parent context.Context, owner int64, count int) {
 		}
 		_ = s.say(context.WithoutCancel(parent), owner, fmt.Sprintf("Серия завершена. Подтверждено лайков: %d из %d.", done, count), nil)
 	}()
-	_ = s.say(parent, owner, fmt.Sprintf("Запущена серия до %d лайков по текущей выдаче. /pause остановит следующие действия.", count), nil)
+	_ = s.say(parent, owner, fmt.Sprintf("Лимит серии бота: до %d обычных лайков по текущей выдаче. /pause остановит следующие действия.", count), nil)
 }
 
 // WriteRecoveryKey keeps the off-server restore key out of Git and service archives.

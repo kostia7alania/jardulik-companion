@@ -361,21 +361,39 @@ func (s *Store) Favorite(ctx context.Context, owner, id int64) error {
 	_, err := s.DB.ExecContext(ctx, "INSERT OR IGNORE INTO favorites(owner_id,profile_id) VALUES(?,?)", owner, id)
 	return err
 }
-func (s *Store) List(ctx context.Context, owner int64, favorites bool) ([]StoredProfile, error) {
-	q := `SELECT v.id,v.profile_id,v.raw_json,v.first_seen,v.last_seen FROM queue q JOIN versions v ON v.id=q.version_id WHERE q.owner_id=? AND v.owner_id=q.owner_id`
+
+type ProfileListItem struct {
+	StoredProfile
+	Cursor int64
+}
+
+func (s *Store) List(ctx context.Context, owner int64, favorites bool, before int64) ([]ProfileListItem, error) {
+	if before < 0 {
+		return nil, errors.New("invalid list cursor")
+	}
+	q := `SELECT v.id,v.profile_id,v.raw_json,v.first_seen,v.last_seen,q.rowid FROM queue q JOIN versions v ON v.id=q.version_id WHERE q.owner_id=? AND v.owner_id=q.owner_id`
 	if favorites {
 		q += ` AND EXISTS(SELECT 1 FROM favorites f WHERE f.owner_id=v.owner_id AND f.profile_id=v.profile_id)`
 	}
-	q += " ORDER BY v.id DESC LIMIT 10"
-	rows, err := s.DB.QueryContext(ctx, q, owner)
+	args := []any{owner}
+	if before > 0 {
+		q += " AND q.rowid<?"
+		args = append(args, before)
+	}
+	q += " ORDER BY q.rowid DESC LIMIT 11"
+	rows, err := s.DB.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []StoredProfile
+	var out []ProfileListItem
 	for rows.Next() {
-		p, err := scanProfile(rows)
-		if err != nil {
+		var p ProfileListItem
+		var raw string
+		if err := rows.Scan(&p.VersionID, &p.ID, &raw, &p.FirstSeen, &p.LastSeen, &p.Cursor); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(raw), &p.Profile); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -420,7 +438,7 @@ func (s *Store) MediaJobs(ctx context.Context, owner, version int64) ([]MediaJob
 }
 func (s *Store) PendingMedia(ctx context.Context) (MediaJob, error) {
 	var owner, version int64
-	err := s.DB.QueryRowContext(ctx, `SELECT j.owner_id,j.version_id FROM media_jobs j JOIN sessions s ON s.owner_id=j.owner_id WHERE j.state='pending' AND j.next_attempt<=unixepoch() AND s.state='connected' ORDER BY j.id LIMIT 1`).Scan(&owner, &version)
+	err := s.DB.QueryRowContext(ctx, `SELECT j.owner_id,j.version_id FROM media_jobs j JOIN sessions s ON s.owner_id=j.owner_id JOIN users u ON u.id=j.owner_id WHERE u.paused=0 AND j.state='pending' AND j.next_attempt<=unixepoch() AND s.state='connected' ORDER BY j.id LIMIT 1`).Scan(&owner, &version)
 	if err != nil {
 		return MediaJob{}, err
 	}
