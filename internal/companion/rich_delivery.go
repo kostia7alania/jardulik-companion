@@ -22,7 +22,7 @@ func (s *Service) sendCurrentProfileCard(ctx context.Context, owner int64, p Sto
 	if err != nil {
 		return nil, err
 	}
-	m, err := s.TG.SendRichProfileCard(ctx, owner, 0, card, profileButtons(p, len(photoExifBlocks(selectedProfilePhotos(jobs))) > 0, false))
+	m, err := s.TG.SendRichProfileCard(ctx, owner, 0, card, s.privateProfileButtons(ctx, owner, p, len(photoExifBlocks(selectedProfilePhotos(jobs))) > 0, false))
 	var ids []int64
 	if m.ID > 0 {
 		ids = []int64{m.ID}
@@ -72,7 +72,7 @@ func (a *Archiver) sendCurrentProfileCard(ctx context.Context, p StoredProfile, 
 }
 
 // Existing rich cards are edited using confirmed Telegram file IDs, without uploads.
-func richProfileEdit(ctx context.Context, store *Store, tg *Telegram, owner, chat, thread, message int64, p StoredProfile, jobs []MediaJob, link string) (bool, error) {
+func richProfileEdit(ctx context.Context, store *Store, tg *Telegram, owner, chat, thread, message int64, p StoredProfile, jobs []MediaJob, link string, keyboard ...any) (bool, error) {
 	marker, err := loadRichCardMarker(ctx, store, chat, message)
 	if err != nil || marker == nil {
 		return marker != nil || err != nil, err
@@ -89,7 +89,11 @@ func richProfileEdit(ctx context.Context, store *Store, tg *Telegram, owner, cha
 		return true, err
 	}
 	var out SentMessage
-	err = tg.Call(ctx, "editMessageText", map[string]any{"chat_id": chat, "message_id": message, "rich_message": content}, &out)
+	payload := map[string]any{"chat_id": chat, "message_id": message, "rich_message": content}
+	if len(keyboard) > 0 {
+		payload["reply_markup"] = keyboard[0]
+	}
+	err = tg.Call(ctx, "editMessageText", payload, &out)
 	var te *TelegramError
 	if errors.As(err, &te) && te.Code == 400 && strings.Contains(strings.ToLower(te.Description), "message is not modified") {
 		return true, nil

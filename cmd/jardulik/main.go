@@ -100,6 +100,11 @@ func run() error {
 			out["session"] = map[string]any{"tenant": owner, "user_id": session.UserID, "state": session.State, "expires_at": session.Expires, "account": json.RawMessage(session.Account)}
 		}
 		return json.NewEncoder(os.Stdout).Encode(out)
+	case "import-contact":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik import-contact < evidence.json")
+		}
+		return importContactEvidence(ctx, s, owner, os.Stdin, os.Stdout)
 	case "connect":
 		b, err := io.ReadAll(io.LimitReader(os.Stdin, 32*1024+1))
 		if err != nil {

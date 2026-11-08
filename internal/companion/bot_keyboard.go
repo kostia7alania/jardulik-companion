@@ -176,6 +176,9 @@ func (s *Service) showKeyboardMenuLocked(ctx context.Context, owner int64) {
 	if p, err := s.activeKeyboardCard(ctx, owner, 0); err == nil {
 		rows = append(rows, []map[string]string{b("👤 Текущая анкета", fmt.Sprintf("p:%d", p.ID))})
 		rows = append(rows, []map[string]string{b("📄 Полный текст", fmt.Sprintf("t:%d", p.ID)), b("JSON", fmt.Sprintf("jv:%d", p.VersionID))})
+		if button := s.telegramContactButton(ctx, owner, p.ID); button != nil {
+			rows = append(rows, []map[string]string{button})
+		}
 	}
 	rows = append(rows,
 		[]map[string]string{b("⭐ Избранное", "favorites"), b("❤️ Лайки", "likes"), b("💞 Взаимные", "matches")},

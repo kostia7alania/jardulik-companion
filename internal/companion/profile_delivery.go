@@ -37,7 +37,7 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		return nil, err
 	}
 	if len(photos) == 0 {
-		m, e := s.TG.SendText(ctx, owner, 0, card.Text, profileButtons(p, card.Truncated, !card.SourceJSONInline), card.Entities)
+		m, e := s.TG.SendText(ctx, owner, 0, card.Text, s.privateProfileButtons(ctx, owner, p, card.Truncated, !card.SourceJSONInline), card.Entities)
 		if e != nil {
 			return nil, e
 		}
@@ -46,7 +46,7 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		}
 		return []int64{m.ID}, nil
 	}
-	buttons := profileButtons(p, card.Truncated || len(photoExifBlocks(photos)) > 0, !card.SourceJSONInline)
+	buttons := s.privateProfileButtons(ctx, owner, p, card.Truncated || len(photoExifBlocks(photos)) > 0, !card.SourceJSONInline)
 	caption := card.Text
 	var ids []int64
 	for start := 0; start < len(photos); {
@@ -404,7 +404,7 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 				if len(ids) != 1 {
 					return errors.New("rich card inventory is invalid")
 				}
-				_, err := richProfileEdit(ctx, s.Store, s.TG, v.owner, v.owner, 0, ids[0], p, jobs, s.profilePostURL(ctx, v.owner, p))
+				_, err := richProfileEdit(ctx, s.Store, s.TG, v.owner, v.owner, 0, ids[0], p, jobs, s.profilePostURL(ctx, v.owner, p), s.privateProfileButtons(ctx, v.owner, p, len(photoExifBlocks(selectedProfilePhotos(jobs))) > 0, false))
 				return err
 			}
 			photos := selectedProfilePhotos(jobs)
@@ -425,7 +425,7 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 				payload["link_preview_options"] = map[string]bool{"is_disabled": true}
 			}
 			if len(ids) == 1 {
-				payload["reply_markup"] = profileButtons(p, card.Truncated || len(photoExifBlocks(photos)) > 0, !card.SourceJSONInline)
+				payload["reply_markup"] = s.privateProfileButtons(ctx, v.owner, p, card.Truncated || len(photoExifBlocks(photos)) > 0, !card.SourceJSONInline)
 			}
 			var out SentMessage
 			err = s.TG.Call(ctx, method, payload, &out)
