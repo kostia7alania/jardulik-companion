@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -20,8 +21,7 @@ const photoMetadataLimit = 1 << 20
 
 var errPhotoMetadata = errors.New("invalid or oversized photo metadata")
 
-// PhotoMetadata deliberately excludes coordinates, people, serials, comments
-// and opaque MakerNotes. HasGPS means an EXIF GPS pointer is present only.
+// PhotoMetadata excludes people, serials, comments and opaque MakerNotes.
 type PhotoMetadata struct {
 	Format         string  `json:"format"`
 	Width          int     `json:"width,omitempty"`
@@ -29,6 +29,7 @@ type PhotoMetadata struct {
 	HasEXIF        bool    `json:"has_exif"`
 	HasICC         bool    `json:"has_icc"`
 	HasGPS         bool    `json:"has_gps"`
+	GPS            string  `json:"gps,omitempty"`
 	Make           string  `json:"make,omitempty"`
 	Model          string  `json:"model,omitempty"`
 	Lens           string  `json:"lens,omitempty"`
@@ -388,8 +389,13 @@ func (p *photoMetaParser) tiff(start, size int64) error {
 			tag, fieldType := order.Uint16(entry[:2]), order.Uint16(entry[2:4])
 			n, value := order.Uint32(entry[4:8]), order.Uint32(entry[8:12])
 			if tag == 0x8825 {
-				p.meta.HasGPS = p.meta.HasGPS || fieldType == 4 && n == 1 && value != 0
-				continue // Never follow this pointer or read any GPS entry/value.
+				if fieldType == 4 && n == 1 && value != 0 {
+					p.meta.HasGPS = true
+					if err := p.gpsIFD(read, order, value, size, visited, &entries); err != nil {
+						return err
+					}
+				}
+				continue
 			}
 			if tag == 0x8769 && fieldType == 4 && n == 1 {
 				pending = append(pending, ifd{value, current.depth + 1})
@@ -480,6 +486,113 @@ func (p *photoMetaParser) tiff(start, size int64) error {
 		pending = append(pending, ifd{order.Uint32(next), current.depth + 1})
 	}
 	return nil
+}
+
+func (p *photoMetaParser) gpsIFD(read func(uint32, int) ([]byte, error), order binary.ByteOrder, offset uint32, size int64, visited map[uint32]bool, entries *int) error {
+	if offset == 0 {
+		return nil
+	}
+	if len(visited) >= 16 || visited[offset] {
+		return errPhotoMetadata
+	}
+	visited[offset] = true
+	b, err := read(offset, 2)
+	if err != nil {
+		return err
+	}
+	count := int(order.Uint16(b))
+	*entries += count
+	if *entries > 512 || uint64(offset)+2+uint64(count)*12+4 > uint64(size) {
+		return errPhotoMetadata
+	}
+	var latRef, lonRef float64
+	var lat, lon float64
+	var hasLat, hasLon bool
+	for i := 0; i < count; i++ {
+		entry, e := read(offset+2+uint32(i)*12, 12)
+		if e != nil {
+			return e
+		}
+		tag, fieldType := order.Uint16(entry[:2]), order.Uint16(entry[2:4])
+		n, value := order.Uint32(entry[4:8]), order.Uint32(entry[8:12])
+		switch tag {
+		case 0x0001:
+			if fieldType == 2 && n >= 1 && n <= 4 {
+				switch entry[8] {
+				case 'N', 'n':
+					latRef = 1
+				case 'S', 's':
+					latRef = -1
+				}
+			}
+		case 0x0003:
+			if fieldType == 2 && n >= 1 && n <= 4 {
+				switch entry[8] {
+				case 'E', 'e':
+					lonRef = 1
+				case 'W', 'w':
+					lonRef = -1
+				}
+			}
+		case 0x0002:
+			v, ok, e := gpsCoord(read, order, fieldType, n, value, 90)
+			if e != nil {
+				return e
+			}
+			if ok {
+				lat, hasLat = v, true
+			}
+		case 0x0004:
+			v, ok, e := gpsCoord(read, order, fieldType, n, value, 180)
+			if e != nil {
+				return e
+			}
+			if ok {
+				lon, hasLon = v, true
+			}
+		}
+	}
+	if hasLat && hasLon && latRef != 0 && lonRef != 0 && (lat != 0 || lon != 0) {
+		p.meta.GPS = formatGPSCoord(lon*lonRef) + ", " + formatGPSCoord(lat*latRef)
+	}
+	return nil
+}
+
+func gpsCoord(read func(uint32, int) ([]byte, error), order binary.ByteOrder, fieldType uint16, n, offset uint32, limit float64) (float64, bool, error) {
+	if fieldType != 5 || n < 1 || n > 3 {
+		return 0, false, nil
+	}
+	raw, err := read(offset, int(n)*8)
+	if err != nil {
+		return 0, false, err
+	}
+	var total float64
+	scale := 1.0
+	for i := 0; i < int(n); i++ {
+		num := order.Uint32(raw[i*8 : i*8+4])
+		den := order.Uint32(raw[i*8+4 : i*8+8])
+		if den == 0 {
+			return 0, false, nil
+		}
+		part := float64(num) / float64(den)
+		if part < 0 || (i > 0 && part > 60) {
+			return 0, false, nil
+		}
+		total += part / scale
+		scale *= 60
+	}
+	if total > limit || math.IsNaN(total) || math.IsInf(total, 0) {
+		return 0, false, nil
+	}
+	return total, true, nil
+}
+
+func formatGPSCoord(v float64) string {
+	rounded := math.Round(v*1e6) / 1e6
+	if rounded == 0 {
+		rounded = 0
+	}
+	return strconv.FormatFloat(rounded, 'f', -1, 64)
 }
 
 func photoTechnicalString(raw []byte) string {

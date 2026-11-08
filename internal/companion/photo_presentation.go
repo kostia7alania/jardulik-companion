@@ -99,8 +99,11 @@ func photoMetadataRows(photos []MediaJob) []string {
 		if m.Width > 0 && m.Height > 0 {
 			row = fmt.Sprintf("%d×%d", m.Width, m.Height)
 		}
-		if m.HasGPS {
-			row += " · GPS:есть"
+		if m.GPS != "" {
+			if row != "" {
+				row += " · "
+			}
+			row += "GPS: " + m.GPS
 		}
 		if i > 0 && row == previous {
 			rows[len(rows)-1] = fmt.Sprintf("%d-%d:%s", start+1, i+1, row)
@@ -129,12 +132,9 @@ func compactPhotoRows(rows []string, budget int) string {
 	var compact []string
 	for _, row := range rows {
 		tail := ""
-		for _, gps := range []string{" · GPS:есть", " · GPS:нет"} {
-			if strings.HasSuffix(row, gps) {
-				tail = gps
-				row = strings.TrimSuffix(row, gps)
-				break
-			}
+		if i := strings.LastIndex(row, " · GPS:"); i >= 0 && textUnits(row[i:])+4 <= per {
+			tail = row[i:]
+			row = row[:i]
 		}
 		prefix, rest := telegramPrefix(row, per-textUnits(tail)-1)
 		if rest != "" {

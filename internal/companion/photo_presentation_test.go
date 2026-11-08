@@ -117,12 +117,12 @@ func TestPhotoCaptionQuotePreservesFooterAndSafeNumberedOrder(t *testing.T) {
 	}
 }
 
-func TestPhotoRowsAreCompactAndGPSIsOnlyAFlag(t *testing.T) {
+func TestPhotoRowsAreCompactAndIncludeGPSLongitudeLatitude(t *testing.T) {
 	tiff, _ := photoMetaTIFF(binary.LittleEndian)
 	first := MediaJob{Path: photoMetaWrite(t, photoMetaWebP(tiff))}
 	second := photoPresentationSource(t, 1, 4, 5)
 	rows := photoMetadataRows([]MediaJob{first, second})
-	if len(rows) != 2 || rows[0] != "1:32×24 · GPS:есть" || rows[1] != "2:4×5" {
+	if len(rows) != 2 || rows[0] != "1:32×24 · GPS: 44.665544, 43.035994" || rows[1] != "2:4×5" {
 		t.Fatalf("compact photo rows incorrect: %v", rows)
 	}
 }
@@ -141,7 +141,7 @@ func TestPhotoRowsCollapseOnlyConsecutiveEqualSummaries(t *testing.T) {
 	}{
 		{"same three", []MediaJob{plain, plain, plain}, "1-3:900×1200"},
 		{"disjoint", []MediaJob{plain, other, plain, plain}, "1:900×1200\n2:4×5\n3-4:900×1200"},
-		{"different GPS", []MediaJob{noGPS, gps, gps, noGPS}, "1:32×24\n2-3:32×24 · GPS:есть\n4:32×24"},
+		{"different GPS", []MediaJob{noGPS, gps, gps, noGPS}, "1:32×24\n2-3:32×24 · GPS: 44.665544, 43.035994\n4:32×24"},
 		{"one", []MediaJob{plain}, "1:900×1200"},
 		{"unavailable metadata", []MediaJob{missing}, "1:"},
 		{"no photos", nil, ""},
@@ -302,7 +302,7 @@ func TestCaptionIsCompactWhileFullEXIFContainsOnlySourceTags(t *testing.T) {
 	const footer = "\n\nНе указано: рост\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
 	card := photoJSONCardText("Ира, 25"+footer, photos, "\nТекст: /text_99", 1024)
 	quote := photoQuoteText(t, card)
-	if !strings.Contains(quote, "1:32×24 · GPS:есть") || !strings.Contains(quote, "2:4×5") || strings.Contains(quote, "DateTimeOriginal") || strings.Contains(quote, "{") {
+	if !strings.Contains(quote, "1:32×24 · GPS: 44.665544, 43.035994") || !strings.Contains(quote, "2:4×5") || strings.Contains(quote, "DateTimeOriginal") || strings.Contains(quote, "{") {
 		t.Fatalf("main caption contains synthesized JSON: %s", quote)
 	}
 	blocks := photoExifBlocks(photos)

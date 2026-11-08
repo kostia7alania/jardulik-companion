@@ -49,10 +49,22 @@ func photoMetaTIFF(order binary.ByteOrder) ([]byte, []photoMetaRange) {
 		order.PutUint32(b[4:], d)
 		return entry{tag: tag, kind: 5, count: 1, data: b}
 	}
+	dms := func(tag uint16, d, m, s, sd uint32) entry {
+		b := make([]byte, 24)
+		order.PutUint32(b[0:], d)
+		order.PutUint32(b[4:], 1)
+		order.PutUint32(b[8:], m)
+		order.PutUint32(b[12:], 1)
+		order.PutUint32(b[16:], s)
+		order.PutUint32(b[20:], sd)
+		return entry{tag: tag, kind: 5, count: 3, data: b}
+	}
 	root := []entry{ascii(0x010f, "TestMake", false), ascii(0x0110, "TestModel", false), ascii(0x0131, "TestEditor", false), {tag: 0x0112, kind: 3, count: 1, value: 6}, {tag: 0x8825, kind: 4, count: 1}, {tag: 0x8769, kind: 4, count: 1}, ascii(0x013b, "PRIVATE_OWNER_DO_NOT_READ", true), ascii(0x0132, "2022:09:10 11:12:13", false)}
 	exif := []entry{ascii(0x9003, "2021:08:09 10:11:12", false), ascii(0x9011, "+03:00", false), ascii(0xa434, "TestLens", false), rational(0x829a, 1, 125), rational(0x829d, 28, 10), rational(0x920a, 35, 1), {tag: 0x8827, kind: 3, count: 1, value: 400}, ascii(0x927c, "PRIVATE_MAKER_NOTES_DO_NOT_READ", true), ascii(0x9286, "PRIVATE_COMMENT_DO_NOT_READ", true), ascii(0xa431, "PRIVATE_SERIAL_DO_NOT_READ", true), ascii(0x9004, "2021:08:09 10:11:14", false)}
+	gps := []entry{ascii(0x0001, "N", false), dms(0x0002, 43, 2, 958, 100), ascii(0x0003, "E", false), dms(0x0004, 44, 39, 5596, 100), ascii(0x001b, "PRIVATE_GPS_METHOD_DO_NOT_READ", true)}
 	exifOffset := 8 + 2 + len(root)*12 + 4
-	data := make([]byte, exifOffset+2+len(exif)*12+4)
+	gpsOffset := exifOffset + 2 + len(exif)*12 + 4
+	data := make([]byte, gpsOffset+2+len(gps)*12+4)
 	if order == binary.LittleEndian {
 		copy(data, "II")
 	} else {
@@ -60,6 +72,7 @@ func photoMetaTIFF(order binary.ByteOrder) ([]byte, []photoMetaRange) {
 	}
 	order.PutUint16(data[2:], 42)
 	order.PutUint32(data[4:], 8)
+	root[4].value = uint32(gpsOffset)
 	root[5].value = uint32(exifOffset)
 	var forbidden []photoMetaRange
 	writeIFD := func(offset int, entries []entry) {
@@ -69,13 +82,15 @@ func photoMetaTIFF(order binary.ByteOrder) ([]byte, []photoMetaRange) {
 			order.PutUint16(data[at:], e.tag)
 			order.PutUint16(data[at+2:], e.kind)
 			order.PutUint32(data[at+4:], e.count)
-			if e.data != nil {
+			if len(e.data) > 4 {
 				start := len(data)
 				data = append(data, e.data...)
 				order.PutUint32(data[at+8:], uint32(start))
 				if e.private {
 					forbidden = append(forbidden, photoMetaRange{int64(start), int64(len(data))})
 				}
+			} else if len(e.data) > 0 {
+				copy(data[at+8:], e.data)
 			} else if e.kind == 3 {
 				order.PutUint16(data[at+8:], uint16(e.value))
 			} else {
@@ -85,10 +100,7 @@ func photoMetaTIFF(order binary.ByteOrder) ([]byte, []photoMetaRange) {
 	}
 	writeIFD(8, root)
 	writeIFD(exifOffset, exif)
-	gps := len(data)
-	data = append(data, []byte("PRIVATE_GPS_COORDINATE_VALUES_DO_NOT_READ")...)
-	order.PutUint32(data[8+2+4*12+8:], uint32(gps))
-	forbidden = append(forbidden, photoMetaRange{int64(gps), int64(len(data))})
+	writeIFD(gpsOffset, gps)
 	return data, forbidden
 }
 
@@ -153,7 +165,7 @@ func TestPhotoMetadataEndianAndImageContainers(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if m.Format != format || m.Width != 32 || m.Height != 24 || !m.HasEXIF || !m.HasICC || !m.HasGPS || m.Make != "TestMake" || m.Model != "TestModel" || m.Lens != "TestLens" || m.Software != "TestEditor" || m.DateOriginal != "2021:08:09 10:11:12" || m.OffsetOriginal != "+03:00" || m.Exposure != "1/125 s" || m.FNumber != 2.8 || m.FocalLength != 35 || m.ISO != 400 || m.Orientation != 6 {
+				if m.Format != format || m.Width != 32 || m.Height != 24 || !m.HasEXIF || !m.HasICC || !m.HasGPS || m.GPS != "44.665544, 43.035994" || m.Make != "TestMake" || m.Model != "TestModel" || m.Lens != "TestLens" || m.Software != "TestEditor" || m.DateOriginal != "2021:08:09 10:11:12" || m.OffsetOriginal != "+03:00" || m.Exposure != "1/125 s" || m.FNumber != 2.8 || m.FocalLength != 35 || m.ISO != 400 || m.Orientation != 6 {
 					t.Fatalf("technical fields lost: %#v", m)
 				}
 				if m.DateDigitized != "2021:08:09 10:11:14" || m.DateModified != "2022:09:10 11:12:13" {
@@ -168,14 +180,14 @@ func TestPhotoMetadataEndianAndImageContainers(t *testing.T) {
 	}
 }
 
-func TestPhotoMetadataDoesNotReadGPSOrPrivateFieldPayloads(t *testing.T) {
+func TestPhotoMetadataDoesNotReadPrivateFieldPayloads(t *testing.T) {
 	data, private := photoMetaTIFF(binary.LittleEndian)
 	guard := &photoMetaGuard{data: data, forbidden: private}
 	p := photoMetaParser{r: guard, size: int64(len(data))}
 	if err := p.tiff(0, int64(len(data))); err != nil {
 		t.Fatal(err)
 	}
-	if guard.violated || !p.meta.HasGPS || p.meta.Model != "TestModel" {
+	if guard.violated || !p.meta.HasGPS || p.meta.GPS != "44.665544, 43.035994" || p.meta.Model != "TestModel" {
 		t.Fatal("parser followed a private payload or lost safe fields")
 	}
 }
