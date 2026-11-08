@@ -36,7 +36,7 @@ func TestPrivateAlbumLikeTailSharesBodyBudget(t *testing.T) {
 		if long {
 			p.Profile["description"] = strings.Repeat("Биография🙂 ", 300)
 		}
-		photos := []MediaJob{photoPresentationSource(t, 0, 2, 3), photoPresentationSource(t, 1, 4, 5)}
+		photos := []MediaJob{photoPresentationSource(t, 0, 2, 3), photoPresentationSource(t, 1, 2, 3), photoPresentationSource(t, 2, 2, 3)}
 		private, err := renderProfileCard(p, photos, 0, false, "https://t.me/c/123/55", 1024, true)
 		if err != nil {
 			t.Fatal(err)
@@ -48,7 +48,8 @@ func TestPrivateAlbumLikeTailSharesBodyBudget(t *testing.T) {
 		if !strings.Contains(private.Text, "❤️ /like_99 · Избранное: /fav_99") || !strings.Contains(private.Text, "/json_123") || strings.Contains(archive.Text, "/like_") {
 			t.Fatal("album command identity or private scope lost")
 		}
-		if photoQuoteText(t, private) != photoQuoteText(t, archive) || private.Truncated != archive.Truncated || private.SourceJSONInline != archive.SourceJSONInline {
+		quote := photoQuoteText(t, private)
+		if quote != photoQuoteText(t, archive) || private.Truncated != archive.Truncated || private.SourceJSONInline != archive.SourceJSONInline || !strings.Contains(quote, "1-3:2×3") || strings.Contains(quote, "GPS:нет") {
 			t.Fatal("album commands changed shared source body")
 		}
 		for _, card := range []photoText{private, archive} {
@@ -105,7 +106,7 @@ func TestPhotoCaptionQuotePreservesFooterAndSafeNumberedOrder(t *testing.T) {
 	first := photoPresentationSource(t, 0, 2, 3)
 	second := photoPresentationSource(t, 1, 4, 5)
 	rows := photoMetadataRows(selectedProfilePhotos([]MediaJob{second, first}))
-	if len(rows) != 2 || rows[0] != "1:2×3 · GPS:нет" || rows[1] != "2:4×5 · GPS:нет" {
+	if len(rows) != 2 || rows[0] != "1:2×3" || rows[1] != "2:4×5" {
 		t.Fatalf("metadata order/format incorrect: %v", rows)
 	}
 	text := strings.Repeat("🙂<blockquote>О фото</blockquote>", 300) + "\n\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
@@ -121,8 +122,35 @@ func TestPhotoRowsAreCompactAndGPSIsOnlyAFlag(t *testing.T) {
 	first := MediaJob{Path: photoMetaWrite(t, photoMetaWebP(tiff))}
 	second := photoPresentationSource(t, 1, 4, 5)
 	rows := photoMetadataRows([]MediaJob{first, second})
-	if len(rows) != 2 || rows[0] != "1:32×24 · GPS:есть" || rows[1] != "2:4×5 · GPS:нет" {
+	if len(rows) != 2 || rows[0] != "1:32×24 · GPS:есть" || rows[1] != "2:4×5" {
 		t.Fatalf("compact photo rows incorrect: %v", rows)
+	}
+}
+
+func TestPhotoRowsCollapseOnlyConsecutiveEqualSummaries(t *testing.T) {
+	plain := photoPresentationSource(t, 0, 900, 1200)
+	other := photoPresentationSource(t, 0, 4, 5)
+	tiff, _ := photoMetaTIFF(binary.LittleEndian)
+	gps := MediaJob{Path: photoMetaWrite(t, photoMetaWebP(tiff))}
+	noGPS := photoPresentationSource(t, 0, 32, 24)
+	missing := MediaJob{Path: filepath.Join(t.TempDir(), "missing")}
+	for _, test := range []struct {
+		name   string
+		photos []MediaJob
+		want   string
+	}{
+		{"same three", []MediaJob{plain, plain, plain}, "1-3:900×1200"},
+		{"disjoint", []MediaJob{plain, other, plain, plain}, "1:900×1200\n2:4×5\n3-4:900×1200"},
+		{"different GPS", []MediaJob{noGPS, gps, gps, noGPS}, "1:32×24\n2-3:32×24 · GPS:есть\n4:32×24"},
+		{"one", []MediaJob{plain}, "1:900×1200"},
+		{"unavailable metadata", []MediaJob{missing}, "1:"},
+		{"no photos", nil, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := strings.Join(photoMetadataRows(test.photos), "\n"); got != test.want {
+				t.Fatalf("photo rows = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -274,7 +302,7 @@ func TestCaptionIsCompactWhileFullEXIFContainsOnlySourceTags(t *testing.T) {
 	const footer = "\n\nНе указано: рост\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
 	card := photoJSONCardText("Ира, 25"+footer, photos, "\nТекст: /text_99", 1024)
 	quote := photoQuoteText(t, card)
-	if !strings.Contains(quote, "1:32×24 · GPS:есть") || !strings.Contains(quote, "2:4×5 · GPS:нет") || strings.Contains(quote, "DateTimeOriginal") || strings.Contains(quote, "{") {
+	if !strings.Contains(quote, "1:32×24 · GPS:есть") || !strings.Contains(quote, "2:4×5") || strings.Contains(quote, "DateTimeOriginal") || strings.Contains(quote, "{") {
 		t.Fatalf("main caption contains synthesized JSON: %s", quote)
 	}
 	blocks := photoExifBlocks(photos)

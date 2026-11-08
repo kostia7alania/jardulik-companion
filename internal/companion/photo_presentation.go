@@ -91,22 +91,24 @@ func photoJSONCardText(text string, photos []MediaJob, tail string, limit int, s
 
 func photoMetadataRows(photos []MediaJob) []string {
 	var rows []string
+	var previous string
+	start := 0
 	for i, photo := range photos {
-		m, err := ReadPhotoMetadata(photo.Path)
-		row := fmt.Sprintf("%d:", i+1)
+		m, _ := ReadPhotoMetadata(photo.Path)
+		row := ""
 		if m.Width > 0 && m.Height > 0 {
-			row += fmt.Sprintf("%d×%d", m.Width, m.Height)
+			row = fmt.Sprintf("%d×%d", m.Width, m.Height)
 		}
-		gps := ""
 		if m.HasGPS {
-			gps = "есть"
-		} else if err == nil {
-			gps = "нет"
+			row += " · GPS:есть"
 		}
-		if gps != "" {
-			row += " · GPS:" + gps
+		if i > 0 && row == previous {
+			rows[len(rows)-1] = fmt.Sprintf("%d-%d:%s", start+1, i+1, row)
+		} else {
+			start = i
+			rows = append(rows, fmt.Sprintf("%d:%s", i+1, row))
 		}
-		rows = append(rows, row)
+		previous = row
 	}
 	return rows
 }
