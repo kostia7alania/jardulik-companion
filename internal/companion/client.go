@@ -282,17 +282,59 @@ func (c *Client) Users(ctx context.Context, owner int64, page int) ([]Profile, e
 		}
 		filters = *state.Applied
 	}
+	return c.usersPage(ctx, owner, s, filters, page, state.Others)
+}
+
+// UsersFrozen never substitutes mutable account preferences or UI filters.
+func (c *Client) UsersFrozen(ctx context.Context, owner int64, expected Session, filters FeedFilters, page int, others bool) ([]Profile, error) {
+	if page < 1 {
+		return nil, errors.New("invalid discovery page")
+	}
 	if err := filters.validate(); err != nil {
 		return nil, err
 	}
-	q := filters.query(s.UserID, page, state.Others)
-	b, err := c.requestSession(ctx, owner, "GET", "/user/getUsers?"+q.Encode(), nil, &s)
+	s, err := c.Store.Session(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	if s.UserID != expected.UserID || s.Generation != expected.Generation {
+		return nil, errors.New("сессия изменилась; обход остановлен")
+	}
+	account, err := c.Me(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	if number(account["type"]) != 1 {
+		return nil, ErrFiltersPremium
+	}
+	if c.Store.Paused(ctx, owner) {
+		return nil, errors.New("аккаунт на паузе; обход остановлен")
+	}
+	current, err := c.Store.Session(ctx, owner)
+	if err != nil || current.State != "connected" || current.UserID != expected.UserID || current.Generation != expected.Generation {
+		return nil, errors.New("сессия изменилась; обход остановлен")
+	}
+	return c.usersPage(ctx, owner, expected, filters, page, others)
+}
+
+func (c *Client) usersPage(ctx context.Context, owner int64, expected Session, filters FeedFilters, page int, others bool) ([]Profile, error) {
+	if page < 1 {
+		return nil, errors.New("invalid discovery page")
+	}
+	if err := filters.validate(); err != nil {
+		return nil, err
+	}
+	q := filters.query(expected.UserID, page, others)
+	b, err := c.requestSession(ctx, owner, "GET", "/user/getUsers?"+q.Encode(), nil, &expected)
 	if err != nil {
 		return nil, err
 	}
 	current, err := c.Store.Session(ctx, owner)
-	if err != nil || current.Generation != s.Generation || current.UserID != s.UserID {
+	if err != nil || current.Generation != expected.Generation || current.UserID != expected.UserID || current.State != "connected" {
 		return nil, errors.New("сессия изменилась; старый ответ отменён")
+	}
+	if trimmed := bytes.TrimSpace(b); len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, errors.New("Jardulik profile list format changed")
 	}
 	var profiles []Profile
 	d := json.NewDecoder(bytes.NewReader(b))

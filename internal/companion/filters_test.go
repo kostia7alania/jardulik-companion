@@ -461,3 +461,23 @@ func TestFiltersManualDeliveryWithoutFilterTables(t *testing.T) {
 		t.Fatalf("manual delivery unexpectedly requires filter schema: %d %v", tables, err)
 	}
 }
+
+func TestFiltersAgePickerSupportsWideRangeAndKeepsOrdinaryReset(t *testing.T) {
+	s, _, _, _ := filterFixture(t)
+	if err := s.OpenFilters(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	filterTap(t, s, 1, "edit:age")
+	filterTap(t, s, 1, "age:any")
+	filterTap(t, s, 1, "age:min:-1")
+	filterTap(t, s, 1, "age:max:1")
+	state, err := s.Store.filterState(context.Background(), 1)
+	if err != nil || state.Draft.Values.AgeMin != 0 || state.Draft.Values.AgeMax != 100 {
+		t.Fatal("age picker clamped wide bounds")
+	}
+	filterTap(t, s, 1, "reset")
+	state, err = s.Store.filterState(context.Background(), 1)
+	if err != nil || state.Draft.Values != DefaultFeedFilters() {
+		t.Fatal("ordinary reset no longer uses18..60")
+	}
+}

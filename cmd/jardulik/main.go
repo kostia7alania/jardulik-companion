@@ -114,6 +114,24 @@ func run() error {
 		}
 		out := map[string]any{"connected": true, "tenant": owner, "user_id": account.ID(), "type": account["type"], "order_end_date": account["orderEndDate"]}
 		return json.NewEncoder(os.Stdout).Encode(out)
+	case "crawl-request":
+		if len(os.Args) > 3 || (len(os.Args) == 3 && os.Args[2] != "--include-others") {
+			return errors.New("usage: crawl-request [--include-others]")
+		}
+		job, err := s.Crawler.Request(ctx, owner, len(os.Args) == 3)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"crawl": job, "reactions_sent": 0})
+	case "crawl-status":
+		if len(os.Args) != 2 {
+			return errors.New("usage: crawl-status")
+		}
+		job, err := s.Store.CrawlStatus(ctx, owner)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"crawl": job})
 	case "fetch":
 		n, err := s.Fetch(ctx, owner)
 		if err != nil {
@@ -180,7 +198,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
+		return errors.New("commands: serve, connect (URL on stdin), account, fetch, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
 	}
 }
 func main() {

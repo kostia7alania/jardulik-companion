@@ -24,6 +24,7 @@ type Service struct {
 	Media    *MediaManager
 	Archiver *Archiver
 	Watcher  *ProfileWatcher
+	Crawler  *FeedCrawler
 	locks    sync.Map
 	runs     sync.Map
 }
@@ -36,6 +37,7 @@ func NewService(c Config) (*Service, error) {
 	v := &Service{Config: c, Store: s, Client: NewClient(s, c), TG: NewTelegram(c), Media: NewMediaManager(s, c)}
 	v.Archiver = NewArchiver(c, s, v.TG, v.Media)
 	v.Watcher = NewProfileWatcher(c, s, v.Client, v.Archiver)
+	v.Crawler = NewFeedCrawler(v)
 	return v, nil
 }
 func (s *Service) Close() error { return s.Store.Close() }
@@ -71,7 +73,7 @@ func (s *Service) Run(ctx context.Context) error {
 		return err
 	}
 	var background sync.WaitGroup
-	background.Add(4)
+	background.Add(5)
 	go func() { defer background.Done(); s.Media.Run(ctx) }()
 	go func() {
 		defer background.Done()
@@ -81,6 +83,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}()
 	go func() { defer background.Done(); s.runPrivateCardRepair(ctx) }()
 	go func() { defer background.Done(); s.Watcher.Run(ctx) }()
+	go func() { defer background.Done(); s.Crawler.Run(ctx) }()
 	queues := make([]chan Update, 4)
 	var workers sync.WaitGroup
 	for i := range queues {
@@ -134,6 +137,7 @@ func (s *Service) Run(ctx context.Context) error {
 				// Pause is not queued behind a long-running profile fetch.
 				if u.Message != nil && strings.HasPrefix(u.Message.Text, "/pause") {
 					s.Store.Pause(ctx, u.Message.From.ID, true)
+					_ = s.Store.StopCrawl(ctx, u.Message.From.ID, "paused")
 					s.cancelRun(u.Message.From.ID)
 				}
 				select {
@@ -404,6 +408,7 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		}
 	case "/pause":
 		s.Store.Pause(ctx, owner, true)
+		_ = s.Store.StopCrawl(ctx, owner, "paused")
 		s.cancelRun(owner)
 		_ = s.say(ctx, owner, "Действия остановлены. Архив сохранён. /next остаётся ручной командой.", nil)
 	case "/resume":
@@ -411,6 +416,7 @@ func (s *Service) Handle(ctx context.Context, u Update) {
 		_ = s.say(ctx, owner, "Ручной режим доступен. Это не запускает автолайки.", nil)
 	case "/disconnect":
 		s.cancelRun(owner)
+		_ = s.Store.StopCrawl(ctx, owner, "disconnected")
 		err := s.Store.Disconnect(ctx, owner)
 		if err == nil {
 			_ = s.say(ctx, owner, "Сессия удалена. Новые запросы к Jardulik остановлены. Архив доступен через /history; полное удаление: /delete.", nil)
@@ -539,6 +545,9 @@ func (s *Service) status(ctx context.Context, owner int64) {
 	}
 	if s.Watcher != nil {
 		text += "\n" + s.Watcher.Status(ctx, owner)
+	}
+	if job, err := s.Store.CrawlStatus(ctx, owner); err == nil && job != nil {
+		text += "\n" + job.shortStatus()
 	}
 	_ = s.say(ctx, owner, text, nil)
 }

@@ -93,6 +93,9 @@ first cloud attempt remains `uncertain`. A new full backup was sent after the
 resolver fix: 202 profiles, 203 versions and 514 files; its companion post was
 observed in Telegram. Cloud polling/history worked during transfer, with a
 combined cgroup peak of 101,183,488 bytes and zero OOM events under 128 MiB.
-Local full v2 restore passed for the earlier 150 profiles and 388 media. The
-owner then stopped the main service; downloading and restoring the new cloud
-copy remain pending. Unit tests make no Telegram calls.
+Local full v2 restore passed for the earlier 150 profiles and 388 media. Cloud
+copy job 2 (message 788) was subsequently downloaded with an exact encrypted-file
+SHA-256 match, then restored: 202 profiles, 203 versions, 202 nested ZIPs/index
+rows and 514 media, all hashes verified; SQLite integrity and foreign keys passed.
+Restore completed under 128 MiB; its exact peak was not retained. The main
+service was resumed with owner approval. Unit tests make no Telegram calls.

@@ -23,7 +23,7 @@ import (
 
 var ErrFiltersPremium = errors.New("фильтры доступны с Jardulik Premium")
 
-// FeedFilters uses the same query values as Jardulik's public filter sheet.
+// FeedFilters matches Jardulik's feed query fields.
 type FeedFilters struct {
 	AgeMin    int64  `json:"ageMin"`
 	AgeMax    int64  `json:"ageMax"`
@@ -60,7 +60,7 @@ var filterOptions = map[string][]string{
 }
 
 func (f FeedFilters) validate() error {
-	if f.AgeMin < 18 || f.AgeMax < f.AgeMin || f.HeightMin < 100 || f.HeightMax > 250 || f.HeightMin > f.HeightMax {
+	if f.AgeMin < 0 || f.AgeMax > 100 || f.AgeMax < f.AgeMin || f.HeightMin < 100 || f.HeightMax > 250 || f.HeightMin > f.HeightMax {
 		return errors.New("неверный диапазон фильтра")
 	}
 	for field, value := range map[string]string{"goal": f.Goal, "children": f.Children, "worldview": f.Worldview} {
@@ -207,16 +207,26 @@ func (s *Store) applyFilterDraft(ctx context.Context, owner int64, draft filterD
 	if n, err := res.RowsAffected(); err != nil || n != 1 {
 		return errors.New("черновик устарел; открой /filters заново")
 	}
-	if _, err = tx.ExecContext(ctx, "INSERT OR IGNORE INTO feed_filter_pending(owner_id,profile_id) SELECT owner_id,profile_id FROM queue WHERE owner_id=? AND delivered=0", owner); err != nil {
+	if err := stopCrawlTx(ctx, tx, owner, "filters_changed"); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE queue SET delivered=1 WHERE owner_id=? AND delivered=0", owner); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, "UPDATE users SET feed_page=1 WHERE id=?", owner); err != nil {
+	if err := resetFilterQueueTx(ctx, tx, owner); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func resetFilterQueueTx(ctx context.Context, tx *sql.Tx, owner int64) error {
+	if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO feed_filter_pending(owner_id,profile_id) SELECT owner_id,profile_id FROM queue WHERE owner_id=? AND delivered=0", owner); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE queue SET delivered=1 WHERE owner_id=? AND delivered=0", owner); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE users SET feed_page=1 WHERE id=?", owner); err != nil {
+		return err
+	}
+	return nil
 }
 
 // RestoreFilteredBatch is called after archiving a successful discovery response.
@@ -535,9 +545,6 @@ func (s *Service) showFilters(ctx context.Context, owner int64, draft *filterDra
 			min, max, label, unit = f.HeightMin, f.HeightMax, "Рост", "см"
 		}
 		text += fmt.Sprintf("%s: %d-%d %s\n", label, min, max, unit)
-		if field == "age" && (min > 60 || max > 60) {
-			text += "Сейчас сохранён исходный диапазон. Кнопки используют диапазон Jardulik 18-60 лет.\n"
-		}
 		rows = [][]filterButton{
 			{button("От -1", field+":min:-1"), button("От +1", field+":min:1")},
 			{button("До -1", field+":max:-1"), button("До +1", field+":max:1")},
@@ -659,7 +666,7 @@ func (s *Service) FilterCallback(ctx context.Context, owner int64, data string) 
 			return s.showFilters(ctx, owner, draft, field, "")
 		case "age", "height":
 			field := parts[2]
-			lower, upper := int64(18), int64(60)
+			lower, upper := int64(0), int64(100)
 			min, max := &draft.Values.AgeMin, &draft.Values.AgeMax
 			if field == "height" {
 				lower, upper, min, max = 100, 250, &draft.Values.HeightMin, &draft.Values.HeightMax
