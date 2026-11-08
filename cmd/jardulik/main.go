@@ -127,7 +127,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, restore, restore-media, repair-posts (service stopped), version")
+		return errors.New("commands: serve, connect (URL on stdin), account, fetch, status, backup, restore, restore-media, repair-posts, repair-zips, reconcile-albums, version")
 	}
 }
 func main() {

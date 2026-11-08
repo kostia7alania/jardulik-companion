@@ -24,21 +24,7 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 	if err != nil {
 		return nil, err
 	}
-	hasFull := false
-	for _, j := range jobs {
-		if j.Role == "photos" && j.State == "complete" {
-			hasFull = true
-		}
-	}
-	var photos []MediaJob
-	seen := map[string]bool{}
-	for _, j := range jobs {
-		if j.State != "complete" || (hasFull && j.Role != "photos") || seen[j.SHA] {
-			continue
-		}
-		seen[j.SHA] = true
-		photos = append(photos, j)
-	}
+	photos := selectedProfilePhotos(jobs)
 	text := s.cardText(ctx, owner, p)
 	buttons := profileButtons(p)
 	if len(photos) == 0 {
@@ -59,10 +45,12 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		}
 		return []int64{m.ID}, nil
 	}
-	caption := profileCaption(text)
+	tail := ""
 	if len(photos) > 1 {
-		caption = albumProfileCaption(text, p.ID)
+		tail = fmt.Sprintf("\n\nТекст: /text_%d\nИзбранное: /fav_%d · /next", p.ID, p.ID)
 	}
+	card := photoCardText(text, photoMetadataRows(photos), tail, 1024)
+	caption := card.Text
 	var ids []int64
 	for start := 0; start < len(photos); {
 		end := start
@@ -78,7 +66,11 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 			if start == 0 {
 				groupCaption = caption
 			}
-			messages, e := s.TG.SendAlbum(ctx, owner, 0, paths, groupCaption)
+			var entities []MessageEntity
+			if start == 0 {
+				entities = card.Entities
+			}
+			messages, e := s.TG.SendAlbum(ctx, owner, 0, paths, groupCaption, entities)
 			for _, m := range messages {
 				if m.ID > 0 {
 					ids = append(ids, m.ID)
@@ -102,7 +94,11 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 			keyboard = buttons
 		}
 		var m SentMessage
-		m, err = s.TG.SendPhotoCard(ctx, owner, 0, j.Path, singleCaption, keyboard)
+		var entities []MessageEntity
+		if start == 0 {
+			entities = card.Entities
+		}
+		m, err = s.TG.SendPhotoCard(ctx, owner, 0, j.Path, singleCaption, keyboard, entities)
 		if err != nil {
 			return ids, err
 		}
@@ -119,14 +115,22 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 }
 
 func (s *Service) fullText(ctx context.Context, chat int64, p StoredProfile) {
-	text := s.cardText(ctx, chat, p)
-	for text != "" {
-		part, rest := telegramPrefix(text, 3900)
-		if _, err := s.TG.SendText(ctx, chat, 0, part, nil); err != nil {
+	var owner int64
+	if err := s.Store.DB.QueryRowContext(ctx, "SELECT owner_id FROM versions WHERE id=? AND profile_id=?", p.VersionID, p.ID).Scan(&owner); err != nil {
+		return
+	}
+	jobs, err := s.Store.MediaJobs(ctx, owner, p.VersionID)
+	if err != nil {
+		return
+	}
+	value := fullPhotoText(s.cardText(ctx, chat, p), photoMetadataRows(selectedProfilePhotos(jobs)))
+	for value.Text != "" {
+		part, rest := photoTextPart(value, 3900)
+		if _, err := s.TG.SendText(ctx, chat, 0, part.Text, nil, part.Entities); err != nil {
 			return
 		}
-		text = rest
-		if text != "" && !sleep(ctx, time.Second) {
+		value = rest
+		if value.Text != "" && !sleep(ctx, time.Second) {
 			return
 		}
 	}
@@ -374,12 +378,17 @@ func (s *Service) RefreshCardCaptions(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			text := s.cardText(ctx, v.owner, p)
-			caption := profileCaption(text)
-			payload := map[string]any{"chat_id": v.owner, "message_id": ids[0], "caption": caption}
+			jobs, err := s.Store.MediaJobs(ctx, v.owner, p.VersionID)
+			if err != nil {
+				return err
+			}
+			tail := ""
 			if len(ids) > 1 {
-				payload["caption"] = albumProfileCaption(text, p.ID)
-			} else {
+				tail = fmt.Sprintf("\n\nТекст: /text_%d\nИзбранное: /fav_%d · /next", p.ID, p.ID)
+			}
+			card := photoCardText(s.cardText(ctx, v.owner, p), photoMetadataRows(selectedProfilePhotos(jobs)), tail, 1024)
+			payload := map[string]any{"chat_id": v.owner, "message_id": ids[0], "caption": card.Text, "caption_entities": card.Entities}
+			if len(ids) == 1 {
 				payload["reply_markup"] = profileButtons(p)
 			}
 			var out SentMessage

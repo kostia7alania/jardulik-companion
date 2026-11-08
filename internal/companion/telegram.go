@@ -50,6 +50,21 @@ type Document struct {
 	Size     int64  `json:"file_size"`
 	Name     string `json:"file_name"`
 }
+type MessageEntity struct {
+	Type   string `json:"type"`
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+}
+
+func validMessageEntities(text string, entities []MessageEntity) error {
+	for _, e := range entities {
+		if e.Type != "expandable_blockquote" || e.Offset < 0 || e.Length <= 0 || e.Offset > textUnits(text)-e.Length {
+			return errors.New("invalid Telegram message entity")
+		}
+	}
+	return nil
+}
+
 type SentMessage struct {
 	ID       int64     `json:"message_id"`
 	ThreadID int64     `json:"message_thread_id"`
@@ -216,7 +231,17 @@ func (t *Telegram) SendDocument(ctx context.Context, chat, thread int64, path, c
 func (t *Telegram) SendPhoto(ctx context.Context, chat, thread int64, path, caption string) (SentMessage, error) {
 	return t.Upload(ctx, "sendPhoto", chat, thread, path, caption, "photo")
 }
-func (t *Telegram) SendPhotoCard(ctx context.Context, chat, thread int64, path, caption string, keyboard any) (SentMessage, error) {
+func (t *Telegram) SendPhotoCard(ctx context.Context, chat, thread int64, path, caption string, keyboard any, entities ...[]MessageEntity) (SentMessage, error) {
+	if len(entities) > 0 && len(entities[0]) > 0 {
+		if err := validMessageEntities(caption, entities[0]); err != nil {
+			return SentMessage{}, err
+		}
+		data, err := json.Marshal(entities[0])
+		if err != nil {
+			return SentMessage{}, err
+		}
+		return t.upload(ctx, "sendPhoto", chat, thread, path, caption, "photo", keyboard, map[string]string{"caption_entities": string(data)})
+	}
 	return t.upload(ctx, "sendPhoto", chat, thread, path, caption, "photo", keyboard)
 }
 func (t *Telegram) SendDocumentCard(ctx context.Context, chat, thread int64, path, caption string, keyboard any) (SentMessage, error) {
@@ -225,7 +250,7 @@ func (t *Telegram) SendDocumentCard(ctx context.Context, chat, thread int64, pat
 
 // EditDocument replaces the ZIP in its existing post, keeping topic ordering.
 // Unknown transport outcomes are returned for reconciliation, never retried.
-func (t *Telegram) EditDocument(ctx context.Context, chat, messageID int64, path, caption string) (SentMessage, error) {
+func (t *Telegram) EditDocument(ctx context.Context, chat, messageID int64, path, caption string, keyboard ...any) (SentMessage, error) {
 	if chat == 0 || messageID <= 0 {
 		return SentMessage{}, errors.New("invalid document edit target")
 	}
@@ -233,7 +258,11 @@ func (t *Telegram) EditDocument(ctx context.Context, chat, messageID int64, path
 	if err != nil {
 		return SentMessage{}, err
 	}
-	m, err := t.upload(ctx, "editMessageMedia", chat, 0, path, "", "archive", nil, map[string]string{"message_id": strconv.FormatInt(messageID, 10), "media": string(media)})
+	var markup any
+	if len(keyboard) > 0 {
+		markup = keyboard[0]
+	}
+	m, err := t.upload(ctx, "editMessageMedia", chat, 0, path, "", "archive", markup, map[string]string{"message_id": strconv.FormatInt(messageID, 10), "media": string(media)})
 	if err != nil {
 		return m, err
 	}
@@ -244,9 +273,14 @@ func (t *Telegram) EditDocument(ctx context.Context, chat, messageID int64, path
 }
 
 // SendAlbum uploads local photos once. A transport error leaves delivery unknown.
-func (t *Telegram) SendAlbum(ctx context.Context, chat, thread int64, paths []string, caption string) (out []SentMessage, retErr error) {
+func (t *Telegram) SendAlbum(ctx context.Context, chat, thread int64, paths []string, caption string, entities ...[]MessageEntity) (out []SentMessage, retErr error) {
 	if len(paths) < 2 || len(paths) > 10 {
 		return nil, errors.New("Telegram photo album requires 2 to 10 files")
+	}
+	if len(entities) > 0 {
+		if err := validMessageEntities(caption, entities[0]); err != nil {
+			return nil, err
+		}
 	}
 	if utf8.RuneCountInString(caption) > 1024 {
 		return nil, errors.New("Telegram album caption exceeds 1024 characters")
@@ -259,9 +293,10 @@ func (t *Telegram) SendAlbum(ctx context.Context, chat, thread int64, paths []st
 	}()
 	sizes := make([]int64, 0, len(paths))
 	media := make([]struct {
-		Type    string `json:"type"`
-		Media   string `json:"media"`
-		Caption string `json:"caption,omitempty"`
+		Type     string          `json:"type"`
+		Media    string          `json:"media"`
+		Caption  string          `json:"caption,omitempty"`
+		Entities []MessageEntity `json:"caption_entities,omitempty"`
 	}, len(paths))
 	for i, path := range paths {
 		info, err := os.Stat(path)
@@ -282,6 +317,9 @@ func (t *Telegram) SendAlbum(ctx context.Context, chat, thread int64, paths []st
 		media[i].Media = "attach://photo" + strconv.Itoa(i)
 	}
 	media[0].Caption = caption
+	if len(entities) > 0 {
+		media[0].Entities = entities[0]
+	}
 	mediaJSON, err := json.Marshal(media)
 	if err != nil {
 		return nil, errors.New("invalid Telegram album media")
@@ -366,9 +404,15 @@ func (t *Telegram) SendAlbum(ctx context.Context, chat, thread int64, paths []st
 	return out, nil
 }
 
-func (t *Telegram) SendText(ctx context.Context, chat, thread int64, text string, keyboard any) (SentMessage, error) {
+func (t *Telegram) SendText(ctx context.Context, chat, thread int64, text string, keyboard any, entities ...[]MessageEntity) (SentMessage, error) {
 	var out SentMessage
 	p := map[string]any{"chat_id": chat, "text": text, "link_preview_options": map[string]bool{"is_disabled": true}}
+	if len(entities) > 0 && len(entities[0]) > 0 {
+		if err := validMessageEntities(text, entities[0]); err != nil {
+			return out, err
+		}
+		p["entities"] = entities[0]
+	}
 	if thread > 0 {
 		p["message_thread_id"] = thread
 	}

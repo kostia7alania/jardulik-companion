@@ -137,11 +137,14 @@ func TestPhotoAndDescriptionOneCard(t *testing.T) {
 					}
 					fmt.Fprint(w, `{"ok":true,"result":{"message_id":20,"chat":{"id":1,"type":"private"}}}`)
 				} else {
-					var media []map[string]string
+					var media []struct {
+						Caption  string          `json:"caption"`
+						Entities []MessageEntity `json:"caption_entities"`
+					}
 					if err := json.Unmarshal([]byte(r.FormValue("media")), &media); err != nil {
 						t.Fatal(err)
 					}
-					if len(media) != 3 || !strings.Contains(media[0]["caption"], "Полное описание") || media[1]["caption"] != "" {
+					if len(media) != 3 || !strings.Contains(media[0].Caption, "Полное описание") || media[1].Caption != "" {
 						t.Fatal("album caption misplaced")
 					}
 					fmt.Fprint(w, `{"ok":true,"result":[{"message_id":20,"chat":{"id":1}},{"message_id":21,"chat":{"id":1}},{"message_id":22,"chat":{"id":1}}]}`)
@@ -235,11 +238,14 @@ func TestAlbumKeepsFullTextAccessibleWithoutMarkup(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer r.MultipartForm.RemoveAll()
-		var media []map[string]string
+		var media []struct {
+			Caption  string          `json:"caption"`
+			Entities []MessageEntity `json:"caption_entities"`
+		}
 		if err := json.Unmarshal([]byte(r.FormValue("media")), &media); err != nil {
 			t.Fatal(err)
 		}
-		caption := media[0]["caption"]
+		caption := media[0].Caption
 		if !strings.Contains(caption, "/text_10") || !strings.Contains(caption, "/fav_10") {
 			t.Fatal("full text inaccessible")
 		}
