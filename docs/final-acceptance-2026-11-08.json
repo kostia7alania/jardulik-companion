@@ -1,0 +1,22 @@
+{
+  "archive": {
+    "at": "2026-11-08T05:20:49.388449+00:00",
+    "repacked_checked": 149,
+    "photo_entries_checked": 386,
+    "media_extensions": [
+      ".webp"
+    ],
+    "all_raw_json_unchanged": true,
+    "all_photo_bytes_unchanged": true,
+    "primary_capture_metadata_omitted": true
+  },
+  "key_only_restore": {
+    "verified_at": "2026-11-08T05:31:25.245362+00:00",
+    "only_recovery_key_required": true,
+    "service_credentials_removed_from_environment": true,
+    "database_quick_check": "ok",
+    "profiles": 150,
+    "recovery_config_restored": true,
+    "release": "4b199a928b775dfb2eea9728d630fa5118e68db8"
+  }
+}
