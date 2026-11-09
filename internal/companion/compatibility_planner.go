@@ -191,10 +191,15 @@ func (s *Store) enqueueCompatibility(ctx context.Context, j CompatibilityJob, no
 		return tx.Commit()
 	}
 	var existing int64
-	var state string
+	var state, reason string
+	var nextAt int64
 	var savedAnalysis sql.NullInt64
-	err = tx.QueryRowContext(ctx, "SELECT id,state,analysis_id FROM compatibility_jobs WHERE pair_id=? AND input_hash=?", j.PairID, j.InputHash).Scan(&existing, &state, &savedAnalysis)
+	err = tx.QueryRowContext(ctx, "SELECT id,state,analysis_id,reason,next_at_ms FROM compatibility_jobs WHERE pair_id=? AND input_hash=?", j.PairID, j.InputHash).Scan(&existing, &state, &savedAnalysis, &reason, &nextAt)
 	if err == nil {
+		// An unavailable profile is checked again by the daily cycle, not every planner tick.
+		if state == "cancelled" && reason == "target_unavailable" && nextAt > now.UnixMilli() {
+			return tx.Commit()
+		}
 		if state == "succeeded" && savedAnalysis.Valid {
 			_, err = tx.ExecContext(ctx, "UPDATE compatibility_pairs SET latest_analysis_id=?,updated_at_ms=? WHERE id=? AND (latest_analysis_id IS NULL OR latest_analysis_id<>?)", savedAnalysis.Int64, now.UnixMilli(), j.PairID, savedAnalysis.Int64)
 		} else if state == "queued" || state == "cancelled" {

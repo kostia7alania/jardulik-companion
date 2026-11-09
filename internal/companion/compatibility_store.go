@@ -375,7 +375,8 @@ func (s *Store) FinishCompatibilityJob(ctx context.Context, j CompatibilityJob, 
 	if state == "cancelled" {
 		previous = "preparing"
 	}
-	result, err := tx.ExecContext(ctx, "UPDATE compatibility_jobs SET state=?,http_status=?,response_body=?,analysis_id=?,reason=?,updated_at_ms=? WHERE id=? AND pair_id=? AND state=?", state, status, response, analysis, reason, now.UnixMilli(), j.ID, j.PairID, previous)
+	unavailable := state == "cancelled" && reason == "target_unavailable"
+	result, err := tx.ExecContext(ctx, "UPDATE compatibility_jobs SET state=?,http_status=?,response_body=?,analysis_id=?,reason=?,next_at_ms=CASE WHEN ? THEN ? ELSE next_at_ms END,updated_at_ms=? WHERE id=? AND pair_id=? AND state=?", state, status, response, analysis, reason, unavailable, now.Add(24*time.Hour).UnixMilli(), now.UnixMilli(), j.ID, j.PairID, previous)
 	if err != nil {
 		return err
 	}

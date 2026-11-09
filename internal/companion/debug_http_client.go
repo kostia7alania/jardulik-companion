@@ -138,6 +138,9 @@ func (c *Client) debugExchange(ctx context.Context, ss Session, method, path str
 		wait, _ := strconv.Atoi(response.Header.Get("Retry-After"))
 		return response.StatusCode, raw, &UpstreamError{Status: response.StatusCode, Kind: kind, RetryAfter: time.Duration(wait) * time.Second}
 	}
+	if profileNoContent(method, path, response.StatusCode, response.Header.Get("Content-Type"), raw) {
+		return response.StatusCode, raw, ErrProfileUnavailable
+	}
 	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/html") || !json.Valid(raw) {
 		return response.StatusCode, raw, &UpstreamError{Status: response.StatusCode, Kind: "unexpected_response_or_challenge"}
 	}

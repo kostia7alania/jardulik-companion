@@ -98,10 +98,19 @@ func (c *Client) exchange(ctx context.Context, method, path, token string, paylo
 		}
 		return nil, &UpstreamError{Status: res.StatusCode, Kind: kind, RetryAfter: d, Endpoint: strings.SplitN(path, "?", 2)[0]}
 	}
+	if profileNoContent(method, path, res.StatusCode, res.Header.Get("Content-Type"), b) {
+		return nil, ErrProfileUnavailable
+	}
 	if strings.Contains(strings.ToLower(res.Header.Get("Content-Type")), "text/html") || !json.Valid(b) {
 		return nil, &UpstreamError{Status: res.StatusCode, Kind: "unexpected_response_or_challenge", Endpoint: strings.SplitN(path, "?", 2)[0]}
 	}
 	return b, nil
+}
+
+func profileNoContent(method, path string, status int, contentType string, body []byte) bool {
+	return method == http.MethodGet && strings.SplitN(path, "?", 2)[0] == "/user/getUser" &&
+		status == http.StatusNoContent && len(bytes.TrimSpace(body)) == 0 &&
+		!strings.Contains(strings.ToLower(contentType), "text/html")
 }
 
 // URL errors can contain credentials in paths. Never propagate them into chat or logs.

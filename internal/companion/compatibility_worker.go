@@ -106,7 +106,7 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 	_, targetRaw, err := s.Client.debugRead(ctx, job.OwnerID, session, "/user/getUser?viewerUserId="+strconv.FormatInt(job.FromUserID, 10)+"&targetUserId="+strconv.FormatInt(job.TargetUserID, 10))
 	if err != nil {
 		var upstream *UpstreamError
-		if errors.As(err, &upstream) && upstream.Status == http.StatusNotFound {
+		if errors.Is(err, ErrProfileUnavailable) || errors.As(err, &upstream) && (upstream.Status == http.StatusNotFound || upstream.Status == http.StatusGone) {
 			return settle("cancelled", "target_unavailable")
 		}
 		return settle("queued", "preflight_unavailable")

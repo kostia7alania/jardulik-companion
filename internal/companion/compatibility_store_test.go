@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 	"testing"
 	"time"
@@ -325,5 +326,85 @@ func TestCompatibilityStoreRechecksManualAnalysisBeforePost(t *testing.T) {
 	}
 	if s.Store.Meta(ctx, "compatibility_next_at_ms") != next {
 		t.Fatal("cache hit consumed POST cooldown")
+	}
+}
+
+func TestCompatibilityStoreUnavailableTargetWaitsForDailyRetry(t *testing.T) {
+	s, now := compatibilityFixture(t)
+	ctx := context.Background()
+	s.Client.HTTP.Transport = archiveRoundTripper(func(*http.Request) (*http.Response, error) { t.Fatal("store/planner attempted HTTP"); return nil, nil })
+	p := compatibilityAdd(t, s, 1, 7, 23)
+	compatibilityQueue(t, s, 1, p, now)
+	j := compatibilityClaim(t, s, now)
+	if err := s.Store.FinishCompatibilityJob(ctx, *j, "cancelled", 0, nil, 0, "target_unavailable", now); err != nil {
+		t.Fatal(err)
+	}
+	due := now.Add(24 * time.Hour).UnixMilli()
+	check := func(wantState string) {
+		t.Helper()
+		var state, reason string
+		var next int64
+		var request []byte
+		if err := s.Store.DB.QueryRowContext(ctx, "SELECT state,reason,next_at_ms,request_body FROM compatibility_jobs WHERE id=?", j.ID).Scan(&state, &reason, &next, &request); err != nil {
+			t.Fatal(err)
+		}
+		if state != wantState {
+			t.Fatalf("state=%s want=%s", state, wantState)
+		}
+		if wantState == "cancelled" && (reason != "target_unavailable" || next != due || len(request) != 0) {
+			t.Fatalf("unavailable retry lost state: reason=%s due=%d request=%q", reason, next, request)
+		}
+	}
+	for _, elapsed := range []time.Duration{time.Minute, time.Hour, 23 * time.Hour} {
+		if err := s.planCompatibility(ctx, now.Add(elapsed)); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.planCompatibility(ctx, now.Add(elapsed)); err != nil {
+			t.Fatal(err)
+		}
+		check("cancelled")
+		if got, err := s.Store.ClaimCompatibilityJob(ctx, now.Add(elapsed)); err != nil || got != nil {
+			t.Fatal("unavailable target retried before daily bound", got, err)
+		}
+	}
+	compatibilityQueue(t, s, 1, p, now.Add(24*time.Hour-time.Millisecond))
+	check("cancelled")
+	compatibilityQueue(t, s, 1, p, now.Add(24*time.Hour))
+	check("queued")
+	next := compatibilityClaim(t, s, now.Add(24*time.Hour))
+	if next.ID != j.ID {
+		t.Fatal("daily retry replaced historical job", next.ID, j.ID)
+	}
+}
+
+func TestCompatibilityStoreChangedTargetCanBypassUnavailableCooldown(t *testing.T) {
+	s, now := compatibilityFixture(t)
+	ctx := context.Background()
+	p := compatibilityAdd(t, s, 1, 7, 23)
+	compatibilityQueue(t, s, 1, p, now)
+	j := compatibilityClaim(t, s, now)
+	if err := s.Store.FinishCompatibilityJob(ctx, *j, "cancelled", 0, nil, 0, "target_unavailable", now); err != nil {
+		t.Fatal(err)
+	}
+	p.Profile["description"] = "profile returned with an update"
+	if _, err := s.Store.ArchiveViewed(ctx, 1, []Profile{p.Profile}, "GET /user/getUser"); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := s.Store.Profile(ctx, 1, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compatibilityQueue(t, s, 1, changed, now.Add(time.Minute))
+	next := compatibilityClaim(t, s, now.Add(time.Minute))
+	if next.ID == j.ID || next.InputHash == j.InputHash {
+		t.Fatal("changed profile reused unavailable input")
+	}
+	var oldState string
+	var oldDue int64
+	if err = s.Store.DB.QueryRowContext(ctx, "SELECT state,next_at_ms FROM compatibility_jobs WHERE id=?", j.ID).Scan(&oldState, &oldDue); err != nil {
+		t.Fatal(err)
+	}
+	if oldState != "cancelled" || oldDue != now.Add(24*time.Hour).UnixMilli() {
+		t.Fatal("new input rewrote old unavailable result")
 	}
 }
