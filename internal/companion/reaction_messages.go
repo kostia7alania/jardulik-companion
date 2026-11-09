@@ -7,6 +7,7 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -14,7 +15,7 @@ const reactionMessageSchema = `
 CREATE TABLE IF NOT EXISTS reaction_message_settings (
  owner_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
  mode TEXT NOT NULL DEFAULT 'off' CHECK(mode IN ('off','first','rotate','birthday')),
- templates_json TEXT NOT NULL DEFAULT '[]', telegram_username TEXT NOT NULL DEFAULT '', next_cursor INTEGER NOT NULL DEFAULT 0 CHECK(next_cursor>=0),
+ templates_json TEXT NOT NULL DEFAULT '[]', telegram_username TEXT NOT NULL DEFAULT '', prefer_drafts INTEGER NOT NULL DEFAULT 0 CHECK(prefer_drafts IN (0,1)), next_cursor INTEGER NOT NULL DEFAULT 0 CHECK(next_cursor>=0),
  revision INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS reaction_message_intents (
@@ -36,6 +37,8 @@ type ReactionMessagePolicy struct {
 	Mode             string   `json:"mode"`
 	Templates        []string `json:"templates"`
 	TelegramUsername string   `json:"telegram_username"`
+	PreferDrafts     bool     `json:"prefer_drafts"`
+	Selection        string   `json:"selection"`
 	NextCursor       int64    `json:"next_cursor"`
 	Revision         int64    `json:"revision"`
 }
@@ -69,14 +72,33 @@ func validateReactionMessagePolicy(mode string, templates []string, telegramUser
 }
 
 func (s *Store) initReactionMessages(ctx context.Context) error {
-	_, err := s.DB.ExecContext(ctx, reactionMessageSchema)
-	return err
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='reaction_message_settings'"); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, reactionMessageSchema+reactionMessageDraftTable); err != nil {
+		return err
+	}
+	var present int
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_settings') WHERE name='prefer_drafts'").Scan(&present); err != nil {
+		return err
+	}
+	if present == 0 {
+		if _, err = tx.ExecContext(ctx, "ALTER TABLE reaction_message_settings ADD COLUMN prefer_drafts INTEGER NOT NULL DEFAULT 0 CHECK(prefer_drafts IN (0,1))"); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func scanReactionMessagePolicy(row interface{ Scan(...any) error }, owner int64) (ReactionMessagePolicy, error) {
-	p := ReactionMessagePolicy{OwnerID: owner, Mode: "off", Templates: []string{}}
+	p := ReactionMessagePolicy{OwnerID: owner, Mode: "off", Templates: []string{}, Selection: "off"}
 	var raw string
-	err := row.Scan(&p.Mode, &raw, &p.TelegramUsername, &p.NextCursor, &p.Revision)
+	err := row.Scan(&p.Mode, &raw, &p.TelegramUsername, &p.PreferDrafts, &p.NextCursor, &p.Revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, nil
 	}
@@ -92,6 +114,13 @@ func scanReactionMessagePolicy(row interface{ Scan(...any) error }, owner int64)
 	if err = validateReactionMessagePolicy(p.Mode, p.Templates, p.TelegramUsername); err != nil {
 		return p, err
 	}
+	if p.PreferDrafts && p.Mode != "birthday" {
+		return p, errors.New("reviewed drafts require birthday fallback mode")
+	}
+	p.Selection = p.Mode
+	if p.PreferDrafts {
+		p.Selection = "reviewed_draft_then_birthday"
+	}
 	if p.NextCursor < 0 {
 		return p, errors.New("неверный курсор шаблонов")
 	}
@@ -105,7 +134,7 @@ func (s *Store) ReactionMessagePolicy(ctx context.Context, owner int64) (Reactio
 	if err := s.initReactionMessages(ctx); err != nil {
 		return ReactionMessagePolicy{}, err
 	}
-	return scanReactionMessagePolicy(s.DB.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	return scanReactionMessagePolicy(s.DB.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 }
 
 // Saving templates never starts a worker or sends a reaction.
@@ -119,6 +148,24 @@ func (s *Store) SetReactionMessagePolicy(ctx context.Context, owner int64, mode 
 	telegramUsername := ""
 	if len(usernames) == 1 {
 		telegramUsername = usernames[0]
+	}
+	return s.ConfigureReactionMessagePolicy(ctx, owner, ReactionMessagePolicyConfig{Mode: mode, Templates: templates, TelegramUsername: telegramUsername})
+}
+
+type ReactionMessagePolicyConfig struct {
+	Mode             string   `json:"mode"`
+	Templates        []string `json:"templates"`
+	TelegramUsername string   `json:"telegram_username"`
+	PreferDrafts     bool     `json:"prefer_drafts"`
+}
+
+func (s *Store) ConfigureReactionMessagePolicy(ctx context.Context, owner int64, config ReactionMessagePolicyConfig) (ReactionMessagePolicy, error) {
+	if owner <= 0 {
+		return ReactionMessagePolicy{}, errors.New("неверный владелец")
+	}
+	mode, templates, telegramUsername := config.Mode, config.Templates, config.TelegramUsername
+	if config.PreferDrafts && mode != "birthday" {
+		return ReactionMessagePolicy{}, errors.New("reviewed drafts require birthday fallback mode")
 	}
 	if err := validateReactionMessagePolicy(mode, templates, telegramUsername); err != nil {
 		return ReactionMessagePolicy{}, err
@@ -138,12 +185,12 @@ func (s *Store) SetReactionMessagePolicy(ctx context.Context, owner int64, mode 
 		return ReactionMessagePolicy{}, err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO reaction_message_settings(owner_id,mode,templates_json,telegram_username) VALUES(?,?,?,?)
- ON CONFLICT(owner_id) DO UPDATE SET mode=excluded.mode,templates_json=excluded.templates_json,telegram_username=excluded.telegram_username,next_cursor=0,revision=reaction_message_settings.revision+1,updated_at=CURRENT_TIMESTAMP`, owner, mode, string(raw), telegramUsername)
+	_, err = tx.ExecContext(ctx, `INSERT INTO reaction_message_settings(owner_id,mode,templates_json,telegram_username,prefer_drafts) VALUES(?,?,?,?,?)
+ ON CONFLICT(owner_id) DO UPDATE SET mode=excluded.mode,templates_json=excluded.templates_json,telegram_username=excluded.telegram_username,prefer_drafts=excluded.prefer_drafts,next_cursor=0,revision=reaction_message_settings.revision+1,updated_at=CURRENT_TIMESTAMP`, owner, mode, string(raw), telegramUsername, config.PreferDrafts)
 	if err != nil {
 		return ReactionMessagePolicy{}, err
 	}
-	p, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	p, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 	if err != nil {
 		return p, err
 	}
@@ -199,12 +246,15 @@ func (s *Store) prepareLikeMessage(ctx context.Context, owner, action int64, tar
 	if err != nil || currentTarget.ID() != target.ID {
 		return nil, errors.New("анкета изменилась; действие отменено")
 	}
+	if err = reactionDraftHoldTx(ctx, tx, owner, session.UserID, target.ID); err != nil {
+		return nil, err
+	}
 	mode, message, slot, revision := "explicit", "", int64(-1), int64(0)
 	reservedCursor := int64(-1)
 	if explicit != nil {
 		message = *explicit
 	} else {
-		p, e := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+		p, e := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 		if e != nil {
 			return nil, e
 		}
@@ -214,9 +264,23 @@ func (s *Store) prepareLikeMessage(ctx context.Context, owner, action int64, tar
 			if !known || age < 18 {
 				return nil, ErrReactionMessageTargetAge
 			}
-			message, slot, err = birthdayReactionMessage(currentTarget, p.TelegramUsername, p.NextCursor)
-			if err != nil {
-				return nil, err
+			if birthdayGreetingMinorDOB(currentTarget, time.Now().UTC()) {
+				return nil, ErrReactionMessageTargetAge
+			}
+			found := false
+			if p.PreferDrafts {
+				message, found, err = reactionDraftMessageTx(ctx, tx, owner, session.UserID, target.ID, p.TelegramUsername, currentTarget)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if found {
+				mode = "personal"
+			} else {
+				message, slot, err = birthdayReactionMessage(currentTarget, p.TelegramUsername, p.NextCursor)
+				if err != nil {
+					return nil, err
+				}
 			}
 		} else if mode != "off" {
 			slot = 0
