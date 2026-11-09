@@ -256,6 +256,10 @@ func (s *Service) handle(ctx context.Context, u Update) {
 		return
 	}
 	if u.Callback != nil && owner == s.Config.OwnerID && m.Chat.ID == s.Config.BackupChatID && s.Config.BackupChatID != 0 {
+		if strings.HasPrefix(u.Callback.Data, "ga:") {
+			s.analysisPostCallback(ctx, *u.Callback)
+			return
+		}
 		if strings.HasPrefix(u.Callback.Data, "av:") || strings.HasPrefix(u.Callback.Data, "az:") || strings.HasPrefix(u.Callback.Data, "aj:") {
 			s.archiveCallback(ctx, *u.Callback)
 		}
@@ -686,6 +690,9 @@ func profileText(p StoredProfile) string {
 	}
 	if age != "" || height != "" {
 		b.WriteString(", " + strings.Trim(age+"/"+height, "/"))
+	}
+	if number(v["type"]) == 1 {
+		b.WriteString(" ⭐ Premium")
 	}
 	var location []string
 	for _, key := range []string{"country", "city"} {

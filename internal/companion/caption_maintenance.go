@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const captionDesignRevision = "2026-11-08-menu-languages-source-json-v1"
+const captionDesignRevision = "2026-11-09-premium-badge-v2"
 const captionMaintenanceSchema = `
 CREATE TABLE IF NOT EXISTS caption_maintenance_jobs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, revision TEXT NOT NULL, kind TEXT NOT NULL,

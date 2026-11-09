@@ -93,6 +93,8 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 			start(s.RunCaptionMaintenance)
 		}
 		start(s.Watcher.RunPresence)
+		start(s.RunAnalysisPosts)
+		start(s.RunArchiveChangePosts)
 	}
 	if s.Config.CompatibilityEnabled && (role == RuntimeAll || role == RuntimeCompatibility) {
 		start(s.runCompatibilityPlanner)
