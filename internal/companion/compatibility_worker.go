@@ -103,7 +103,7 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 	if s.foregroundPending() {
 		return settle("queued", "foreground_busy")
 	}
-	_, targetRaw, err := s.Client.debugRead(ctx, job.OwnerID, session, "/user/getUser?viewerUserId="+strconv.FormatInt(job.FromUserID, 10)+"&targetUserId="+strconv.FormatInt(job.TargetUserID, 10))
+	_, targetRaw, targetObserved, err := s.Client.debugReadObserved(ctx, job.OwnerID, session, "/user/getUser?viewerUserId="+strconv.FormatInt(job.FromUserID, 10)+"&targetUserId="+strconv.FormatInt(job.TargetUserID, 10))
 	if err != nil {
 		var upstream *UpstreamError
 		if errors.Is(err, ErrProfileUnavailable) || errors.As(err, &upstream) && (upstream.Status == http.StatusNotFound || upstream.Status == http.StatusGone) {
@@ -120,6 +120,9 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 	err = s.Client.debugBinding(ctx, job.OwnerID, session)
 	if err == nil {
 		_, err = s.Store.ArchiveViewed(ctx, job.OwnerID, []Profile{target}, "GET /user/getUser")
+	}
+	if err == nil {
+		_, err = s.Store.recordProfilePresence(ctx, job.OwnerID, job.TargetUserID, true, targetObserved)
 	}
 	sessionMu.Unlock()
 	if err != nil {

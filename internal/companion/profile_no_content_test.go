@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func profileTestResponse(r *http.Request, status int, contentType, body string) *http.Response {
@@ -20,6 +21,8 @@ func TestProfileNoContentFullProfileKeepsSourceConnected(t *testing.T) {
 		t.Run(fmt.Sprint(frozen), func(t *testing.T) {
 			f := newDebugFixture(t)
 			client := f.service.Client
+			observed := client.Now()
+			client.Now = func() time.Time { return observed }
 			base := client.HTTP.Transport
 			calls := 0
 			client.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
@@ -45,6 +48,7 @@ func TestProfileNoContentFullProfileKeepsSourceConnected(t *testing.T) {
 			if !errors.Is(err, ErrProfileUnavailable) || calls != 1 {
 				t.Fatal("missing profile was not classified", err, calls)
 			}
+			assertMissingProfileRecorded(t, client.Store, 1, 7, observed, 1)
 			current, err := client.Store.Session(ctx, 1)
 			if err != nil || current.State != "connected" || current.Generation != ss.Generation {
 				t.Fatal("missing profile paused source", err)
@@ -56,6 +60,8 @@ func TestProfileNoContentFullProfileKeepsSourceConnected(t *testing.T) {
 func TestProfileNoContentDebugReadPreservesRawStatusAndSource(t *testing.T) {
 	f := newDebugFixture(t)
 	client := f.service.Client
+	observed := client.Now()
+	client.Now = func() time.Time { return observed }
 	client.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/user/getUser" {
 			t.Fatal("unexpected request")
@@ -68,6 +74,7 @@ func TestProfileNoContentDebugReadPreservesRawStatusAndSource(t *testing.T) {
 	if status != 204 || string(raw) != " \n" || !errors.Is(err, ErrProfileUnavailable) {
 		t.Fatal("debug response was changed", status, raw, err)
 	}
+	assertMissingProfileRecorded(t, client.Store, 1, 7, observed, 1)
 	current, err := client.Store.Session(ctx, 1)
 	if err != nil || current.State != "connected" {
 		t.Fatal("debug missing profile paused source", err)
@@ -146,6 +153,7 @@ func TestProfileNoContentCompatibilityCancelsUnavailableWithoutPost(t *testing.T
 			if f.state(t) != "cancelled" || reason != "target_unavailable" || f.posts != 0 {
 				t.Fatal("unavailable job was not cancelled", f.state(t), reason, f.posts)
 			}
+			assertMissingProfileRecorded(t, f.service.Store, 1, 7, f.now, 1)
 			current, err := f.service.Store.Session(context.Background(), 1)
 			if err != nil || current.State != "connected" {
 				t.Fatal("unavailable target paused source", err)

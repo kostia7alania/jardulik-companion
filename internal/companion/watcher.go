@@ -218,7 +218,7 @@ func (w *ProfileWatcher) CheckOne(ctx context.Context) (bool, error) {
 		}
 		return true, ctx.Err()
 	}
-	p, requestErr := w.Client.FullProfile(ctx, owner, profile)
+	p, observed, requestErr := w.Client.fullProfileObserved(ctx, owner, profile)
 	finished := w.now()
 	if err = ctx.Err(); err != nil {
 		return true, err
@@ -249,7 +249,7 @@ func (w *ProfileWatcher) CheckOne(ctx context.Context) (bool, error) {
 	}
 	result := "discarded"
 	if session.State == "connected" && !w.Store.Paused(ctx, owner) && errors.Is(requestErr, ErrProfileUnavailable) {
-		_, requestErr = w.recordProfilePresence(ctx, owner, profile, false, finished)
+		requestErr = nil
 		result = "unavailable"
 	} else if requestErr == nil && session.State == "connected" && !w.Store.Paused(ctx, owner) {
 		result = "unchanged"
@@ -268,7 +268,7 @@ func (w *ProfileWatcher) CheckOne(ctx context.Context) (bool, error) {
 		}
 		if requestErr == nil {
 			var returned bool
-			returned, requestErr = w.recordProfilePresence(ctx, owner, profile, true, finished)
+			returned, requestErr = w.recordProfilePresence(ctx, owner, profile, true, observed)
 			if returned {
 				result = "returned"
 			}

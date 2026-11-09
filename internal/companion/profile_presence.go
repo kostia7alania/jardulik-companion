@@ -107,11 +107,18 @@ func presenceVersionTx(ctx context.Context, tx *sql.Tx, owner, profile int64) (i
 }
 
 func (w *ProfileWatcher) recordProfilePresence(ctx context.Context, owner, profile int64, available bool, observed time.Time) (bool, error) {
-	tx, err := w.Store.DB.BeginTx(ctx, nil)
+	return w.Store.recordProfilePresence(ctx, owner, profile, available, observed)
+}
+
+func (s *Store) recordProfilePresence(ctx context.Context, owner, profile int64, available bool, observed time.Time) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
+	if err = migrateProfilePresenceTx(ctx, tx); err != nil {
+		return false, err
+	}
 	version, err := presenceVersionTx(ctx, tx, owner, profile)
 	if err != nil {
 		return false, err
@@ -129,19 +136,33 @@ func recordProfilePresenceTx(ctx context.Context, tx *sql.Tx, owner, profile int
 		availability = "available"
 	}
 	at := observed.UTC().Format(time.RFC3339Nano)
-	var previous, oldReason string
+	var previous, oldReason, checked string
 	var transition, oldBaseline int64
-	err := tx.QueryRowContext(ctx, "SELECT availability,transition,reason,baseline_version_id FROM profile_presence WHERE owner_id=? AND profile_id=?", owner, profile).Scan(&previous, &transition, &oldReason, &oldBaseline)
+	err := tx.QueryRowContext(ctx, "SELECT availability,transition,reason,baseline_version_id,checked_at FROM profile_presence WHERE owner_id=? AND profile_id=?", owner, profile).Scan(&previous, &transition, &oldReason, &oldBaseline, &checked)
 	if errors.Is(err, sql.ErrNoRows) {
 		if available {
 			reason = ""
 			baseline = 0
 		}
-		_, err = tx.ExecContext(ctx, "INSERT INTO profile_presence(owner_id,profile_id,availability,changed_at,checked_at,reason,baseline_version_id) VALUES(?,?,?,?,?,?,?)", owner, profile, availability, at, at, reason, baseline)
-		return false, err
+		if !available && baseline > 0 {
+			transition = 1
+		}
+		_, err = tx.ExecContext(ctx, "INSERT INTO profile_presence(owner_id,profile_id,availability,transition,changed_at,checked_at,reason,baseline_version_id) VALUES(?,?,?,?,?,?,?,?)", owner, profile, availability, transition, at, at, reason, baseline)
+		if err == nil && transition > 0 {
+			_, err = tx.ExecContext(ctx, "INSERT INTO profile_presence_events(owner_id,profile_id,transition,availability,observed_at,reason,old_version_id,version_id) VALUES(?,?,?,?,?,?,?,?)", owner, profile, transition, availability, at, reason, baseline, current)
+		}
+		return transition > 0 && err == nil, err
 	}
 	if err != nil {
 		return false, err
+	}
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05"} {
+		if last, err := time.Parse(layout, checked); err == nil {
+			if observed.Before(last) {
+				return false, nil
+			}
+			break
+		}
 	}
 	if previous == availability {
 		_, err = tx.ExecContext(ctx, "UPDATE profile_presence SET checked_at=? WHERE owner_id=? AND profile_id=?", at, owner, profile)
@@ -341,7 +362,7 @@ func (w *ProfileWatcher) deliverProfilePresence(ctx context.Context) (bool, erro
 	} else if reason == "feed_absent" {
 		title = "Анкета в этом обходе не обнаружена"
 	}
-	text := fmt.Sprintf("%s\nJardulik: %d\n%s", title, profile, displayTime(observed))
+	text := fmt.Sprintf("%s\nJardulik: %d\nОбнаружено: %s", title, profile, displayTime(observed))
 	if availability == "available" && changes != "" {
 		summary, rest := telegramPrefix(changes, 3400)
 		if rest != "" {

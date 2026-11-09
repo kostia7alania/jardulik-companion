@@ -136,7 +136,7 @@ func (c *Client) debugExchange(ctx context.Context, ss Session, method, path str
 			kind = "rate_limited"
 		}
 		wait, _ := strconv.Atoi(response.Header.Get("Retry-After"))
-		return response.StatusCode, raw, &UpstreamError{Status: response.StatusCode, Kind: kind, RetryAfter: time.Duration(wait) * time.Second}
+		return response.StatusCode, raw, &UpstreamError{Status: response.StatusCode, Kind: kind, RetryAfter: time.Duration(wait) * time.Second, Endpoint: strings.SplitN(path, "?", 2)[0]}
 	}
 	if profileNoContent(method, path, response.StatusCode, response.Header.Get("Content-Type"), raw) {
 		return response.StatusCode, raw, ErrProfileUnavailable
@@ -165,12 +165,17 @@ func (c *Client) debugFailure(ctx context.Context, owner int64, ss Session, err 
 	}
 }
 func (c *Client) debugRead(ctx context.Context, owner int64, expected Session, path string) (int, []byte, error) {
+	status, body, _, err := c.debugReadObserved(ctx, owner, expected, path)
+	return status, body, err
+}
+
+func (c *Client) debugReadObserved(ctx context.Context, owner int64, expected Session, path string) (int, []byte, time.Time, error) {
 	current, e := c.token(ctx, owner, "")
 	if e != nil {
-		return 0, nil, e
+		return 0, nil, time.Time{}, e
 	}
 	if current.UserID != expected.UserID || current.Generation != expected.Generation {
-		return 0, nil, ErrReactionSessionChanged
+		return 0, nil, time.Time{}, ErrReactionSessionChanged
 	}
 	status, body, e := c.debugExchange(ctx, current, http.MethodGet, path, nil)
 	var upstream *UpstreamError
@@ -180,11 +185,12 @@ func (c *Client) debugRead(ctx context.Context, owner int64, expected Session, p
 			status, body, e = c.debugExchange(ctx, current, http.MethodGet, path, nil)
 		}
 	}
+	observed := c.Now()
 	if bind := c.debugBinding(ctx, owner, current); bind != nil {
-		return 0, nil, bind
+		return 0, nil, observed, bind
 	}
 	c.debugFailure(ctx, owner, current, e)
-	return status, body, e
+	return status, body, observed, c.observeProfileUnavailable(ctx, owner, current, http.MethodGet, path, body, e, observed)
 }
 func (c *Client) debugPost(ctx context.Context, owner int64, expected Session, path string, body []byte) (int, []byte, error) {
 	return c.debugPostGuarded(ctx, owner, expected, path, body, nil)

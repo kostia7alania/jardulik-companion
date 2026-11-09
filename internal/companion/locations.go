@@ -157,41 +157,47 @@ func (c *Client) LocationsFrozen(ctx context.Context, owner int64, expected Sess
 
 // Freezes both entitlement and request identity while retaining KnownProfile's source-ID guard.
 func (c *Client) FullProfileFrozen(ctx context.Context, owner int64, expected Session, id int64) (Profile, error) {
+	profile, _, err := c.fullProfileFrozenObserved(ctx, owner, expected, id)
+	return profile, err
+}
+
+func (c *Client) fullProfileFrozenObserved(ctx context.Context, owner int64, expected Session, id int64) (Profile, time.Time, error) {
+	var observed time.Time
 	if err := c.Store.KnownProfile(ctx, owner, id); err != nil {
-		return nil, errors.New("анкета недоступна этому аккаунту")
+		return nil, observed, errors.New("анкета недоступна этому аккаунту")
 	}
 	if err := c.crawlPremium(ctx, owner, expected); err != nil {
-		return nil, err
+		return nil, observed, err
 	}
 	query := url.Values{"viewerUserId": {strconv.FormatInt(expected.UserID, 10)}, "targetUserId": {strconv.FormatInt(id, 10)}}
-	raw, err := c.requestSession(ctx, owner, http.MethodGet, "/user/getUser?"+query.Encode(), nil, &expected)
+	raw, observed, err := c.requestSessionObserved(ctx, owner, http.MethodGet, "/user/getUser?"+query.Encode(), nil, &expected)
 	current, currentErr := c.Store.Session(ctx, owner)
 	if currentErr != nil || current.Generation != expected.Generation || current.UserID != expected.UserID {
-		return nil, errors.New("сессия изменилась; старая анкета отменена")
+		return nil, observed, errors.New("сессия изменилась; старая анкета отменена")
 	}
 	if err != nil {
 		var upstream *UpstreamError
 		if errors.As(err, &upstream) && upstream.Endpoint == "/user/getUser" && (upstream.Status == http.StatusNotFound || upstream.Status == http.StatusGone) {
-			return nil, ErrProfileUnavailable
+			return nil, observed, ErrProfileUnavailable
 		}
-		return nil, err
+		return nil, observed, err
 	}
 	raw = bytes.TrimSpace(raw)
 	if bytes.Equal(raw, []byte("null")) || bytes.Equal(raw, []byte("[]")) {
-		return nil, ErrProfileUnavailable
+		return nil, observed, ErrProfileUnavailable
 	}
 	if len(raw) > 0 && raw[0] == '[' {
 		var entries []json.RawMessage
 		if json.Unmarshal(raw, &entries) != nil || len(entries) != 1 {
-			return nil, errors.New("Jardulik profile format changed")
+			return nil, observed, errors.New("Jardulik profile format changed")
 		}
 		raw = entries[0]
 	}
 	profile, err := decodeProfile(raw)
 	if err != nil || profile == nil || profile.ID() != id {
-		return nil, errors.New("Jardulik profile identity or format changed")
+		return nil, observed, errors.New("Jardulik profile identity or format changed")
 	}
-	return profile, nil
+	return profile, observed, nil
 }
 
 // Save the exact partial batch before its cursor. Partial previews never become versions.

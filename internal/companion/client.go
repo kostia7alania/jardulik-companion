@@ -271,22 +271,28 @@ func (c *Client) Request(ctx context.Context, owner int64, method, path string, 
 }
 
 func (c *Client) requestSession(ctx context.Context, owner int64, method, path string, payload any, expected *Session) ([]byte, error) {
+	raw, _, err := c.requestSessionObserved(ctx, owner, method, path, payload, expected)
+	return raw, err
+}
+
+func (c *Client) requestSessionObserved(ctx context.Context, owner int64, method, path string, payload any, expected *Session) ([]byte, time.Time, error) {
 	s, err := c.token(ctx, owner, "")
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if expected != nil && (s.Generation != expected.Generation || s.UserID != expected.UserID) {
-		return nil, errors.New("сессия изменилась; старый запрос отменён")
+		return nil, time.Time{}, errors.New("сессия изменилась; старый запрос отменён")
 	}
 	b, err := c.exchange(ctx, method, path, s.Token, payload)
 	var ue *UpstreamError
 	if errors.As(err, &ue) && ue.Status == 401 {
 		s, err = c.token(ctx, owner, s.Token, s.Generation)
 		if err != nil {
-			return nil, err
+			return nil, time.Time{}, err
 		}
 		b, err = c.exchange(ctx, method, path, s.Token, payload)
 	}
+	observed := c.Now()
 	if errors.As(err, &ue) && (ue.Status == 403 || ue.Status == 429 || ue.Kind == "unexpected_response_or_challenge") {
 		mu := c.lock(owner)
 		mu.Lock()
@@ -295,7 +301,7 @@ func (c *Client) requestSession(ctx context.Context, owner int64, method, path s
 		}
 		mu.Unlock()
 	}
-	return b, err
+	return b, observed, c.observeProfileUnavailable(ctx, owner, s, method, path, b, err, observed)
 }
 func decodeProfile(b []byte) (Profile, error) {
 	var p Profile
@@ -416,48 +422,54 @@ func (c *Client) usersPage(ctx context.Context, owner int64, expected Session, f
 	return profiles, nil
 }
 func (c *Client) FullProfile(ctx context.Context, owner, id int64) (Profile, error) {
+	profile, _, err := c.fullProfileObserved(ctx, owner, id)
+	return profile, err
+}
+
+func (c *Client) fullProfileObserved(ctx context.Context, owner, id int64) (Profile, time.Time, error) {
+	var observed time.Time
 	if err := c.Store.KnownProfile(ctx, owner, id); err != nil {
-		return nil, errors.New("анкета недоступна этому аккаунту")
+		return nil, observed, errors.New("анкета недоступна этому аккаунту")
 	}
 	s, err := c.Store.Session(ctx, owner)
 	if err != nil {
-		return nil, err
+		return nil, observed, err
 	}
 	q := url.Values{"viewerUserId": {strconv.FormatInt(s.UserID, 10)}, "targetUserId": {strconv.FormatInt(id, 10)}}
-	b, err := c.requestSession(ctx, owner, "GET", "/user/getUser?"+q.Encode(), nil, &s)
+	b, observed, err := c.requestSessionObserved(ctx, owner, "GET", "/user/getUser?"+q.Encode(), nil, &s)
 	current, currentErr := c.Store.Session(ctx, owner)
 	if currentErr != nil || current.Generation != s.Generation || current.UserID != s.UserID {
-		return nil, errors.New("сессия изменилась; старый ответ отменён")
+		return nil, observed, errors.New("сессия изменилась; старый ответ отменён")
 	}
 	if err != nil {
 		var upstream *UpstreamError
 		if errors.As(err, &upstream) && upstream.Endpoint == "/user/getUser" && (upstream.Status == http.StatusNotFound || upstream.Status == http.StatusGone) {
-			return nil, ErrProfileUnavailable
+			return nil, observed, ErrProfileUnavailable
 		}
-		return nil, err
+		return nil, observed, err
 	}
 	b = bytes.TrimSpace(b)
 	if bytes.Equal(b, []byte("null")) || bytes.Equal(b, []byte("[]")) {
-		return nil, ErrProfileUnavailable
+		return nil, observed, ErrProfileUnavailable
 	}
 	if len(b) > 0 && b[0] == '[' {
 		var a []json.RawMessage
 		if json.Unmarshal(b, &a) != nil {
-			return nil, errors.New("Jardulik profile format changed")
+			return nil, observed, errors.New("Jardulik profile format changed")
 		}
 		if len(a) == 0 {
-			return nil, ErrProfileUnavailable
+			return nil, observed, ErrProfileUnavailable
 		}
 		if len(a) != 1 {
-			return nil, errors.New("Jardulik profile format changed")
+			return nil, observed, errors.New("Jardulik profile format changed")
 		}
 		b = a[0]
 	}
 	p, err := decodeProfile(b)
 	if err != nil || p == nil || p.ID() != id {
-		return nil, errors.New("Jardulik profile identity or format changed")
+		return nil, observed, errors.New("Jardulik profile identity or format changed")
 	}
-	return p, nil
+	return p, observed, nil
 }
 
 type ReactionResult struct {

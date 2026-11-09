@@ -28,6 +28,7 @@ func newWatchFixture(t *testing.T) *watchFixture {
 	c.WatchInterval, c.WatchGap, c.WatchDailyLimit = 24*time.Hour, 20*time.Second, 300
 	f := &watchFixture{store: s, now: time.Date(2030, 1, 2, 10, 0, 0, 0, time.UTC)}
 	client := NewClient(s, c)
+	client.Now = func() time.Time { return f.now }
 	client.HTTP = &http.Client{Transport: archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
 		if r.Method != http.MethodGet || r.URL.Path != "/user/getUser" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)

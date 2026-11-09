@@ -597,7 +597,7 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 			} else if reason != "" {
 				return true, c.stop(ctx, j, reason)
 			}
-			if err = c.checkpointHydration(ctx, j, 0, nil, false); err != nil {
+			if err = c.checkpointHydration(ctx, j, 0, nil, false, c.now()); err != nil {
 				return true, c.stop(ctx, j, "checkpoint_failed")
 			}
 			return true, nil
@@ -642,6 +642,7 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 	var profiles []Profile
 	var locations LocationPage
 	var requestErr error
+	var observed time.Time
 	expected := Session{UserID: j.UserID, Generation: j.Generation}
 	requestCtx := withCrawlPriority(ctx, s)
 	switch j.Mode {
@@ -655,13 +656,16 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		locations, requestErr = s.Client.LocationsFrozen(requestCtx, j.Owner, expected, "", "", j.Page)
 	case 3:
 		var profile Profile
-		profile, requestErr = s.Client.FullProfileFrozen(requestCtx, j.Owner, expected, target)
+		profile, observed, requestErr = s.Client.fullProfileFrozenObserved(requestCtx, j.Owner, expected, target)
 		if requestErr == nil {
 			profiles = []Profile{profile}
 		}
 	}
 	if ctx.Err() != nil {
 		return true, ctx.Err()
+	}
+	if observed.IsZero() {
+		observed = c.now()
 	}
 	// No session mutex is held during HTTP. Guard the archived response afterwards.
 	sessionMu := s.Client.lock(j.Owner)
@@ -712,7 +716,7 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	if j.Mode == 3 && errors.Is(requestErr, ErrProfileUnavailable) {
-		if err = c.checkpointHydration(ctx, j, target, nil, true); err != nil {
+		if err = c.checkpointHydration(ctx, j, target, nil, true, observed); err != nil {
 			if ctx.Err() != nil {
 				return true, ctx.Err()
 			}
@@ -735,7 +739,7 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		return true, c.stop(ctx, j, "archive_failed")
 	}
 	if j.Mode == 3 {
-		err = c.checkpointHydration(ctx, j, target, profiles, false)
+		err = c.checkpointHydration(ctx, j, target, profiles, false, observed)
 	} else {
 		err = c.checkpoint(ctx, j, fingerprint, len(profiles), profiles)
 	}
@@ -860,7 +864,7 @@ func (c *FeedCrawler) checkpointLocations(ctx context.Context, j *CrawlJob, page
 	})
 }
 
-func (c *FeedCrawler) checkpointHydration(ctx context.Context, j *CrawlJob, target int64, profiles []Profile, unavailable bool) error {
+func (c *FeedCrawler) checkpointHydration(ctx context.Context, j *CrawlJob, target int64, profiles []Profile, unavailable bool, observed time.Time) error {
 	return c.checkpointTx(ctx, j, func(tx *sql.Tx, next *CrawlJob) error {
 		if target != 0 {
 			state, version := "unavailable", int64(0)
@@ -868,7 +872,7 @@ func (c *FeedCrawler) checkpointHydration(ctx context.Context, j *CrawlJob, targ
 				if len(profiles) != 1 || profiles[0].ID() != target {
 					return errors.New("invalid hydrated profile")
 				}
-				if err := recordCrawlSeenTx(ctx, tx, j, profiles, c.now()); err != nil {
+				if err := recordCrawlSeenTx(ctx, tx, j, profiles, observed); err != nil {
 					return err
 				}
 				if err := tx.QueryRowContext(ctx, "SELECT version_id FROM queue WHERE owner_id=? AND profile_id=?", j.Owner, target).Scan(&version); err != nil {
@@ -886,15 +890,6 @@ func (c *FeedCrawler) checkpointHydration(ctx context.Context, j *CrawlJob, targ
 				return errors.New("hydration cursor changed")
 			}
 			if unavailable {
-				known, err := presenceVersionTx(ctx, tx, j.Owner, target)
-				if err != nil {
-					return err
-				}
-				if known > 0 {
-					if _, err = recordProfilePresenceTx(ctx, tx, j.Owner, target, false, "direct_unavailable", known, known, c.now()); err != nil {
-						return err
-					}
-				}
 				next.Unavailable++
 			} else {
 				next.Hydrated++
