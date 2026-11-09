@@ -120,7 +120,7 @@ func (f *autoFixture) advance() { f.now = f.now.Add(31 * time.Second) }
 
 func TestAutoOffByDefaultAndExplicitRestartDurability(t *testing.T) {
 	f := newAutoFixture(t)
-	f.add(t, 1, 8, 55, true)
+	f.add(t, 1, 8, 23, true)
 	f.step(t)
 	if len(f.requests) != 0 {
 		t.Fatal("default-off worker requested source")
@@ -143,8 +143,9 @@ func TestAutoOffByDefaultAndExplicitRestartDurability(t *testing.T) {
 func TestAutoFavoritesFirstThenFreshStrictFeedNeverGlobalArchive(t *testing.T) {
 	f := newAutoFixture(t)
 	f.add(t, 1, 9, 23, false)
-	f.add(t, 1, 8, 55, true)
+	f.add(t, 1, 8, 23, true)
 	f.add(t, 2, 99, 23, true)
+	f.full[8]["height"] = 99 // Explicit favorites still bypass non-age filters.
 	f.feed = []Profile{{"userId": 1, "age": 23, "height": 170}, {"userId": 7, "age": 45, "height": 170}}
 	for _, p := range f.feed {
 		f.full[p.ID()] = p
@@ -154,7 +155,7 @@ func TestAutoFavoritesFirstThenFreshStrictFeedNeverGlobalArchive(t *testing.T) {
 	}
 	f.step(t)
 	if len(f.sent) != 1 || f.sent[0] != 8 {
-		t.Fatal("favorite outside filters lost priority")
+		t.Fatal("favorite outside non-age filters lost priority")
 	}
 	f.advance()
 	f.step(t)

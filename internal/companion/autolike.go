@@ -483,8 +483,9 @@ func (a *Autoliker) Step(ctx context.Context) (bool, error) {
 	if err != nil {
 		return stop("source_failed")
 	}
-	// Zero may mean an open server filter; an automatic reaction still needs an adult age.
-	if number(full["age"]) < 18 || c.source != "favorite" && !profileMatchesAutoFilters(full, j.Filters) {
+	// The selected age range and adult age apply to every automatic reaction, including favorites.
+	age, validAge := autoInteger(full["age"])
+	if !validAge || age < 18 || age < j.Filters.AgeMin || age > j.Filters.AgeMax || c.source != "favorite" && !profileMatchesAutoFilters(full, j.Filters) {
 		return true, a.candidateState(ctx, j, c.id, "skipped")
 	}
 	if err = a.guard(ctx, j); err != nil {

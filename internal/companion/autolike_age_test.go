@@ -8,13 +8,13 @@ import (
 	"testing"
 )
 
-func TestAutoOpenAgeFilterStillSkipsUnknownAndUnderageFavorites(t *testing.T) {
-	for _, age := range []int64{0, 17, 18} {
-		t.Run(fmt.Sprint(age), func(t *testing.T) {
+func TestAutoAgeRangeAppliesToFavorites(t *testing.T) {
+	for _, tc := range []struct{ age, minimum int64 }{{0, 0}, {17, 0}, {18, 0}, {25, 0}, {26, 0}, {20, 21}, {21, 21}} {
+		t.Run(fmt.Sprintf("age_%d_min_%d", tc.age, tc.minimum), func(t *testing.T) {
 			f := newAutoFixture(t)
-			f.add(t, 1, 81, age, true)
+			f.add(t, 1, 81, tc.age, true)
 			filters := DefaultFeedFilters()
-			filters.AgeMin, filters.AgeMax = 0, 25
+			filters.AgeMin, filters.AgeMax = tc.minimum, 25
 			raw, _ := json.Marshal(filters)
 			if _, err := f.worker.Service.Store.DB.Exec("UPDATE feed_filters SET applied_json=? WHERE owner_id=1", string(raw)); err != nil {
 				t.Fatal(err)
@@ -24,11 +24,11 @@ func TestAutoOpenAgeFilterStillSkipsUnknownAndUnderageFavorites(t *testing.T) {
 			}
 			f.step(t)
 			want := 0
-			if age >= 18 {
+			if tc.age >= 18 && tc.age >= tc.minimum && tc.age <= 25 {
 				want = 1
 			}
 			if len(f.sent) != want {
-				t.Fatalf("age %d sent reactions: %v", age, f.sent)
+				t.Fatalf("age %d sent reactions: %v", tc.age, f.sent)
 			}
 		})
 	}
