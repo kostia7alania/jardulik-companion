@@ -61,6 +61,7 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		start(s.Watcher.RunChecks)
 		start(s.Crawler.Run)
 		start(s.Autoliker.Run)
+		start(s.runContacts)
 		start(s.runPrivateCardRepair)
 	}
 	if role == RuntimeAll || role == RuntimePoster {

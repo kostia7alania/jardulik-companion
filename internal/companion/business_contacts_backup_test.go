@@ -60,10 +60,10 @@ func TestBusinessContactBackupTracksBindingsAndSourceHistoryWithoutCaptureNoise(
 	if captured == connected {
 		t.Fatal("new source contact did not dirty the backup")
 	}
-	// The same projection received again retains raw proof without requiring another backup.
-	businessBackupIngest(t, s, businessBackupMessage(52, 1, "https://t.me/Example16"))
+	// Re-delivery of the exact same source update does not require another backup.
+	businessBackupIngest(t, s, businessBackupMessage(51, 1, "https://t.me/Example16"))
 	if fullTestFingerprint(t, s) != captured {
-		t.Fatal("repeated contact projection dirtied the backup")
+		t.Fatal("duplicate source update dirtied the backup")
 	}
 	if _, err := s.DB.ExecContext(ctx, `UPDATE business_contact_connections SET update_id=60,raw_json='{"capture":"changed"}' WHERE id='fixture-business';
 UPDATE profile_business_contacts SET observed_at_ms=999,raw_json='{"unknown_source_field":"preserved"}'`); err != nil {

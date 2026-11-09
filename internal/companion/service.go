@@ -603,6 +603,7 @@ func (s *Service) status(ctx context.Context, owner int64) {
 	}
 	text := fmt.Sprintf("%s\nАнкет: %d, снимков: %d\nФото сохранено: %d, в очереди: %d\nИзбранное: %d\nОтправлено лайков ботом: %d\nРеакции в Jardulik: %s", state, n["profiles"], n["versions"], n["photos"], n["pending_photos"], n["favorites"], n["likes"], mode)
 	text += "\n" + s.AutolikeStatus(ctx, owner)
+	text += "\n" + s.ContactStatusText(ctx, owner)
 	if owner == s.Config.OwnerID {
 		text += "\nБэкап: " + s.Archiver.BackupStatus(ctx)
 	}

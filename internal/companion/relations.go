@@ -89,6 +89,14 @@ func decodeRelations(raw []byte) ([]Profile, error) {
 
 // ReactUsers preserves partial source previews; it never hydrates or archives a profile.
 func (c *Client) ReactUsers(ctx context.Context, owner int64, mutual bool, page int) (RelationPage, error) {
+	return c.reactUsers(ctx, owner, nil, mutual, page)
+}
+
+func (c *Client) ReactUsersFrozen(ctx context.Context, owner int64, expected Session, mutual bool, page int) (RelationPage, error) {
+	return c.reactUsers(ctx, owner, &expected, mutual, page)
+}
+
+func (c *Client) reactUsers(ctx context.Context, owner int64, expected *Session, mutual bool, page int) (RelationPage, error) {
 	result := RelationPage{Mutual: mutual, SourcePage: page}
 	if page < 1 {
 		return result, errors.New("invalid relationship page")
@@ -103,6 +111,9 @@ func (c *Client) ReactUsers(ctx context.Context, owner int64, mutual bool, page 
 	session, err := c.Store.Session(ctx, owner)
 	if err != nil {
 		return result, err
+	}
+	if expected != nil && (session.UserID != expected.UserID || session.Generation != expected.Generation) {
+		return result, ErrContactSessionChanged
 	}
 	query := url.Values{"userId": {strconv.FormatInt(session.UserID, 10)}, "isMutual": {strconv.FormatBool(mutual)}, "pageNumber": {strconv.Itoa(page)}, "pageSize": {"1000"}}
 	raw, err := c.requestSession(ctx, owner, "GET", "/user/getReactUsers?"+query.Encode(), nil, &session)
@@ -123,6 +134,11 @@ func (c *Client) ReactUsers(ctx context.Context, owner int64, mutual bool, page 
 	if err = c.Store.initRelations(ctx); err != nil {
 		return result, err
 	}
+	if mutual {
+		if err = c.Store.initContactJobs(ctx); err != nil {
+			return result, err
+		}
+	}
 	tx, err := c.Store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return result, err
@@ -142,6 +158,11 @@ func (c *Client) ReactUsers(ctx context.Context, owner int64, mutual bool, page 
 			return result, e
 		}
 		if _, err = tx.ExecContext(ctx, "INSERT INTO relation_profiles(batch_id,owner_id,profile_id,position,raw_json) VALUES(?,?,?,?,?)", result.ID, owner, profile.ID(), pos, string(value)); err != nil {
+			return result, err
+		}
+	}
+	if mutual {
+		if err = c.Store.queueMutualContactsTx(ctx, tx, owner, session, result.ID, result.Profiles, c.Now().UTC()); err != nil {
 			return result, err
 		}
 	}

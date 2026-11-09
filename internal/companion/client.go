@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -649,6 +650,11 @@ func (c *Client) LikeGuarded(ctx context.Context, owner, id int64, guard func(co
 	if err = c.Store.finishReactionAction(writeCtx, action, state, body, out.RetryAt); err != nil {
 		c.Store.Pause(writeCtx, owner, true)
 		return out, err
+	}
+	if out.Decision == ReactionSuccess && out.Mutual {
+		if err := c.Store.RequestContactSync(writeCtx, owner, current, c.Now()); err != nil {
+			slog.Warn("contact sync scheduling failed", "kind", safeError(err))
+		}
 	}
 	return out, nil
 }

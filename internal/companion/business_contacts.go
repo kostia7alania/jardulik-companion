@@ -29,6 +29,14 @@ CREATE TABLE IF NOT EXISTS profile_business_contacts (
  contact_url TEXT NOT NULL, profile_url TEXT NOT NULL, raw_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS business_contact_latest ON profile_business_contacts(owner_id,upstream_id,profile_id,source_message_timestamp DESC,update_id DESC);
+CREATE TABLE IF NOT EXISTS business_contact_inbox (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ upstream_id INTEGER NOT NULL, source_bot_id INTEGER NOT NULL, connection_id TEXT NOT NULL,
+ source_message_id INTEGER NOT NULL, source_message_timestamp INTEGER NOT NULL,
+ update_id INTEGER NOT NULL UNIQUE, captured_at_ms INTEGER NOT NULL,
+ parse_state TEXT NOT NULL CHECK(parse_state IN ('unresolved','contact')), raw_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS business_contact_inbox_owner ON business_contact_inbox(owner_id,upstream_id,id);
 `
 
 func (s *Store) initBusinessContacts(ctx context.Context) error {
@@ -73,9 +81,6 @@ func (s *Store) IngestBusinessContactUpdate(ctx context.Context, update Update) 
 		return true, nil
 	}
 	profile, contactURL, profileURL := businessContactURLs(message.ReplyMarkup)
-	if profile == 0 {
-		return true, nil
-	}
 	return true, s.saveBusinessContactMessage(ctx, source, message, profile, contactURL, profileURL)
 }
 
@@ -211,7 +216,15 @@ func (s *Store) saveBusinessContactMessage(ctx context.Context, update Update, m
 	if err != nil {
 		return err
 	}
-	if !enabled || message.Date < date || update.ID <= last {
+	timestamp := message.Date
+	if update.EditedBusinessMessage != nil {
+		if message.EditDate > 0 && message.EditDate >= message.Date {
+			timestamp = message.EditDate
+		} else {
+			profile = 0
+		}
+	}
+	if !enabled || timestamp < date || update.ID <= last {
 		return nil
 	}
 	session, err := s.businessSession(ctx, tx, owner)
@@ -221,11 +234,11 @@ func (s *Store) saveBusinessContactMessage(ctx context.Context, update Update, m
 	if err != nil {
 		return err
 	}
-	if session.UserID != upstream || session.Generation != generation || session.State != "connected" && session.State != "paused" {
+	if session.UserID != upstream || session.Generation != generation || session.State != "connected" && session.State != "paused" && session.State != "reconnect_required" {
 		return nil
 	}
 	var previousRaw string
-	err = tx.QueryRowContext(ctx, "SELECT raw_json FROM profile_business_contacts WHERE update_id=?", update.ID).Scan(&previousRaw)
+	err = tx.QueryRowContext(ctx, "SELECT raw_json FROM business_contact_inbox WHERE update_id=?", update.ID).Scan(&previousRaw)
 	if err == nil {
 		if previousRaw != string(update.RawJSON) {
 			return ErrContactEvidenceConflict
@@ -235,16 +248,35 @@ func (s *Store) saveBusinessContactMessage(ctx context.Context, update Update, m
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	timestamp := message.Date
-	if update.EditedBusinessMessage != nil {
-		if message.EditDate < message.Date {
-			return nil
+	legacyContact := false
+	err = tx.QueryRowContext(ctx, "SELECT raw_json FROM profile_business_contacts WHERE update_id=?", update.ID).Scan(&previousRaw)
+	if err == nil {
+		if previousRaw != string(update.RawJSON) {
+			return ErrContactEvidenceConflict
 		}
-		timestamp = message.EditDate
+		legacyContact = true
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	parseState := "unresolved"
+	if profile > 0 || legacyContact {
+		parseState = "contact"
+	}
+	now := time.Now().UTC()
+	_, err = tx.ExecContext(ctx, `INSERT INTO business_contact_inbox(owner_id,upstream_id,source_bot_id,connection_id,source_message_id,source_message_timestamp,update_id,captured_at_ms,parse_state,raw_json)
+ VALUES(?,?,?,?,?,?,?,?,?,?)`, owner, upstream, s.cfg.SourceBotID, message.BusinessConnectionID, message.ID, timestamp, update.ID, now.UnixMilli(), parseState, string(update.RawJSON))
+	if err != nil {
+		return err
+	}
+	if profile == 0 || legacyContact {
+		return tx.Commit()
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO profile_business_contacts(owner_id,upstream_id,profile_id,source_bot_id,connection_id,source_message_id,source_message_timestamp,update_id,observed_at_ms,contact_url,profile_url,raw_json)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, owner, upstream, profile, s.cfg.SourceBotID, message.BusinessConnectionID, message.ID, timestamp, update.ID, time.Now().UTC().UnixMilli(), contactURL, profileURL, string(update.RawJSON))
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, owner, upstream, profile, s.cfg.SourceBotID, message.BusinessConnectionID, message.ID, timestamp, update.ID, now.UnixMilli(), contactURL, profileURL, string(update.RawJSON))
 	if err != nil {
+		return err
+	}
+	if err = s.receiveContactJobTx(ctx, tx, owner, upstream, profile, now); err != nil {
 		return err
 	}
 	return tx.Commit()
