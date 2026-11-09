@@ -126,7 +126,7 @@ func (s *Service) runBot(ctx context.Context, role RuntimeRole) error {
 	slog.Info("bot started", "username", me.Username, "version", Version, "reactions_enabled", s.Config.AllowReactions)
 	for ctx.Err() == nil {
 		var updates []Update
-		err := s.TG.Call(ctx, "getUpdates", map[string]any{"offset": offset, "timeout": 30, "allowed_updates": []string{"message", "callback_query", "my_chat_member"}}, &updates)
+		err := s.TG.Call(ctx, "getUpdates", map[string]any{"offset": offset, "timeout": 30, "allowed_updates": []string{"message", "callback_query", "my_chat_member", "business_connection", "business_message", "edited_business_message"}}, &updates)
 		if err != nil {
 			if ctx.Err() != nil {
 				break
@@ -138,6 +138,17 @@ func (s *Service) runBot(ctx context.Context, role RuntimeRole) error {
 			continue
 		}
 		for _, u := range updates {
+			// Commit contact receipts before acknowledging the Telegram offset.
+			// Serial ingestion also preserves connection/revocation ordering.
+			if handled, err := s.Store.IngestBusinessContactUpdate(ctx, u); err != nil {
+				return err
+			} else if handled {
+				offset = u.ID + 1
+				if err = s.Store.SetMeta(ctx, "telegram_offset", strconv.FormatInt(offset, 10)); err != nil {
+					return err
+				}
+				continue
+			}
 			claimed, err := s.Store.ClaimUpdate(ctx, u.ID)
 			if err != nil {
 				return err
@@ -645,9 +656,14 @@ func (s *Service) next(ctx context.Context, owner int64) {
 		_ = s.say(ctx, owner, "В этой пачке нет ещё не показанных анкет. Они сохранены в архиве; попробуй /next позже.", nil)
 		return
 	}
-	if full, e := s.Client.FullProfile(ctx, owner, p.ID); e == nil {
-		if _, e = s.Store.Archive(ctx, owner, []Profile{full}, "GET /user/getUser"); e == nil {
-			p, _ = s.Store.Profile(ctx, owner, p.ID)
+	fullCached, cacheErr := s.Store.ProfileHasFullCapture(ctx, owner, p.ID, p.VersionID)
+	if cacheErr != nil {
+		slog.Warn("full profile cache check failed", "tenant", owner, "kind", safeError(cacheErr))
+	} else if !fullCached {
+		if full, e := s.Client.FullProfile(ctx, owner, p.ID); e == nil {
+			if _, e = s.Store.Archive(ctx, owner, []Profile{full}, "GET /user/getUser"); e == nil {
+				p, _ = s.Store.Profile(ctx, owner, p.ID)
+			}
 		}
 	}
 	if err = s.Deliver(ctx, owner, p); err != nil {

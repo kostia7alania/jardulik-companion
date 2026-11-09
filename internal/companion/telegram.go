@@ -110,13 +110,26 @@ type SentMessage struct {
 	Document *Document       `json:"document"`
 	Chat     TGChat          `json:"chat"`
 }
+type BusinessConnection struct {
+	ID         string `json:"id"`
+	User       TGUser `json:"user"`
+	UserChatID int64  `json:"user_chat_id"`
+	Date       int64  `json:"date"`
+	IsEnabled  bool   `json:"is_enabled"`
+}
+
 type Message struct {
-	ID            int64  `json:"message_id"`
-	ThreadID      int64  `json:"message_thread_id"`
-	From          TGUser `json:"from"`
-	Chat          TGChat `json:"chat"`
-	Text          string `json:"text"`
-	ForwardOrigin *struct {
+	Date                 int64           `json:"date"`
+	EditDate             int64           `json:"edit_date,omitempty"`
+	BusinessConnectionID string          `json:"business_connection_id,omitempty"`
+	SenderBusinessBot    *TGUser         `json:"sender_business_bot,omitempty"`
+	ReplyMarkup          json.RawMessage `json:"reply_markup,omitempty"`
+	ID                   int64           `json:"message_id"`
+	ThreadID             int64           `json:"message_thread_id"`
+	From                 TGUser          `json:"from"`
+	Chat                 TGChat          `json:"chat"`
+	Text                 string          `json:"text"`
+	ForwardOrigin        *struct {
 		Type   string `json:"type"`
 		Sender TGUser `json:"sender_user"`
 	} `json:"forward_origin"`
@@ -128,9 +141,27 @@ type Callback struct {
 	Message Message `json:"message"`
 }
 type Update struct {
-	ID       int64     `json:"update_id"`
-	Message  *Message  `json:"message"`
-	Callback *Callback `json:"callback_query"`
+	ID                    int64               `json:"update_id"`
+	Message               *Message            `json:"message"`
+	Callback              *Callback           `json:"callback_query"`
+	BusinessConnection    *BusinessConnection `json:"business_connection,omitempty"`
+	BusinessMessage       *Message            `json:"business_message,omitempty"`
+	EditedBusinessMessage *Message            `json:"edited_business_message,omitempty"`
+	RawJSON               json.RawMessage     `json:"-"`
+}
+
+func (u *Update) UnmarshalJSON(raw []byte) error {
+	type updateFields Update
+	var fields updateFields
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	*u = Update(fields)
+	if u.BusinessConnection != nil || u.BusinessMessage != nil || u.EditedBusinessMessage != nil {
+		// Keep the incoming receipt intact, including fields this version does not know.
+		u.RawJSON = append(json.RawMessage(nil), raw...)
+	}
+	return nil
 }
 
 func NewTelegram(c Config) *Telegram {

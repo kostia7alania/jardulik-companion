@@ -1203,6 +1203,8 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		{"feed_filters", "filters", `SELECT owner_id,applied_json,include_others FROM feed_filters WHERE applied_json IS NOT NULL OR include_others<>0`},
 		{"autolike_settings", "autolike", "SELECT owner_id,mode,interval_seconds,series_count,daily_cap FROM autolike_settings"},
 		{"profile_contact_evidence", "contact", "SELECT owner_id,upstream_id,profile_id,source_bot_id,source_peer_id,source_locator_kind,source_message_locator,source_message_timestamp,contact_url,profile_url,evidence_kind FROM profile_contact_evidence"},
+		{"business_contact_connections", "business-connection", "SELECT owner_id,upstream_id,id,enabled FROM business_contact_connections"},
+		{"profile_business_contacts", "business-contact", "SELECT DISTINCT owner_id,upstream_id,profile_id,source_bot_id,connection_id,source_message_id,source_message_timestamp,contact_url,profile_url FROM profile_business_contacts"},
 	}
 	for _, q := range queries {
 		exists, err := snapshotHasTable(ctx, db, q.table)

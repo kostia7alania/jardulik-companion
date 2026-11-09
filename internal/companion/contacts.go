@@ -199,11 +199,19 @@ func (s *Store) ProfileTelegramContact(ctx context.Context, owner, profileID int
  FROM profile_contact_evidence e JOIN sessions s ON s.owner_id=e.owner_id AND s.upstream_id=e.upstream_id
  WHERE e.owner_id=? AND e.profile_id=? AND e.source_bot_id=? AND e.source_peer_id=? AND s.state IN ('connected','paused','reconnect_required')
  ORDER BY e.source_message_timestamp DESC,e.observed_at_ms DESC,e.id DESC LIMIT 1`, owner, profileID, s.cfg.SourceBotID, s.cfg.SourceBotID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
 	}
+	var saved *ContactEvidence
+	if err == nil {
+		saved = &result
+	}
+	business, err := s.businessTelegramContact(ctx, owner, profileID)
 	if err != nil {
 		return nil, err
 	}
-	return &result, nil
+	if business != nil && (saved == nil || business.SourceMessageTimestamp > saved.SourceMessageTimestamp || business.SourceMessageTimestamp == saved.SourceMessageTimestamp && business.ObservedAt.After(saved.ObservedAt)) {
+		return business, nil
+	}
+	return saved, nil
 }
