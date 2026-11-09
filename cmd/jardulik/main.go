@@ -117,10 +117,7 @@ func run() error {
 		if err = s.Store.User(ctx, owner, "cli"); err != nil {
 			return err
 		}
-		if err = s.Client.Login(ctx, owner, raw); err != nil {
-			return err
-		}
-		account, err := s.Client.Me(ctx, owner)
+		account, err := s.Client.LoginAccount(ctx, owner, raw)
 		if err != nil {
 			return err
 		}

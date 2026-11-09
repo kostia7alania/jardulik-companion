@@ -11,7 +11,10 @@ import (
 	"strconv"
 )
 
-// UsersUnfilteredFrozen collects without mutable account preferences or UI filters.
+const broadCrawlAgeMin int64 = 0
+const broadCrawlAgeMax int64 = 111
+
+// UsersUnfilteredFrozen collects with broad age bounds and no mutable account preferences or other UI filters.
 func (c *Client) UsersUnfilteredFrozen(ctx context.Context, owner int64, expected Session, page int, others bool) ([]Profile, error) {
 	if page < 1 {
 		return nil, errors.New("invalid discovery page")
@@ -24,6 +27,8 @@ func (c *Client) UsersUnfilteredFrozen(ctx context.Context, owner int64, expecte
 		"pageNumber": {strconv.Itoa(page)},
 		"pageSize":   {"150"},
 		"all":        {"0"},
+		"ageMin":     {strconv.FormatInt(broadCrawlAgeMin, 10)},
+		"ageMax":     {strconv.FormatInt(broadCrawlAgeMax, 10)},
 	}
 	if others {
 		query.Set("all", "1")

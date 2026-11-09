@@ -2,13 +2,46 @@ package companion
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func (s *Service) OpenSettings(ctx context.Context, owner int64) error {
+	return s.OpenSettingsMessage(ctx, owner, 0)
+}
+
+// OpenSettingsMessage refreshes the existing menu without changing the run or its settings.
+func (s *Service) OpenSettingsMessage(ctx context.Context, owner, messageID int64) error {
+	return s.showSettings(ctx, owner, messageID, "", "")
+}
+
+func (s *Service) editMenuMessage(ctx context.Context, owner, messageID int64, text string, keyboard any) error {
+	if messageID <= 0 {
+		return s.say(ctx, owner, text, keyboard)
+	}
+	var out SentMessage
+	err := s.TG.Call(ctx, "editMessageText", map[string]any{
+		"chat_id": owner, "message_id": messageID, "text": text,
+		"reply_markup": keyboard, "link_preview_options": map[string]bool{"is_disabled": true},
+	}, &out)
+	var te *TelegramError
+	if errors.As(err, &te) && te.Code == 400 && strings.Contains(strings.ToLower(te.Description), "message is not modified") {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if out.ID != messageID || out.Chat.ID != owner {
+		return errors.New("Telegram не подтвердил обновление меню")
+	}
+	return nil
+}
+
+func (s *Service) showSettings(ctx context.Context, owner, messageID int64, panel, notice string) error {
 	j, err := NewAutoliker(s).settings(ctx, owner)
 	if err != nil {
 		return err
@@ -16,19 +49,130 @@ func (s *Service) OpenSettings(ctx context.Context, owner int64) error {
 	b := func(text, action string) map[string]string {
 		return map[string]string{"text": text, "callback_data": "as:" + j.Nonce + ":" + action}
 	}
-	rows := [][]map[string]string{
-		{b("▶ Серия", "series"), b("♾ Авто", "automatic"), b("⏹ Выключить", "off")},
-		{b("10 с", "interval:10"), b("30 с", "interval:30"), b("60 с", "interval:60")},
-		{b("1 лайк", "count:1"), b("10", "count:10"), b("25", "count:25"), b("50", "count:50")},
-		{b("Лимит 10", "cap:10"), b("20", "cap:20"), b("50", "cap:50"), b("100", "cap:100")},
-		{b("🔎 Фильтры", "filters")},
+	choice := func(label, key string, value, selected int) map[string]string {
+		if value == selected {
+			label = "✅ " + label
+		}
+		return b(label, key+":"+strconv.Itoa(value))
 	}
-	text := s.AutolikeStatus(ctx, owner) + fmt.Sprintf("\nРазмер серии: %d.\nСначала ⭐ избранное, затем свежая выдача по фильтрам.\nМой лимит /24ч включает ручные и неопределённые отправки; это не квота Jardulik.\nСерия: /autolikes N (1..50). Лимит: /autolike_cap N (1..500).", j.Count)
-	return s.say(ctx, owner, text, map[string]any{"inline_keyboard": rows})
+	mode := map[string]string{"off": "выключен", "series": "серия", "automatic": "авто"}[j.Mode]
+	text := "Автолайкер: " + mode
+	var rows [][]map[string]string
+	switch panel {
+	case "interval":
+		text += fmt.Sprintf("\n\nИнтервал между лайками: %d с", j.Interval)
+		rows = [][]map[string]string{{
+			choice("10 с", "interval", 10, j.Interval), choice("30 с", "interval", 30, j.Interval), choice("60 с", "interval", 60, j.Interval),
+		}}
+	case "count":
+		text += fmt.Sprintf("\n\nРазмер серии: %s\nПосле серии бот останавливается. Изменение размера действует для следующей серии.", settingsLikeCount(j.Count))
+		rows = [][]map[string]string{{
+			choice("1 лайк", "count", 1, j.Count), choice("10 лайков", "count", 10, j.Count),
+		}, {
+			choice("25 лайков", "count", 25, j.Count), choice("50 лайков", "count", 50, j.Count),
+		}}
+		if j.Count != 1 && j.Count != 10 && j.Count != 25 && j.Count != 50 {
+			rows = append(rows, []map[string]string{choice(settingsLikeCount(j.Count), "count", j.Count, j.Count)})
+		}
+	case "cap":
+		text += fmt.Sprintf("\n\nМой лимит: %s /24ч\nУчитывает ручные лайки и отправки с неизвестным результатом. Лимит Jardulik учитывается отдельно.", settingsLikeCount(j.DailyCap))
+		rows = [][]map[string]string{{
+			choice("10 /24ч", "cap", 10, j.DailyCap), choice("20 /24ч", "cap", 20, j.DailyCap),
+		}, {
+			choice("50 /24ч", "cap", 50, j.DailyCap), choice("100 /24ч", "cap", 100, j.DailyCap),
+		}}
+		if j.DailyCap != 10 && j.DailyCap != 20 && j.DailyCap != 50 && j.DailyCap != 100 {
+			rows = append(rows, []map[string]string{choice(fmt.Sprintf("%d /24ч", j.DailyCap), "cap", j.DailyCap, j.DailyCap)})
+		}
+	default:
+		panel = ""
+		if j.Mode == "series" {
+			text += fmt.Sprintf("\nОтправлено: %d из %d", j.Sent, j.Limit)
+		} else if j.Mode != "off" {
+			text += fmt.Sprintf("\nОтправлено за запуск: %d", j.Sent)
+		}
+		text += "\n\n⭐ Избранное → анкеты по фильтрам. Только анкеты 18+.\nАвто продолжает после снятия лимита. Серия заканчивается после выбранного числа лайков."
+		var sourceState, sourceReason string
+		var paused bool
+		err := s.Store.DB.QueryRowContext(ctx, `SELECT COALESCE(s.state,''),COALESCE(s.last_error,''),u.paused FROM users u LEFT JOIN sessions s ON s.owner_id=u.id WHERE u.id=?`, owner).Scan(&sourceState, &sourceReason, &paused)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if sourceState != "connected" {
+			switch {
+			case sourceReason == "unexpected_response_or_challenge":
+				text += "\n\nПодключение Jardulik приостановлено после необычного ответа. Подключи аккаунт заново."
+			case sourceState == "reconnect_required":
+				text += "\n\nПодключение Jardulik истекло. Подключи аккаунт заново."
+			default:
+				text += "\n\nJardulik не подключён."
+			}
+			rows = append(rows, []map[string]string{{"text": "🔑 Подключить Jardulik", "callback_data": "connect_help"}})
+		} else if paused {
+			text += "\n\n⏸ Действия приостановлены."
+		} else if !s.Config.AllowReactions || !s.Store.cfg.AllowReactions {
+			text += "\n\nОтправка лайков сейчас выключена."
+		} else if j.Mode == "off" {
+			rows = append(rows, []map[string]string{b("▶ Запустить авто", "automatic")}, []map[string]string{b("▶ Серия · "+settingsLikeCount(j.Count), "series")})
+		}
+		if filters, err := NewAutoliker(s).filters(ctx, owner); err == nil {
+			place := filterCountryLabel(filters.Country)
+			if filters.Country == "" {
+				place = "Любая страна"
+			}
+			text += fmt.Sprintf("\n\n🔎 %d-%d лет · %d-%d см\n📍 %s", filters.AgeMin, filters.AgeMax, filters.HeightMin, filters.HeightMax, place)
+			if filters.City != "" {
+				text += ", " + filters.City
+			}
+		} else {
+			text += "\n\nФильтры недоступны до подключения Jardulik."
+		}
+		rows = append(rows,
+			[]map[string]string{b(fmt.Sprintf("⏱ Интервал · %d с", j.Interval), "view:interval"), b(fmt.Sprintf("🔢 Серия · %d", j.Count), "view:count")},
+			[]map[string]string{b(fmt.Sprintf("🧮 Мой лимит · %d /24ч", j.DailyCap), "view:cap")},
+			[]map[string]string{b("🔎 Фильтры", "filters"), b("↻ Обновить", "refresh")})
+		if j.Reason != "" {
+			text += "\n\n" + autoReason(j.Reason)
+		}
+		if j.Mode != "off" && j.NextAttempt > time.Now().UnixMilli() {
+			text += "\nСледующая попытка: " + displayTime(time.UnixMilli(j.NextAttempt).UTC().Format(time.RFC3339))
+		}
+	}
+	if j.Mode != "off" {
+		rows = append([][]map[string]string{{b("⏹ Остановить", "off")}}, rows...)
+	}
+	if panel != "" {
+		rows = append(rows, []map[string]string{b("← Автолайкер", "home")})
+	}
+	if notice != "" {
+		text += "\n\n" + notice
+	}
+	return s.editMenuMessage(ctx, owner, messageID, text, map[string]any{"inline_keyboard": rows})
+}
+
+func settingsLikeCount(n int) string {
+	word := "лайков"
+	if n%100 < 11 || n%100 > 14 {
+		switch n % 10 {
+		case 1:
+			word = "лайк"
+		case 2, 3, 4:
+			word = "лайка"
+		}
+	}
+	return fmt.Sprintf("%d %s", n, word)
 }
 
 // Settings dispatch runs under the Service's private-owner gate and userLock.
 func (s *Service) HandleSettingsCallback(ctx context.Context, owner int64, data string) (bool, error) {
+	return s.handleSettingsCallback(ctx, owner, 0, data)
+}
+
+func (s *Service) HandleSettingsMessageCallback(ctx context.Context, owner, messageID int64, data string) (bool, error) {
+	return s.handleSettingsCallback(ctx, owner, messageID, data)
+}
+
+func (s *Service) handleSettingsCallback(ctx context.Context, owner, messageID int64, data string) (bool, error) {
 	if !strings.HasPrefix(data, "as:") {
 		return false, nil
 	}
@@ -40,7 +184,7 @@ func (s *Service) HandleSettingsCallback(ctx context.Context, owner int64, data 
 		if err := s.DisableAutolike(ctx, owner, "user_off"); err != nil {
 			return true, err
 		}
-		return true, s.OpenSettings(ctx, owner)
+		return true, s.OpenSettingsMessage(ctx, owner, messageID)
 	}
 	a := NewAutoliker(s)
 	j, err := a.settings(ctx, owner)
@@ -48,16 +192,33 @@ func (s *Service) HandleSettingsCallback(ctx context.Context, owner int64, data 
 		return true, err
 	}
 	if parts[1] != j.Nonce {
-		return true, errors.New("меню устарело; открой /settings")
+		if messageID <= 0 {
+			return true, errors.New("меню устарело; открой /settings")
+		}
+		notice := "Меню обновлено. Выбери действие ещё раз."
+		if parts[2] == "series" || parts[2] == "automatic" {
+			notice = "Настройки изменились. Для запуска нажми кнопку ещё раз."
+		}
+		return true, s.showSettings(ctx, owner, messageID, "", notice)
 	}
-	if parts[2] == "filters" {
-		return true, s.OpenFilters(ctx, owner)
-	}
-	if parts[2] == "series" || parts[2] == "automatic" {
+	switch parts[2] {
+	case "home", "refresh":
+		return true, s.OpenSettingsMessage(ctx, owner, messageID)
+	case "view":
+		if len(parts) != 4 || (parts[3] != "interval" && parts[3] != "count" && parts[3] != "cap") {
+			return true, errors.New("неверная кнопка")
+		}
+		return true, s.showSettings(ctx, owner, messageID, parts[3], "")
+	case "filters":
+		return true, s.OpenFiltersMessage(ctx, owner, messageID)
+	case "series", "automatic":
 		if err = a.startLocked(ctx, owner, parts[2], j.Count, j.Nonce); err != nil {
+			if messageID > 0 {
+				return true, s.showSettings(ctx, owner, messageID, "", "Не удалось запустить: "+err.Error())
+			}
 			return true, err
 		}
-		return true, s.OpenSettings(ctx, owner)
+		return true, s.OpenSettingsMessage(ctx, owner, messageID)
 	}
 	if len(parts) != 4 {
 		return true, errors.New("неверная кнопка")
@@ -66,10 +227,13 @@ func (s *Service) HandleSettingsCallback(ctx context.Context, owner int64, data 
 	if err != nil {
 		return true, errors.New("неверная настройка")
 	}
-	if err = a.updateSetting(ctx, owner, j.Nonce, parts[2], value); err != nil {
-		return true, err
+	current := map[string]int{"interval": j.Interval, "count": j.Count, "cap": j.DailyCap}
+	if selected, ok := current[parts[2]]; !ok || selected != value {
+		if err = a.updateSetting(ctx, owner, j.Nonce, parts[2], value); err != nil {
+			return true, err
+		}
 	}
-	return true, s.OpenSettings(ctx, owner)
+	return true, s.showSettings(ctx, owner, messageID, parts[2], "")
 }
 func (a *Autoliker) updateSetting(ctx context.Context, owner int64, nonce, key string, value int) error {
 	column := ""

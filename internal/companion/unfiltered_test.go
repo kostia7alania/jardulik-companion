@@ -49,7 +49,7 @@ func unfilteredFixture(t *testing.T) (*Client, Session, *unfilteredSource) {
 	return s.Client, Session{UserID: 101, Generation: "1"}, source
 }
 
-func TestUsersUnfilteredFrozenOmitsEveryFilterAndPreservesNumbers(t *testing.T) {
+func TestUsersUnfilteredFrozenUsesBroadAgesWithoutPersonalFiltersAndPreservesNumbers(t *testing.T) {
 	client, expected, source := unfilteredFixture(t)
 	ctx := context.Background()
 	if _, err := client.Store.DB.ExecContext(ctx, filterSchema); err != nil {
@@ -70,7 +70,7 @@ func TestUsersUnfilteredFrozenOmitsEveryFilterAndPreservesNumbers(t *testing.T) 
 		if others {
 			all = "1"
 		}
-		want := url.Values{"userId": {"101"}, "pageNumber": {"2"}, "pageSize": {"150"}, "all": {all}}
+		want := url.Values{"userId": {"101"}, "pageNumber": {"2"}, "pageSize": {"150"}, "all": {all}, "ageMin": {"0"}, "ageMax": {"111"}}
 		if query := source.queries[len(source.queries)-1]; !reflect.DeepEqual(query, want) {
 			t.Fatalf("unfiltered query contains preferences or missing fields: %v", query)
 		}

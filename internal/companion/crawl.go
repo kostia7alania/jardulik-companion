@@ -215,12 +215,17 @@ func (e *crawlLifecycleError) Error() string {
 // Caller holds userLock to serialize explicit requests and daily scheduling.
 func (c *FeedCrawler) requestLocked(ctx context.Context, owner int64, includeOthers bool, includeLocations ...bool) (*CrawlJob, error) {
 	locations := len(includeLocations) == 1 && includeLocations[0]
+	return c.requestRunLocked(ctx, owner, includeOthers, locations, nil)
+}
+
+// replacement pins an active older broad query so its cursor is never reused for new parameters.
+func (c *FeedCrawler) requestRunLocked(ctx context.Context, owner int64, includeOthers, locations bool, replacement *CrawlJob) (*CrawlJob, error) {
 	s := c.Service
 	if err := c.init(ctx); err != nil {
 		return nil, err
 	}
 	filters := DefaultFeedFilters()
-	filters.AgeMin, filters.AgeMax = 0, 100
+	filters.AgeMin, filters.AgeMax = broadCrawlAgeMin, broadCrawlAgeMax
 	if err := filters.validate(); err != nil {
 		return nil, err
 	}
@@ -237,6 +242,10 @@ func (c *FeedCrawler) requestLocked(ctx context.Context, owner int64, includeOth
 		return nil, err
 	}
 	defer tx.Rollback()
+	// Reserve the writer before reading lifecycle state shared with other processes.
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='feed_crawl_next'"); err != nil {
+		return nil, err
+	}
 	var paused bool
 	if err = tx.QueryRowContext(ctx, "SELECT paused FROM users WHERE id=?", owner).Scan(&paused); err != nil {
 		return nil, err
@@ -245,7 +254,7 @@ func (c *FeedCrawler) requestLocked(ctx context.Context, owner int64, includeOth
 		return nil, &crawlLifecycleError{state: "paused"}
 	}
 	expectedDaily, daily := ctx.Value(dailyCrawlRequestKey{}).(dailyCrawlIdentity)
-	if daily {
+	if daily || replacement != nil {
 		var blocked bool
 		if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM meta WHERE key=? AND value='1')", dailyCrawlBlockKey(owner)).Scan(&blocked); err != nil {
 			return nil, err
@@ -264,12 +273,18 @@ func (c *FeedCrawler) requestLocked(ctx context.Context, owner int64, includeOth
 	if daily && (session.UserID != expectedDaily.UserID || session.Generation != expectedDaily.Generation) {
 		return nil, &crawlLifecycleError{state: "session_changed"}
 	}
-	var oldState string
-	err = tx.QueryRowContext(ctx, "SELECT state FROM feed_crawls WHERE owner_id=?", owner).Scan(&oldState)
+	old, err := scanCrawl(tx.QueryRowContext(ctx, "SELECT "+crawlColumns+" FROM feed_crawls WHERE owner_id=?", owner))
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	if oldState == "queued" || oldState == "running" {
+	if replacement != nil {
+		if session.UserID != replacement.UserID || session.Generation != replacement.Generation {
+			return nil, &crawlLifecycleError{state: "session_changed"}
+		}
+		if old == nil || old.RunID != replacement.RunID || old.UserID != replacement.UserID || old.Generation != replacement.Generation || !old.active() || !old.Unfiltered || old.Filters.AgeMin == broadCrawlAgeMin && old.Filters.AgeMax == broadCrawlAgeMax {
+			return nil, &crawlLifecycleError{state: "job_stopped"}
+		}
+	} else if old != nil && old.active() {
 		return nil, &crawlLifecycleError{state: "active"}
 	}
 	now := c.now().UnixMilli()
@@ -552,6 +567,14 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		return true, e
 	} else if reason != "" {
 		return true, c.stop(ctx, j, reason)
+	}
+	if j.Unfiltered && (j.Filters.AgeMin != broadCrawlAgeMin || j.Filters.AgeMax != broadCrawlAgeMax) {
+		_, err = c.requestRunLocked(ctx, j.Owner, j.IncludeOthers, j.IncludeLocations, j)
+		var lifecycle *crawlLifecycleError
+		if errors.As(err, &lifecycle) {
+			return true, c.stop(ctx, j, lifecycle.state)
+		}
+		return true, err
 	}
 	if j.Mode < 0 || j.Mode > 3 || (j.Mode >= 2 && !j.IncludeLocations) {
 		return true, c.stop(ctx, j, "invalid_phase")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -113,30 +114,87 @@ func redactedTransportError(err error) error {
 }
 
 func (c *Client) Login(ctx context.Context, owner int64, raw string) error {
+	_, err := c.LoginAccount(ctx, owner, raw)
+	return err
+}
+
+// LoginAccount keeps the previous session until the new identity is verified and committed.
+func (c *Client) LoginAccount(ctx context.Context, owner int64, raw string) (Profile, error) {
 	if err := ValidateInitData(raw, c.Store.cfg.SourceBotID, owner, c.Now(), c.Store.cfg.InitMaxAge); err != nil {
-		return err
+		return nil, err
 	}
 	mu := c.lock(owner)
 	mu.Lock()
 	defer mu.Unlock()
-	b, err := c.exchange(ctx, "POST", "/appuser/login/telegram", "", map[string]string{"initData": raw})
+	var previous []byte
+	var upstream int64
+	var state, reason string
+	err := c.Store.DB.QueryRowContext(ctx, "SELECT encrypted,upstream_id,state,last_error FROM sessions WHERE owner_id=?", owner).Scan(&previous, &upstream, &state, &reason)
+	missing := errors.Is(err, sql.ErrNoRows)
+	if err != nil && !missing {
+		return nil, err
+	}
+	b, err := c.exchange(ctx, http.MethodPost, "/appuser/login/telegram", "", map[string]string{"initData": raw})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	session, err := decodeLoginResponse(b)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	accountRaw, err := c.exchange(ctx, http.MethodGet, "/user/getMe?userId="+strconv.FormatInt(session.UserID, 10), session.Token, nil)
+	if err != nil {
+		return nil, err
+	}
+	account, err := decodeProfile(accountRaw)
+	if err != nil {
+		return nil, err
+	}
+	if account.ID() != session.UserID {
+		return nil, errors.New("Jardulik account identity changed")
 	}
 	var generation [16]byte
 	if _, err = rand.Read(generation[:]); err != nil {
-		return err
+		return nil, err
 	}
 	session.Generation = hex.EncodeToString(generation[:])
-	if err = c.Store.SaveSession(ctx, owner, session); err != nil {
-		return err
+	encoded, err := json.Marshal(session)
+	if err != nil {
+		return nil, err
 	}
-	c.Store.Event(ctx, owner, "connect_success")
-	return nil
+	encoded, err = seal(c.Store.cfg.SessionKey, encoded, sessionPurpose(owner))
+	if err != nil {
+		return nil, err
+	}
+	tx, err := c.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var result sql.Result
+	if missing {
+		result, err = tx.ExecContext(ctx, `INSERT INTO sessions(owner_id,upstream_id,encrypted,expires_at,state,account_json) VALUES(?,?,?,?,'connected',?) ON CONFLICT(owner_id) DO NOTHING`, owner, session.UserID, encoded, session.Expires, string(accountRaw))
+	} else {
+		// A second process may have paused, replaced or disconnected this binding during HTTP.
+		result, err = tx.ExecContext(ctx, `UPDATE sessions SET upstream_id=?,encrypted=?,expires_at=?,state='connected',last_error='',account_json=?,updated_at=CURRENT_TIMESTAMP WHERE owner_id=? AND encrypted=? AND upstream_id=? AND state=? AND last_error=?`, session.UserID, encoded, session.Expires, string(accountRaw), owner, previous, upstream, state, reason)
+	}
+	if err != nil {
+		return nil, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if changed != 1 {
+		return nil, errors.New("сессия изменилась; подключение отменено")
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO events(owner_id,kind) VALUES(?,'connect_success')", owner); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return account, nil
 }
 
 func decodeLoginResponse(b []byte) (Session, error) {

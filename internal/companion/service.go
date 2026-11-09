@@ -272,13 +272,13 @@ func (s *Service) handle(ctx context.Context, u Update) {
 	}
 	if u.Callback != nil {
 		_ = s.TG.Call(ctx, "answerCallbackQuery", map[string]string{"callback_query_id": u.Callback.ID}, nil)
-		if handled, err := s.HandleSettingsCallback(ctx, owner, u.Callback.Data); handled {
+		if handled, err := s.HandleSettingsMessageCallback(ctx, owner, m.ID, u.Callback.Data); handled {
 			if err != nil {
 				_ = s.say(ctx, owner, "Не удалось изменить настройки: "+err.Error(), nil)
 			}
 			return
 		}
-		if s.FilterCallback(ctx, owner, u.Callback.Data) {
+		if s.FilterMessageCallback(ctx, owner, m.ID, u.Callback.Data) {
 			return
 		}
 		if s.HandleRelationCallback(ctx, owner, u.Callback.Data) {
@@ -336,9 +336,9 @@ func (s *Service) handle(ctx context.Context, u Update) {
 			case "status":
 				s.status(ctx, owner)
 			case "filters":
-				_ = s.OpenFilters(ctx, owner)
+				_ = s.OpenFiltersMessage(ctx, owner, m.ID)
 			case "settings":
-				_ = s.OpenSettings(ctx, owner)
+				_ = s.OpenSettingsMessage(ctx, owner, m.ID)
 			case "likes":
 				s.OpenRelations(ctx, owner, false)
 			case "matches":
@@ -443,19 +443,18 @@ func (s *Service) handle(ctx context.Context, u Update) {
 		if err == nil {
 			err = s.Media.CheckDisk()
 		}
+		var account Profile
 		if err == nil {
-			err = s.Client.Login(ctx, owner, raw)
+			account, err = s.Client.LoginAccount(ctx, owner, raw)
 		}
 		if err != nil {
-			_ = s.say(ctx, owner, "Не удалось подключить: "+err.Error(), nil)
+			_ = s.say(ctx, owner, "Не удалось подключить: "+err.Error(), mainButtons())
 			return
 		}
-		account, err := s.Client.Me(ctx, owner)
-		if err != nil {
-			_ = s.say(ctx, owner, "Сессия получена, но проверка аккаунта не завершилась. /status", nil)
-			return
-		}
-		_ = s.say(ctx, owner, "Аккаунт подключён. "+accountSummary(account)+"\n/next покажет первую анкету. Настройки и автолайки: /settings", nil)
+		_ = s.say(ctx, owner, "✅ Jardulik подключён. "+accountSummary(account), map[string]any{"inline_keyboard": [][]map[string]string{
+			{{"text": "▶ Автолайкер", "callback_data": "settings"}},
+			{{"text": "Следующая анкета", "callback_data": "next"}},
+		}})
 	case "/next":
 		s.next(ctx, owner)
 	case "/status":

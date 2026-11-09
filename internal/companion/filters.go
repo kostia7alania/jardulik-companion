@@ -60,7 +60,7 @@ var filterOptions = map[string][]string{
 }
 
 func (f FeedFilters) validate() error {
-	if f.AgeMin < 0 || f.AgeMax > 100 || f.AgeMax < f.AgeMin || f.HeightMin < 100 || f.HeightMax > 250 || f.HeightMin > f.HeightMax {
+	if f.AgeMin < 0 || f.AgeMax > 111 || f.AgeMax < f.AgeMin || f.HeightMin < 100 || f.HeightMax > 250 || f.HeightMin > f.HeightMax {
 		return errors.New("неверный диапазон фильтра")
 	}
 	for field, value := range map[string]string{"goal": f.Goal, "children": f.Children, "worldview": f.Worldview} {
@@ -103,6 +103,7 @@ func (f FeedFilters) query(user int64, page int, others bool) url.Values {
 }
 
 type filterDraft struct {
+	MessageID  int64        `json:"messageId,omitempty"`
 	ID         string       `json:"id"`
 	Generation string       `json:"generation"`
 	UserID     int64        `json:"userId"`
@@ -476,9 +477,18 @@ func (s *Service) filterPremium(ctx context.Context, owner int64) (Profile, Sess
 }
 
 func (s *Service) OpenFilters(ctx context.Context, owner int64) error {
+	return s.OpenFiltersMessage(ctx, owner, 0)
+}
+
+// OpenFiltersMessage uses only a message from the checked private-owner callback.
+func (s *Service) OpenFiltersMessage(ctx context.Context, owner, messageID int64) error {
+	return s.openFiltersMessage(ctx, owner, messageID, "")
+}
+
+func (s *Service) openFiltersMessage(ctx context.Context, owner, messageID int64, notice string) error {
 	account, session, err := s.filterPremium(ctx, owner)
 	if err != nil {
-		_ = s.say(ctx, owner, "Не удалось открыть фильтры: "+err.Error(), nil)
+		s.filterMenuError(ctx, owner, messageID, "Не удалось открыть фильтры: "+err.Error())
 		return err
 	}
 	state, err := s.Store.filterState(ctx, owner)
@@ -489,8 +499,20 @@ func (s *Service) OpenFilters(ctx context.Context, owner int64) error {
 	if state.Applied != nil {
 		values = *state.Applied
 	}
-	draft := &filterDraft{Generation: session.Generation, UserID: session.UserID, Values: values}
-	return s.showFilters(ctx, owner, draft, "", "")
+	draft := &filterDraft{MessageID: messageID, Generation: session.Generation, UserID: session.UserID, Values: values}
+	return s.showFilters(ctx, owner, draft, "", notice)
+}
+
+func (s *Service) filterMenuError(ctx context.Context, owner, messageID int64, text string) {
+	var keyboard any
+	if messageID > 0 {
+		back := filterButton{"text": "← Автолайкер", "callback_data": "settings"}
+		if state, err := s.Store.filterState(ctx, owner); err == nil && state.Draft != nil {
+			back = filterButtonFor(state.Draft.ID, "← Автолайкер", "settings")
+		}
+		keyboard = map[string]any{"inline_keyboard": [][]filterButton{{back}}}
+	}
+	_ = s.editMenuMessage(ctx, owner, messageID, text, keyboard)
 }
 
 func filterChoiceLabel(field, value string) string {
@@ -542,6 +564,11 @@ func (s *Service) showFilters(ctx context.Context, owner int64, draft *filterDra
 			min, max, label, unit = f.HeightMin, f.HeightMax, "Рост", "см"
 		}
 		text += fmt.Sprintf("%s: %d-%d %s\n", label, min, max, unit)
+		if field == "age" {
+			text += "Отправь два числа: 0 25."
+		} else {
+			text += "Отправь два числа: 150 180."
+		}
 		rows = [][]filterButton{
 			{button("От -1", field+":min:-1"), button("От +1", field+":min:1")},
 			{button("До -1", field+":max:-1"), button("До +1", field+":max:1")},
@@ -584,16 +611,22 @@ func (s *Service) showFilters(ctx context.Context, owner int64, draft *filterDra
 		}
 	}
 	if field != "" {
-		rows = append(rows, []filterButton{button("Назад", "back"), button("Отмена", "cancel")})
+		rows = append(rows, []filterButton{button("← Фильтры", "back"), button("Отмена", "cancel")})
 	}
+	rows = append(rows, []filterButton{button("← Автолайкер", "settings")})
 	if notice != "" {
 		text += "\n\n" + notice
 	}
-	return s.say(ctx, owner, text, map[string]any{"inline_keyboard": rows})
+	return s.editMenuMessage(ctx, owner, draft.MessageID, text, map[string]any{"inline_keyboard": rows})
 }
 
-// FilterCallback is called only after Handle has checked the private owner chat.
+// FilterCallback preserves the legacy command-menu behavior.
 func (s *Service) FilterCallback(ctx context.Context, owner int64, data string) bool {
+	return s.FilterMessageCallback(ctx, owner, 0, data)
+}
+
+// FilterMessageCallback is called only after Handle has checked the private owner chat.
+func (s *Service) FilterMessageCallback(ctx context.Context, owner, messageID int64, data string) bool {
 	if !strings.HasPrefix(data, "flt:") {
 		return false
 	}
@@ -604,19 +637,42 @@ func (s *Service) FilterCallback(ctx context.Context, owner int64, data string) 
 		}
 		parts := strings.Split(data, ":")
 		if len(parts) == 3 && parts[1] == "others" {
-			return s.acceptOtherProfiles(ctx, owner, parts[2], state)
+			return s.acceptOtherProfilesMessage(ctx, owner, messageID, parts[2], state)
 		}
 		if len(parts) < 3 || state.Draft == nil || parts[1] != state.Draft.ID {
-			return errors.New("эта панель устарела; открой /filters заново")
+			if messageID <= 0 || len(parts) < 3 {
+				return errors.New("эта панель устарела; открой /filters заново")
+			}
+			notice := "Панель обновлена. Выбери действие ещё раз."
+			if parts[2] == "apply" {
+				notice = "Черновик изменился. Проверь фильтры и нажми Применить ещё раз."
+			}
+			if state.Draft == nil {
+				return s.openFiltersMessage(ctx, owner, messageID, notice)
+			}
+			state.Draft.MessageID = messageID
+			state.Draft.Input, state.Draft.Cities = "", nil
+			return s.showFilters(ctx, owner, state.Draft, "", notice)
 		}
 		draft := state.Draft
+		// A callback's checked message is authoritative; stored IDs are only for text continuation.
+		draft.MessageID = messageID
 		switch parts[2] {
-		case "cancel":
+		case "cancel", "settings":
+			if len(parts) != 3 {
+				return errors.New("неверная кнопка фильтра")
+			}
 			if err := s.Store.saveFilterDraft(ctx, owner, nil); err != nil {
 				return err
 			}
+			if messageID > 0 || parts[2] == "settings" {
+				return s.showSettings(ctx, owner, messageID, "", "Изменения фильтров отменены.")
+			}
 			return s.say(ctx, owner, "Изменения фильтров отменены.", nil)
 		case "apply":
+			if len(parts) != 3 {
+				return errors.New("неверная кнопка фильтра")
+			}
 			_, session, err := s.filterPremium(ctx, owner)
 			if err != nil {
 				return err
@@ -634,6 +690,9 @@ func (s *Service) FilterCallback(ctx context.Context, owner int64, data string) 
 			}()
 			if err != nil {
 				return err
+			}
+			if messageID > 0 {
+				return s.showSettings(ctx, owner, messageID, "", "Фильтры применены.")
 			}
 			return s.say(ctx, owner, "Фильтры применены. /next покажет новую выдачу. История и избранное сохранены.", nil)
 		case "reset":
@@ -657,7 +716,7 @@ func (s *Service) FilterCallback(ctx context.Context, owner int64, data string) 
 			if field == "city" && draft.Values.Country == "" {
 				field = "country"
 			}
-			if field == "country" || field == "city" {
+			if field == "country" || field == "city" || field == "age" || field == "height" {
 				draft.Input = field
 			}
 			return s.showFilters(ctx, owner, draft, field, "")
@@ -752,7 +811,7 @@ func (s *Service) FilterCallback(ctx context.Context, owner int64, data string) 
 		}
 	}
 	if err := handle(); err != nil {
-		_ = s.say(ctx, owner, "Не удалось изменить фильтры: "+err.Error(), nil)
+		s.filterMenuError(ctx, owner, messageID, "Не удалось изменить фильтры: "+err.Error())
 	}
 	return true
 }
@@ -761,7 +820,7 @@ func filterSearch(text string) string {
 	return strings.ToLower(strings.TrimSpace(text))
 }
 
-// FilterText consumes text only while this owner's geography picker is open.
+// FilterText consumes text only while this owner's filter picker is open.
 func (s *Service) FilterText(ctx context.Context, owner int64, text string) bool {
 	if strings.HasPrefix(strings.TrimSpace(text), "/") {
 		return false
@@ -771,9 +830,44 @@ func (s *Service) FilterText(ctx context.Context, owner int64, text string) bool
 		return false
 	}
 	draft := state.Draft
+	if draft.Input == "age" || draft.Input == "height" {
+		field := draft.Input
+		lower, upper, example := int64(0), int64(100), "0 25"
+		if field == "height" {
+			lower, upper, example = 100, 250, "150 180"
+		}
+		parts := strings.Fields(text)
+		var from, to int64
+		valid := len(parts) == 2
+		if valid {
+			var fromErr, toErr error
+			from, fromErr = strconv.ParseInt(parts[0], 10, 64)
+			to, toErr = strconv.ParseInt(parts[1], 10, 64)
+			valid = fromErr == nil && toErr == nil && strings.Trim(parts[0]+parts[1], "0123456789") == "" && from >= lower && to <= upper && from <= to
+		}
+		if !valid {
+			_ = s.showFilters(ctx, owner, draft, field, fmt.Sprintf("Диапазон %d..%d. Отправь два числа: %s.", lower, upper, example))
+			return true
+		}
+		values := draft.Values
+		if field == "age" {
+			values.AgeMin, values.AgeMax = from, to
+		} else {
+			values.HeightMin, values.HeightMax = from, to
+		}
+		if err = values.validate(); err != nil {
+			s.filterMenuError(ctx, owner, draft.MessageID, err.Error())
+			return true
+		}
+		draft.Values, draft.Input, draft.Cities = values, "", nil
+		if err = s.showFilters(ctx, owner, draft, "", "Черновик обновлён. Нажми Применить для сохранения."); err != nil {
+			s.filterMenuError(ctx, owner, draft.MessageID, err.Error())
+		}
+		return true
+	}
 	search := filterSearch(text)
 	if search == "" || utf8.RuneCountInString(search) > 160 {
-		_ = s.say(ctx, owner, "Введи короткое название страны или города.", nil)
+		_ = s.showFilters(ctx, owner, draft, draft.Input, "Введи короткое название страны или города.")
 		return true
 	}
 	if draft.Input == "country" {
@@ -783,7 +877,7 @@ func (s *Service) FilterText(ctx context.Context, owner int64, text string) bool
 				draft.Values.Country, draft.Values.City, draft.Input, draft.Cities = country, "", "", nil
 				err = s.showFilters(ctx, owner, draft, "", "")
 				if err != nil {
-					_ = s.say(ctx, owner, err.Error(), nil)
+					s.filterMenuError(ctx, owner, draft.MessageID, err.Error())
 				}
 				return true
 			}
@@ -814,7 +908,7 @@ func (s *Service) FilterText(ctx context.Context, owner int64, text string) bool
 					draft.Values.City, draft.Input, draft.Cities = city.Name, "", nil
 					err = s.showFilters(ctx, owner, draft, "", "")
 					if err != nil {
-						_ = s.say(ctx, owner, err.Error(), nil)
+						s.filterMenuError(ctx, owner, draft.MessageID, err.Error())
 					}
 					return true
 				}
@@ -836,7 +930,7 @@ func (s *Service) FilterText(ctx context.Context, owner int64, text string) bool
 		}
 	}
 	if err != nil {
-		_ = s.say(ctx, owner, "Не удалось изменить фильтр: "+err.Error(), nil)
+		s.filterMenuError(ctx, owner, draft.MessageID, "Не удалось изменить фильтр: "+err.Error())
 	}
 	return true
 }
@@ -864,6 +958,10 @@ func (s *Service) OfferOtherProfiles(ctx context.Context, owner int64) error {
 }
 
 func (s *Service) acceptOtherProfiles(ctx context.Context, owner int64, id string, state filterState) error {
+	return s.acceptOtherProfilesMessage(ctx, owner, 0, id, state)
+}
+
+func (s *Service) acceptOtherProfilesMessage(ctx context.Context, owner, messageID int64, id string, state filterState) error {
 	if id == "" || id != state.OfferID {
 		return errors.New("это предложение устарело; повтори /next")
 	}
@@ -890,5 +988,5 @@ func (s *Service) acceptOtherProfiles(ctx context.Context, owner int64, id strin
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	return s.say(ctx, owner, "Показ остальных включён. /next запросит новую пачку. Это не отправляет лайки.", nil)
+	return s.editMenuMessage(ctx, owner, messageID, "Показ остальных включён. /next запросит новую пачку. Это не отправляет лайки.", nil)
 }

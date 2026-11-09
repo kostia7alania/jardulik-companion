@@ -51,10 +51,10 @@ func crawlFixture(t *testing.T, response func(mode, page int) ([]Profile, int)) 
 				t.Fatal(err)
 			}
 			if unfiltered {
-				if len(q) != 4 || q.Get("pageSize") != "150" {
+				if len(q) != 6 || q.Get("pageSize") != "150" || q.Get("ageMin") != "0" || q.Get("ageMax") != "111" {
 					t.Fatalf("broad crawl sent personal filters: %s", r.URL)
 				}
-				for _, key := range []string{"ageMin", "ageMax", "heightMin", "heightMax", "goal", "children", "worldview", "country", "city"} {
+				for _, key := range []string{"heightMin", "heightMax", "goal", "children", "worldview", "country", "city"} {
 					if _, ok := q[key]; ok {
 						t.Fatalf("unexpected %s query: %v", key, q)
 					}
@@ -125,7 +125,7 @@ func TestCrawlRequestIsLocalAtomicAndRespectsPause(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if j.Filters.AgeMin != 0 || j.Filters.AgeMax != 100 || !j.IncludeOthers || j.Page != 1 || j.State != "queued" {
+	if j.Filters.AgeMin != 0 || j.Filters.AgeMax != 111 || !j.IncludeOthers || j.Page != 1 || j.State != "queued" {
 		t.Fatalf("bad new job: %+v", j)
 	}
 	state, err := s.Store.filterState(ctx, 1)
@@ -842,7 +842,7 @@ func TestCrawlLegacyActiveCursorKeepsFrozenQueryUntilExplicitNewRun(t *testing.T
 		t.Fatalf("explicit new run did not persist the raw query contract: %+v err=%v", job, err)
 	}
 	crawlStep(t, c, now)
-	if len(queries) != 2 || len(queries[1]) != 4 || queries[1]["pageNumber"][0] != "1" || queries[1]["userId"][0] != "101" || queries[1]["pageSize"][0] != "150" || queries[1]["all"][0] != "0" {
+	if len(queries) != 2 || len(queries[1]) != 6 || queries[1]["ageMin"][0] != "0" || queries[1]["ageMax"][0] != "111" || queries[1]["pageNumber"][0] != "1" || queries[1]["userId"][0] != "101" || queries[1]["pageSize"][0] != "150" || queries[1]["all"][0] != "0" {
 		t.Fatalf("new run retained legacy filters: %v", queries)
 	}
 }

@@ -483,7 +483,8 @@ func (a *Autoliker) Step(ctx context.Context) (bool, error) {
 	if err != nil {
 		return stop("source_failed")
 	}
-	if c.source != "favorite" && !profileMatchesAutoFilters(full, j.Filters) {
+	// Zero may mean an open server filter; an automatic reaction still needs an adult age.
+	if number(full["age"]) < 18 || c.source != "favorite" && !profileMatchesAutoFilters(full, j.Filters) {
 		return true, a.candidateState(ctx, j, c.id, "skipped")
 	}
 	if err = a.guard(ctx, j); err != nil {
