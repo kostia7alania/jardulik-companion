@@ -280,3 +280,27 @@ func TestSettingsUXShowsAppliedFiltersAndSelectedTapDoesNotRotateNonce(t *testin
 		t.Fatalf("selected option changed run or nonce: before=%+v after=%+v", before, after)
 	}
 }
+
+func TestSettingsUXSuccessfulReconnectDoesNotShowOldDisconnectAsCurrent(t *testing.T) {
+	f, requests := settingsUXFixture(t)
+	s := f.worker.Service
+	ctx := context.Background()
+	if _, err := f.worker.settings(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DisableAutolike(ctx, 1, "disconnected"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.OpenSettingsMessage(ctx, 1, 100); err != nil {
+		t.Fatal(err)
+	}
+	menu := (*requests)[0]
+	if !strings.Contains(menu.Text, "Подключение восстановлено") || strings.Contains(menu.Text, "Нужно переподключение") {
+		t.Fatal("healthy session shows an obsolete reconnect error", menu.Text)
+	}
+	settingsUXAction(t, menu, "automatic")
+	state, err := f.worker.settings(ctx, 1)
+	if err != nil || state.Mode != "off" || state.Reason != "disconnected" || len(f.requests) != 0 {
+		t.Fatal("render changed the previous run or used source", err)
+	}
+}

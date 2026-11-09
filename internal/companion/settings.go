@@ -131,7 +131,9 @@ func (s *Service) showSettings(ctx context.Context, owner, messageID int64, pane
 			[]map[string]string{b(fmt.Sprintf("⏱ Интервал · %d с", j.Interval), "view:interval"), b(fmt.Sprintf("🔢 Серия · %d", j.Count), "view:count")},
 			[]map[string]string{b(fmt.Sprintf("🧮 Мой лимит · %d /24ч", j.DailyCap), "view:cap")},
 			[]map[string]string{b("🔎 Фильтры", "filters"), b("↻ Обновить", "refresh")})
-		if j.Reason != "" {
+		if j.Mode == "off" && j.Reason == "disconnected" && sourceState == "connected" {
+			text += "\n\nПодключение восстановлено. Можно запустить автолайкер."
+		} else if j.Reason != "" {
 			text += "\n\n" + autoReason(j.Reason)
 		}
 		if j.Mode != "off" && j.NextAttempt > time.Now().UnixMilli() {
