@@ -22,7 +22,7 @@ func run() error {
 	if len(os.Args) > 1 {
 		command = os.Args[1]
 	}
-	if (command == "serve-bot-parser" || command == "serve-poster") && len(os.Args) != 2 {
+	if (command == "serve-bot-parser" || command == "serve-poster" || command == "serve-compatibility") && len(os.Args) != 2 {
 		return errors.New("usage: jardulik " + command)
 	}
 	if command == "version" {
@@ -91,6 +91,17 @@ func run() error {
 		return s.RunBotParser(ctx)
 	case "serve-poster":
 		return s.RunPoster(ctx)
+	case "serve-compatibility":
+		return s.RunCompatibility(ctx)
+	case "compatibility-status":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik compatibility-status")
+		}
+		status, statusErr := s.Store.CompatibilityStatus(ctx, owner)
+		if statusErr != nil {
+			return statusErr
+		}
+		return json.NewEncoder(os.Stdout).Encode(status)
 	case "status":
 		if err = s.Store.Check(ctx); err != nil {
 			return err
@@ -220,7 +231,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, compatibility-status, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
 	}
 }
 func main() {

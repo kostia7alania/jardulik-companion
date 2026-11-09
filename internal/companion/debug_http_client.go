@@ -184,6 +184,11 @@ func (c *Client) debugRead(ctx context.Context, owner int64, expected Session, p
 	return status, body, e
 }
 func (c *Client) debugPost(ctx context.Context, owner int64, expected Session, path string, body []byte) (int, []byte, error) {
+	return c.debugPostGuarded(ctx, owner, expected, path, body, nil)
+}
+
+// The guard commits a durable intent under the shared session lock before a single POST.
+func (c *Client) debugPostGuarded(ctx context.Context, owner int64, expected Session, path string, body []byte, guard func(context.Context) error) (int, []byte, error) {
 	if _, e := c.token(ctx, owner, ""); e != nil {
 		return 0, nil, e
 	}
@@ -201,6 +206,12 @@ func (c *Client) debugPost(ctx context.Context, owner int64, expected Session, p
 	if path == "/reactions/addNew" && !c.Store.cfg.AllowReactions {
 		mu.Unlock()
 		return 0, nil, ErrReactionDisabled
+	}
+	if guard != nil {
+		if e = guard(ctx); e != nil {
+			mu.Unlock()
+			return 0, nil, e
+		}
 	}
 	status, response, e := c.debugExchange(ctx, current, http.MethodPost, path, body)
 	mu.Unlock()

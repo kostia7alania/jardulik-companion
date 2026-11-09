@@ -124,6 +124,7 @@ cp "$1" "$DEPLOY_TEST_PACKAGE"
         self.assertEqual(names, {"jardulik", "telegram-transfer", "deploy", "deploy/install.sh",
                                  "deploy/jardulik-companion.service",
                                  "deploy/jardulik-companion-poster.service",
+                                 "deploy/jardulik-companion-compatibility.service",
                                  "deploy/jardulik-companion-backup.service",
                                  "deploy/jardulik-companion-backup.timer"})
         self.assertNotIn("fixture-only", result.stdout + result.stderr)
@@ -205,7 +206,7 @@ for line in sys.stdin:
             if not success:
                 self.assertIn("helper checksum mismatch", result.stderr)
 
-    def run_activation_fixture(self, *, no_start=False, split=False, main="active", poster="missing", fail="", missing_pid=False):
+    def run_activation_fixture(self, *, no_start=False, split=False, main="active", poster="missing", compatibility="missing", fail="", missing_pid=False):
         script = (SOURCE / "deploy/install.sh").read_text()
         helpers = script.split("# BEGIN runtime unit helpers\n", 1)[1].split("# END runtime unit helpers", 1)[0]
         activation = script.split("# BEGIN controlled activation\n", 1)[1]
@@ -222,18 +223,25 @@ for line in sys.stdin:
         unit_dir.mkdir()
         main_name = "jardulik-companion.service"
         poster_name = "jardulik-companion-poster.service"
-        units = [main_name, poster_name, "jardulik-companion-backup.service", "jardulik-companion-backup.timer"]
+        compatibility_name = "jardulik-companion-compatibility.service"
+        timer_name = "jardulik-companion-backup.timer"
+        units = [main_name, poster_name, compatibility_name, "jardulik-companion-backup.service", timer_name]
         old_files = {main_name: "old split serve-bot-parser\n" if split else "old all-in-one serve\n",
-                     units[2]: "old backup-daily\n", units[3]: "old timer\n"}
+                     units[3]: "old backup-daily\n", timer_name: "old timer\n"}
         if split or poster != "missing":
             old_files[poster_name] = "old split serve-poster\n"
+        if compatibility != "missing":
+            old_files[compatibility_name] = "old serve-compatibility\n"
         for name, body in old_files.items():
             (unit_dir / name).write_text(body)
         states = {name: {"state": "inactive", "pid": "0", "enabled": "disabled"} for name in units}
         states[main_name].update(state=main, pid="123" if main == "active" else "0", enabled="enabled")
         states[poster_name].update(state="inactive" if poster == "missing" else poster,
                                   pid="124" if poster == "active" else "0", enabled="enabled" if split else "disabled")
-        states[units[3]].update(state="active", enabled="enabled")
+        states[compatibility_name].update(state="inactive" if compatibility == "missing" else compatibility,
+                                         pid="125" if compatibility == "active" else "0",
+                                         enabled="disabled" if compatibility == "missing" else "enabled")
+        states[timer_name].update(state="active", enabled="enabled")
         state_file = base / "states.json"
         state_file.write_text(json.dumps(states))
         control_log = base / "control.jsonl"
@@ -282,7 +290,9 @@ elif op in ('stop','start','enable','disable'):
         if op == 'start':
             if not (unit_dir/name).exists(): sys.exit(97)
             if current == 'a'*40 and name.endswith('-poster.service') and 'old split' not in (unit_dir/name).read_text(): sys.exit(96)
-            if os.environ['DEPLOY_TEST_FAIL'] == 'poster-start' and current == 'b'*40 and name.endswith('-poster.service'):
+            if current == 'a'*40 and name.endswith('-compatibility.service') and 'old serve-compatibility' not in (unit_dir/name).read_text():sys.exit(96)
+            if current == 'b'*40 and ((os.environ['DEPLOY_TEST_FAIL'] == 'poster-start' and name.endswith('-poster.service')) or
+                                      (os.environ['DEPLOY_TEST_FAIL'] == 'compatibility-start' and name.endswith('-compatibility.service'))):
                 data[name].update(state='failed',pid='0');state_file.write_text(json.dumps(data));sys.exit(1)
             data[name].update(state='active',pid='456')
         elif op == 'stop': data[name].update(state='inactive',pid='0')
@@ -306,8 +316,9 @@ else:
     source,target=paths
     states=json.loads(pathlib.Path(os.environ['DEPLOY_TEST_STATE']).read_text())
     if target.parent==pathlib.Path(os.environ['DEPLOY_TEST_UNITS']):
-        if any(states[n]['state']=='active' for n in ('jardulik-companion.service','jardulik-companion-poster.service')):sys.exit(94)
-        if os.environ['DEPLOY_TEST_FAIL']=='unit-copy' and target.name.endswith('-poster.service'):
+        if any(states[n]['state']=='active' for n in ('jardulik-companion.service','jardulik-companion-poster.service','jardulik-companion-compatibility.service')):sys.exit(94)
+        if ((os.environ['DEPLOY_TEST_FAIL']=='unit-copy' and target.name.endswith('-poster.service')) or
+            (os.environ['DEPLOY_TEST_FAIL']=='compatibility-copy' and target.name.endswith('-compatibility.service'))):
             print('fixture unit-copy failure',file=sys.stderr);sys.exit(1)
     shutil.copyfile(source,target)
 """)
@@ -319,49 +330,56 @@ if os.environ['DEPLOY_TEST_NO_START']=='1':sys.exit(99)
         for name in ("systemd-analyze", "sleep"):
             self.write_mock(name, "#!/bin/sh\nexit 0\n")
         setup = 'set -Eeuo pipefail\ndie(){ echo "$*" >&2; exit 1; }\nbase=$1; release_dir=$2; previous_target=$3; source_dir=$4; unit_dir=$5; revision=' + "b" * 40 + "\n"
-        setup += "data_dir=/unused; env_file=/unused; runtime_units=(jardulik-companion.service jardulik-companion-poster.service)\n"
+        setup += "data_dir=/unused; env_file=/unused; runtime_units=(jardulik-companion.service jardulik-companion-poster.service jardulik-companion-compatibility.service)\n"
         setup += 'unit_names=("${runtime_units[@]}" jardulik-companion-backup.service jardulik-companion-backup.timer)\nno_start=' + ("true" if no_start else "false") + "\n"
         result = subprocess.run(["bash", "-c", setup + helpers + activation, "activate", str(base), str(new), str(old), str(self.repo), str(unit_dir)],
                                 env=env,capture_output=True,text=True,timeout=15)
         calls = [json.loads(line) for line in control_log.read_text().splitlines()] if control_log.exists() else []
         return result,base,unit_dir,old_files,json.loads(state_file.read_text()),calls
 
-    def test_split_migration_stops_old_role_before_switch_and_starts_two_roles(self):
+    def test_migration_stops_old_roles_before_switch_and_starts_three_roles(self):
         result,base,unit_dir,old_files,states,calls=self.run_activation_fixture()
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual((base/'current').resolve().name,'b'*40)
         self.assertEqual((base/'previous').resolve().name,'a'*40)
         self.assertIn('serve-bot-parser',(unit_dir/'jardulik-companion.service').read_text())
         self.assertIn('serve-poster',(unit_dir/'jardulik-companion-poster.service').read_text())
+        self.assertIn('serve-compatibility',(unit_dir/'jardulik-companion-compatibility.service').read_text())
         self.assertEqual(states['jardulik-companion.service']['state'],'active')
         self.assertEqual(states['jardulik-companion-poster.service']['state'],'active')
+        self.assertEqual(states['jardulik-companion-compatibility.service']['state'],'active')
         stops=[c for c in calls if c['args'][0]=='stop']
         self.assertTrue(stops)
         self.assertTrue(all(c['current']=='a'*40 for c in stops))
         self.assertEqual(len(list((base/'deployments').glob('*/units/jardulik-companion.service'))),1)
 
-    def test_failed_split_migration_restores_legacy_or_split_units_and_binary_pair(self):
-        for split in (False,True):
-            for fail in ('poster-start','unit-copy','after-switch','enable-timer'):
-                with self.subTest(old_split=split,failure=fail):
-                    result,base,unit_dir,old_files,states,calls=self.run_activation_fixture(split=split,poster='active' if split else 'missing',fail=fail)
+    def test_failed_migration_restores_previous_roles_units_and_binary_pair(self):
+        for split,compatibility in ((False,'missing'),(True,'missing'),(True,'active')):
+            for fail in ('poster-start','compatibility-start','unit-copy','compatibility-copy','after-switch','enable-timer'):
+                with self.subTest(old_split=split,compatibility=compatibility,failure=fail):
+                    result,base,unit_dir,old_files,states,calls=self.run_activation_fixture(
+                        split=split,poster='active' if split else 'missing',compatibility=compatibility,fail=fail)
                     self.assertNotEqual(result.returncode,0)
-                    if fail=='unit-copy':self.assertIn('fixture unit-copy failure',result.stderr)
-                    if fail=='poster-start':self.assertTrue(any(c['args'][0]=='start' and c['current']=='b'*40 for c in calls),calls)
+                    if fail in ('unit-copy','compatibility-copy'):self.assertIn('fixture unit-copy failure',result.stderr)
+                    if fail.endswith('-start'):self.assertTrue(any(c['args'][0]=='start' and c['current']=='b'*40 for c in calls),calls)
                     if fail=='after-switch':self.assertTrue(any(c['args'][0]=='daemon-reload' and c['current']=='b'*40 for c in calls),calls)
                     if fail=='enable-timer':self.assertTrue(any(c['args'][0]=='enable' and '--now' in c['args'] and c['current']=='b'*40 for c in calls),calls)
                     self.assertEqual((base/'current').resolve().name,'a'*40,result.stderr)
                     for name,body in old_files.items():self.assertEqual((unit_dir/name).read_text(),body)
                     if not split:self.assertFalse((unit_dir/'jardulik-companion-poster.service').exists())
+                    if compatibility=='missing':self.assertFalse((unit_dir/'jardulik-companion-compatibility.service').exists())
                     for binary in ('jardulik','telegram-transfer'):self.assertEqual((base/'current'/binary).read_text(),'old:'+binary)
                     self.assertEqual(states['jardulik-companion.service']['state'],'active',result.stderr)
                     self.assertEqual(states['jardulik-companion.service']['enabled'],'enabled',result.stderr)
                     self.assertEqual(states['jardulik-companion-poster.service']['enabled'],'enabled' if split else 'disabled',result.stderr)
+                    self.assertEqual(states['jardulik-companion-compatibility.service']['enabled'],'enabled' if compatibility!='missing' else 'disabled',result.stderr)
                     self.assertEqual(states['jardulik-companion-backup.timer']['enabled'],'enabled',result.stderr)
                     self.assertEqual(states['jardulik-companion-backup.timer']['state'],'active',result.stderr)
                     if split:self.assertEqual(states['jardulik-companion-poster.service']['state'],'active',result.stderr)
-                    old_starts=[c for c in calls if c['args'][0]=='start' and c['current']=='a'*40 and any(name in c['args'] for name in ('jardulik-companion.service','jardulik-companion-poster.service'))]
-                    self.assertEqual(len(old_starts),2 if split else 1,result.stderr)
+                    if compatibility=='active':self.assertEqual(states['jardulik-companion-compatibility.service']['state'],'active',result.stderr)
+                    old_starts=[c for c in calls if c['args'][0]=='start' and c['current']=='a'*40 and any(
+                        name in c['args'] for name in ('jardulik-companion.service','jardulik-companion-poster.service','jardulik-companion-compatibility.service'))]
+                    self.assertEqual(len(old_starts),1+int(split)+int(compatibility=='active'),result.stderr)
 
     def test_no_start_mode_reaches_remote_installer_and_rejects_unknown_mode(self):
         self.commit_and_publish_locally()
@@ -376,14 +394,16 @@ if os.environ['DEPLOY_TEST_NO_START']=='1':sys.exit(99)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid installation mode", result.stderr)
 
-    def test_no_start_requires_both_roles_stopped_and_never_starts_on_rollback(self):
-        cases=(('inactive','missing',''),('inactive','inactive',''),('inactive','missing','after-switch'),
-               ('inactive','inactive','after-switch'),('active','missing',''),('inactive','active',''),
-               ('inactive','failed',''))
-        for main,poster,fail in cases:
-            with self.subTest(main=main,poster=poster,failure=fail):
-                result,base,unit_dir,old_files,states,calls=self.run_activation_fixture(no_start=True,main=main,poster=poster,fail=fail)
-                success=main=='inactive' and poster in ('missing','inactive') and not fail
+    def test_no_start_requires_all_roles_stopped_and_never_starts_on_rollback(self):
+        cases=(('inactive','missing','missing',''),('inactive','inactive','inactive',''),
+               ('inactive','missing','missing','after-switch'),('inactive','inactive','inactive','after-switch'),
+               ('active','missing','missing',''),('inactive','active','missing',''),('inactive','failed','missing',''),
+               ('inactive','inactive','active',''),('inactive','inactive','failed',''))
+        for main,poster,compatibility,fail in cases:
+            with self.subTest(main=main,poster=poster,compatibility=compatibility,failure=fail):
+                result,base,unit_dir,old_files,states,calls=self.run_activation_fixture(
+                    no_start=True,main=main,poster=poster,compatibility=compatibility,fail=fail)
+                success=main=='inactive' and poster in ('missing','inactive') and compatibility in ('missing','inactive') and not fail
                 self.assertEqual(result.returncode==0,success,result.stderr)
                 self.assertEqual((base/'current').resolve().name,('b' if success else 'a')*40)
                 forbidden={'start','restart','stop','enable','disable','systemd-run'}
@@ -391,10 +411,11 @@ if os.environ['DEPLOY_TEST_NO_START']=='1':sys.exit(99)
                 if not success:
                     for name,body in old_files.items():self.assertEqual((unit_dir/name).read_text(),body)
                     if poster=='missing':self.assertFalse((unit_dir/'jardulik-companion-poster.service').exists())
+                    if compatibility=='missing':self.assertFalse((unit_dir/'jardulik-companion-compatibility.service').exists())
                 else:
-                    self.assertIn('both roles remain stopped',result.stdout)
-                    self.assertEqual(states['jardulik-companion.service']['state'],'inactive')
-                    self.assertEqual(states['jardulik-companion-poster.service']['state'],'inactive')
+                    self.assertIn('all three roles remain stopped',result.stdout)
+                    for name in ('jardulik-companion.service','jardulik-companion-poster.service','jardulik-companion-compatibility.service'):
+                        self.assertEqual(states[name]['state'],'inactive')
 
     def test_first_migration_accepts_missing_poster_without_mainpid_property(self):
         result,base,unit_dir,old_files,states,calls=self.run_activation_fixture(no_start=True,main='inactive',poster='missing',missing_pid=True)
@@ -414,6 +435,14 @@ if os.environ['DEPLOY_TEST_NO_START']=='1':sys.exit(99)
             self.assertIn('Environment=GOMEMLIMIT=64MiB\n',text)
         self.assertNotIn('jardulik-companion.service',poster)
         self.assertNotIn('jardulik-companion-poster.service',main)
+        compatibility=(SOURCE/'deploy/jardulik-companion-compatibility.service').read_text()
+        self.assertIn('current/jardulik serve-compatibility\n',compatibility)
+        self.assertIn('After=network-online.target jardulik-companion.service\n',compatibility)
+        self.assertIn('MemoryMax=64M\n',compatibility)
+        self.assertIn('Environment=GOMEMLIMIT=32MiB\n',compatibility)
+        self.assertIn('ExecStart=/usr/bin/env GOMEMLIMIT=32MiB GOMAXPROCS=1 ',compatibility)
+        self.assertNotIn('PartOf=',compatibility)
+        self.assertNotIn('Requires=',compatibility)
         backup=(SOURCE/'deploy/jardulik-companion-backup.service').read_text()
         self.assertIn('current/jardulik backup-daily\n',backup)
         self.assertNotIn('serve',backup)
@@ -440,7 +469,9 @@ if os.environ['DEPLOY_TEST_NO_START']=='1':sys.exit(99)
         self.assertEqual(result.returncode, 0, result.stderr)
         for changes in ({"ALLOW_REACTIONS": "true"}, {"SESSION_KEY": "bad-key"},
                         {"JARDULIK_BOT_ID": "0"}, {"BACKUP_CHAT_ID": "12345"},
-                        {"MIN_FREE_BYTES": "1000"}):
+                        {"MIN_FREE_BYTES": "1000"}, {"COMPATIBILITY_ENABLED": "yes"},
+                        {"COMPATIBILITY_INTERVAL_SECONDS": "0"}, {"COMPATIBILITY_INTERVAL_SECONDS": "-1"},
+                        {"COMPATIBILITY_INTERVAL_SECONDS": "9223372037"}):
             with self.subTest(changes=changes):
                 result = validate(dict(values, **changes))
                 self.assertNotEqual(result.returncode, 0)

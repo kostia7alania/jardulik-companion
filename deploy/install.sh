@@ -29,7 +29,7 @@ base=/opt/jardulik-companion
 data_dir=/var/lib/jardulik-companion
 env_file=/etc/jardulik-companion.env
 unit_dir=/etc/systemd/system
-runtime_units=(jardulik-companion.service jardulik-companion-poster.service)
+runtime_units=(jardulik-companion.service jardulik-companion-poster.service jardulik-companion-compatibility.service)
 unit_names=("${runtime_units[@]}" jardulik-companion-backup.service jardulik-companion-backup.timer)
 
 # BEGIN runtime unit helpers
@@ -127,6 +127,11 @@ if values['APP_DATA_DIR'] != '/var/lib/jardulik-companion':
     raise SystemExit('install: APP_DATA_DIR does not match the service data directory')
 if values.get('ALLOW_REACTIONS', 'false').lower() != 'false':
     raise SystemExit('install: reactions must remain disabled for this deployment')
+if values.get('COMPATIBILITY_ENABLED', 'false') not in ('true', 'false'):
+    raise SystemExit('install: COMPATIBILITY_ENABLED must be true or false')
+compatibility_interval = values.get('COMPATIBILITY_INTERVAL_SECONDS', '60')
+if not re.fullmatch(r'[1-9][0-9]*', compatibility_interval) or int(compatibility_interval) > ((1 << 63) - 1) // 1000000000:
+    raise SystemExit('install: COMPATIBILITY_INTERVAL_SECONDS must fit a positive Go duration')
 reserve = values.get('MIN_FREE_BYTES', '2147483648')
 if not reserve.isdigit() or int(reserve) < 2147483648:
     raise SystemExit('install: MIN_FREE_BYTES must preserve at least 2 GiB')
@@ -325,8 +330,8 @@ if [[ -n $previous_target && $previous_target != "$release_dir" ]]; then
 fi
 trap - ERR
 if $no_start; then
-    printf 'Installed %s; both roles remain stopped; previous units: %s\n' "$revision" "$state_dir"
+    printf 'Installed %s; all three roles remain stopped; previous units: %s\n' "$revision" "$state_dir"
 else
-    printf 'Deployed %s; bot/parser and poster active; previous units: %s\n' "$revision" "$state_dir"
+    printf 'Deployed %s; bot/parser, poster and compatibility planner active; previous units: %s\n' "$revision" "$state_dir"
 fi
 # END controlled activation

@@ -23,6 +23,8 @@ type Config struct {
 	DataDir, Token, APIBase, TelegramBase              string
 	UserAgent                                          string
 	DebugListen                                        string
+	CompatibilityEnabled                               bool
+	CompatibilityGap                                   time.Duration
 	TelegramAPIID, TransferBytesPerSecond              int64
 	TelegramAPIHash, TransferHelper, TransferSession   string
 	OwnerID, SourceBotID, BackupChatID, BackupThreadID int64
@@ -39,6 +41,20 @@ type Config struct {
 
 func LoadConfig() (Config, error) {
 	c := Config{DataDir: os.Getenv("APP_DATA_DIR"), Token: os.Getenv("TELEGRAM_BOT_TOKEN"), APIBase: "https://api.jardulik.app/api", TelegramBase: "https://api.telegram.org", MinFreeBytes: 2 << 30, InitMaxAge: 24 * time.Hour, WatchInterval: 24 * time.Hour, WatchGap: 20 * time.Second, WatchDailyLimit: 2000}
+	c.CompatibilityGap = time.Minute
+	if raw := strings.TrimSpace(os.Getenv("COMPATIBILITY_ENABLED")); raw != "" {
+		if raw != "true" && raw != "false" {
+			return c, errors.New("COMPATIBILITY_ENABLED must be true or false")
+		}
+		c.CompatibilityEnabled = raw == "true"
+	}
+	if raw := strings.TrimSpace(os.Getenv("COMPATIBILITY_INTERVAL_SECONDS")); raw != "" {
+		seconds, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || seconds <= 0 || seconds > int64((1<<63-1)/time.Second) {
+			return c, errors.New("invalid COMPATIBILITY_INTERVAL_SECONDS")
+		}
+		c.CompatibilityGap = time.Duration(seconds) * time.Second
+	}
 	c.DebugListen = strings.TrimSpace(os.Getenv("JARDULIK_DEBUG_LISTEN"))
 	if c.DebugListen != "" {
 		host, port, err := net.SplitHostPort(c.DebugListen)

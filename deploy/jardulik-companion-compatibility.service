@@ -1,0 +1,36 @@
+[Unit]
+Description=Jardulik Companion compatibility planner
+Wants=network-online.target
+After=network-online.target jardulik-companion.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=jardulik
+Group=jardulik
+WorkingDirectory=/var/lib/jardulik-companion
+EnvironmentFile=/etc/jardulik-companion.env
+Environment=GOMEMLIMIT=32MiB
+Environment=GOMAXPROCS=1
+# EnvironmentFile overrides Environment; keep the planner limits after loading it.
+ExecStart=/usr/bin/env GOMEMLIMIT=32MiB GOMAXPROCS=1 /opt/jardulik-companion/current/jardulik serve-compatibility
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/jardulik-companion
+MemoryHigh=48M
+MemoryMax=64M
+TasksMax=16
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jardulik-companion-compatibility
+
+[Install]
+WantedBy=multi-user.target

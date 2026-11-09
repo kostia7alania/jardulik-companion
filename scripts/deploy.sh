@@ -54,7 +54,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 git -C "$repo_dir" fetch --no-tags origin
 [[ $(git -C "$repo_dir" rev-parse origin/main) == "$revision" ]] || die 'origin/main changed while building; refusing upload'
 mkdir "$staging_dir/release/deploy"
-for file in install.sh jardulik-companion.service jardulik-companion-poster.service jardulik-companion-backup.service jardulik-companion-backup.timer; do
+for file in install.sh jardulik-companion.service jardulik-companion-poster.service jardulik-companion-compatibility.service jardulik-companion-backup.service jardulik-companion-backup.timer; do
     cp "$repo_dir/deploy/$file" "$staging_dir/release/deploy/$file"
 done
 binary_sha=$(shasum -a 256 "$staging_dir/release/jardulik" | awk '{print $1}')

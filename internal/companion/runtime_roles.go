@@ -13,9 +13,10 @@ import (
 type RuntimeRole string
 
 const (
-	RuntimeAll       RuntimeRole = "all"
-	RuntimeBotParser RuntimeRole = "bot-parser"
-	RuntimePoster    RuntimeRole = "poster"
+	RuntimeAll           RuntimeRole = "all"
+	RuntimeBotParser     RuntimeRole = "bot-parser"
+	RuntimePoster        RuntimeRole = "poster"
+	RuntimeCompatibility RuntimeRole = "compatibility"
 )
 
 // RunBackground holds role locks until the caller cancels ctx and invokes wait.
@@ -23,11 +24,13 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 	var names []string
 	switch role {
 	case RuntimeAll:
-		names = []string{"bot-parser.lock", "archive-poster.lock"}
+		names = []string{"bot-parser.lock", "archive-poster.lock", "compatibility-planner.lock"}
 	case RuntimeBotParser:
 		names = []string{"bot-parser.lock"}
 	case RuntimePoster:
 		names = []string{"archive-poster.lock"}
+	case RuntimeCompatibility:
+		names = []string{"compatibility-planner.lock"}
 	default:
 		return nil, errors.New("invalid runtime role")
 	}
@@ -51,6 +54,12 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		}
 		locks = append(locks, lock)
 	}
+	if s.Config.CompatibilityEnabled {
+		if err = s.Store.InitCompatibility(ctx); err != nil {
+			unlock()
+			return nil, err
+		}
+	}
 	var debugRun func(context.Context)
 	if role == RuntimeAll || role == RuntimeBotParser {
 		debugRun, err = s.prepareDebugHTTP()
@@ -73,6 +82,9 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		start(s.Crawler.Run)
 		start(s.Autoliker.Run)
 		start(s.runContacts)
+		if s.Config.CompatibilityEnabled {
+			start(s.runCompatibilityExecutor)
+		}
 		start(s.runPrivateCardRepair)
 	}
 	if role == RuntimeAll || role == RuntimePoster {
@@ -81,6 +93,9 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 			start(s.RunCaptionMaintenance)
 		}
 		start(s.Watcher.RunPresence)
+	}
+	if s.Config.CompatibilityEnabled && (role == RuntimeAll || role == RuntimeCompatibility) {
+		start(s.runCompatibilityPlanner)
 	}
 	var once sync.Once
 	return func() { once.Do(func() { background.Wait(); unlock() }) }, nil
@@ -94,6 +109,17 @@ func (s *Service) RunPoster(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	wait, err := s.RunBackground(ctx, RuntimePoster)
+	if err != nil {
+		return err
+	}
+	defer wait()
+	<-ctx.Done()
+	return nil
+}
+
+// RunCompatibility starts only the database planner, independently of Telegram and source HTTP.
+func (s *Service) RunCompatibility(ctx context.Context) error {
+	wait, err := s.RunBackground(ctx, RuntimeCompatibility)
 	if err != nil {
 		return err
 	}
