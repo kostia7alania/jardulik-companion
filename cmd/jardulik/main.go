@@ -100,6 +100,11 @@ func run() error {
 			out["session"] = map[string]any{"tenant": owner, "user_id": session.UserID, "state": session.State, "expires_at": session.Expires, "account": json.RawMessage(session.Account)}
 		}
 		return json.NewEncoder(os.Stdout).Encode(out)
+	case "import-analysis":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik import-analysis < capture.json")
+		}
+		return importAnalysisCapture(ctx, s, owner, os.Stdin, os.Stdout)
 	case "import-contact":
 		if len(os.Args) != 2 {
 			return errors.New("usage: jardulik import-contact < evidence.json")
@@ -215,7 +220,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, connect (URL on stdin), account, fetch, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
 	}
 }
 func main() {

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,6 +22,7 @@ type Config struct {
 	FullBackupEnabled                                  bool
 	DataDir, Token, APIBase, TelegramBase              string
 	UserAgent                                          string
+	DebugListen                                        string
 	TelegramAPIID, TransferBytesPerSecond              int64
 	TelegramAPIHash, TransferHelper, TransferSession   string
 	OwnerID, SourceBotID, BackupChatID, BackupThreadID int64
@@ -37,6 +39,14 @@ type Config struct {
 
 func LoadConfig() (Config, error) {
 	c := Config{DataDir: os.Getenv("APP_DATA_DIR"), Token: os.Getenv("TELEGRAM_BOT_TOKEN"), APIBase: "https://api.jardulik.app/api", TelegramBase: "https://api.telegram.org", MinFreeBytes: 2 << 30, InitMaxAge: 24 * time.Hour, WatchInterval: 24 * time.Hour, WatchGap: 20 * time.Second, WatchDailyLimit: 2000}
+	c.DebugListen = strings.TrimSpace(os.Getenv("JARDULIK_DEBUG_LISTEN"))
+	if c.DebugListen != "" {
+		host, port, err := net.SplitHostPort(c.DebugListen)
+		n, parseErr := strconv.Atoi(port)
+		if err != nil || host != "127.0.0.1" || parseErr != nil || n < 0 || n > 65535 {
+			return c, errors.New("JARDULIK_DEBUG_LISTEN must use 127.0.0.1 and a valid port")
+		}
+	}
 	c.UserAgent = strings.TrimSpace(os.Getenv("JARDULIK_USER_AGENT"))
 	if c.UserAgent == "" {
 		c.UserAgent = defaultUserAgent

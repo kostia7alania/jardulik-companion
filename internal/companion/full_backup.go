@@ -1206,6 +1206,8 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		{"business_contact_connections", "business-connection", "SELECT owner_id,upstream_id,id,enabled FROM business_contact_connections"},
 		{"profile_business_contacts", "business-contact", "SELECT DISTINCT owner_id,upstream_id,profile_id,source_bot_id,connection_id,source_message_id,source_message_timestamp,contact_url,profile_url FROM profile_business_contacts"},
 		{"contact_requests", "contact-request", "SELECT owner_id,upstream_id,profile_id,state,request_json,response_body,http_status,reason FROM contact_requests"},
+		{"profile_analyses", "analysis", "SELECT owner_id,upstream_id,profile_id,provider,model,observed_at_ms,http_status,state,generation,request_body,response_body,own_profile,target_profile,capture_sha FROM profile_analyses"},
+		{"debug_api_calls", "debug-api-call", "SELECT owner_id,request_id,upstream_id,generation,path,target_id,reaction_type,request_body,response_body,http_status,state,error FROM debug_api_calls"},
 		{"business_contact_inbox", "business-contact-inbox", "SELECT owner_id,upstream_id,source_bot_id,connection_id,source_message_id,source_message_timestamp,update_id,parse_state,CAST(raw_json AS BLOB) FROM business_contact_inbox"},
 	}
 	for _, q := range queries {

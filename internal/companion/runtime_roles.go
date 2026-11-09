@@ -51,12 +51,23 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		}
 		locks = append(locks, lock)
 	}
+	var debugRun func(context.Context)
+	if role == RuntimeAll || role == RuntimeBotParser {
+		debugRun, err = s.prepareDebugHTTP()
+		if err != nil {
+			unlock()
+			return nil, err
+		}
+	}
 	var background sync.WaitGroup
 	start := func(run func(context.Context)) {
 		background.Add(1)
 		go func() { defer background.Done(); run(ctx) }()
 	}
 	if role == RuntimeAll || role == RuntimeBotParser {
+		if debugRun != nil {
+			start(debugRun)
+		}
 		start(s.Media.Run)
 		start(s.Watcher.RunChecks)
 		start(s.Crawler.Run)

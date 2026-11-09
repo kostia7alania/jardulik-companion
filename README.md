@@ -4,6 +4,7 @@
 
 - Бот: [@dvachers_jardulik_bot](https://t.me/dvachers_jardulik_bot).
 - Лендинг: [Jardulik Companion](https://kostia7alania.ru/jardulik-companion-site/).
+- Личный API-клиент: [запуск и работа через SSH](docs/owner-debug-client.md).
 - Регистрация через `/start`, работа в личном чате, данные разделены по владельцам.
 - Автолайки выключены по умолчанию. Подключение аккаунта и Premium их не включают.
 
