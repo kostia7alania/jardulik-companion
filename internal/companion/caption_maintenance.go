@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const captionDesignRevision = "2026-11-09-premium-badge-v2"
+const captionDesignRevision = "2026-11-10-model-bold-clock-v3"
 const captionMaintenanceSchema = `
 CREATE TABLE IF NOT EXISTS caption_maintenance_jobs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, revision TEXT NOT NULL, kind TEXT NOT NULL,
@@ -49,6 +49,38 @@ func (s *Service) ScheduleCaptionMaintenance(ctx context.Context) error {
 	}
 	if revision == captionDesignRevision {
 		return tx.Commit()
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE caption_maintenance_jobs SET state='superseded',error='newer_design_revision',updated_at=CURRENT_TIMESTAMP WHERE revision<>? AND state IN ('pending','retry')", captionDesignRevision); err != nil {
+		return err
+	}
+	var analysisPosts bool
+	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='analysis_posts')").Scan(&analysisPosts); err != nil {
+		return err
+	}
+	if analysisPosts {
+		if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO caption_maintenance_jobs(revision,kind,receipt_id,owner_id,version_id,inventory,source_sha,chat_id,thread_id)
+ SELECT ?,'analysis',p.analysis_id,p.owner_id,COALESCE(a.version_id,0),json_array(p.message_id),p.response_sha,p.chat_id,p.thread_id
+ FROM analysis_posts p JOIN profile_analyses a ON a.id=p.analysis_id AND a.owner_id=p.owner_id AND a.upstream_id=p.upstream_id AND a.profile_id=p.profile_id
+ JOIN sessions se ON se.owner_id=a.owner_id AND se.upstream_id=a.upstream_id
+ WHERE p.owner_id=? AND p.state='sent' AND p.message_id>0 AND p.chat_id=? AND p.thread_id>0`, captionDesignRevision, s.Config.OwnerID, s.Config.BackupChatID); err != nil {
+			return err
+		}
+	}
+	for _, notice := range []struct{ table, kind, receipt, version string }{
+		{"archive_change_posts", "change", "version_id", "version_id"},
+		{"profile_presence_events", "presence", "id", "version_id"},
+	} {
+		var exists bool
+		if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)", notice.table).Scan(&exists); err != nil {
+			return err
+		}
+		if exists {
+			query := `INSERT OR IGNORE INTO caption_maintenance_jobs(revision,kind,receipt_id,owner_id,version_id,inventory,chat_id,thread_id)
+ SELECT ?,?,` + notice.receipt + `,owner_id,` + notice.version + `,json_array(message_id),?,thread_id FROM ` + notice.table + ` WHERE owner_id=? AND state='sent' AND message_id>0 AND thread_id>0`
+			if _, err = tx.ExecContext(ctx, query, captionDesignRevision, notice.kind, s.Config.BackupChatID, s.Config.OwnerID); err != nil {
+				return err
+			}
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO caption_maintenance_jobs(revision,kind,receipt_id,owner_id,version_id,inventory,source_sha,chat_id,thread_id)
  SELECT ?,'archive',version_id,owner_id,version_id,message_ids,source_sha,?,thread_id FROM archive_versions WHERE state IN ('sent','partial')`, captionDesignRevision, s.Config.BackupChatID); err != nil {
@@ -132,7 +164,7 @@ func (w *captionMaintenanceWorker) claim(ctx context.Context) (*captionMaintenan
 	}
 	var j captionMaintenanceJob
 	err = tx.QueryRowContext(ctx, `SELECT id,kind,receipt_id,owner_id,version_id,inventory,source_sha,chat_id,thread_id,attempts FROM caption_maintenance_jobs
- WHERE revision=? AND state IN ('pending','retry') AND next_attempt<=? ORDER BY id LIMIT 1`, captionDesignRevision, w.now().UnixMilli()).Scan(&j.id, &j.kind, &j.receipt, &j.owner, &j.version, &j.inventory, &j.source, &j.chat, &j.thread, &j.attempts)
+ WHERE revision=? AND state IN ('pending','retry') AND next_attempt<=? ORDER BY CASE WHEN kind='analysis' THEN 0 WHEN kind IN ('change','presence') THEN 1 WHEN EXISTS(SELECT 1 FROM versions v WHERE v.id=caption_maintenance_jobs.version_id AND CASE WHEN json_valid(v.raw_json) THEN json_extract(v.raw_json,'$.type')=1 ELSE 0 END) THEN 2 ELSE 3 END,CASE WHEN kind='analysis' THEN -receipt_id ELSE id END LIMIT 1`, captionDesignRevision, w.now().UnixMilli()).Scan(&j.id, &j.kind, &j.receipt, &j.owner, &j.version, &j.inventory, &j.source, &j.chat, &j.thread, &j.attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -160,7 +192,7 @@ func (w *captionMaintenanceWorker) finish(ctx context.Context, j *captionMainten
 func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMaintenanceJob) (string, map[string]any, error) {
 	s := w.service
 	var ids []int64
-	if j.owner <= 0 || j.version <= 0 || json.Unmarshal([]byte(j.inventory), &ids) != nil || len(ids) == 0 {
+	if j.owner <= 0 || (j.version <= 0 && j.kind != "analysis" && j.kind != "presence") || json.Unmarshal([]byte(j.inventory), &ids) != nil || len(ids) == 0 {
 		return "", nil, errCaptionMaintenanceReceipt
 	}
 	seen := map[int64]bool{}
@@ -169,6 +201,12 @@ func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMainte
 			return "", nil, errCaptionMaintenanceReceipt
 		}
 		seen[id] = true
+	}
+	if j.kind == "analysis" {
+		return s.prepareAnalysisPostEdit(ctx, j, ids)
+	}
+	if j.kind == "change" || j.kind == "presence" {
+		return s.prepareThreadNoticeEdit(ctx, j, ids)
 	}
 	if j.kind == "archive" {
 		var owner, thread, chat, receiptThread, zip int64
@@ -291,17 +329,30 @@ func (w *captionMaintenanceWorker) step(ctx context.Context) (bool, error) {
 	if err != nil {
 		return true, w.retry(ctx, j, "render_failed", 30*time.Second)
 	}
+	done := func() error {
+		if j.kind == "analysis" {
+			if err := s.saveAnalysisPostEdit(ctx, j, payload); err != nil {
+				return w.retry(ctx, j, "analysis_receipt_update_failed", 30*time.Second)
+			}
+		}
+		if j.kind == "change" || j.kind == "presence" {
+			if err := s.saveThreadNoticeEdit(ctx, j, payload); err != nil {
+				return w.retry(ctx, j, "notice_receipt_update_failed", 30*time.Second)
+			}
+		}
+		return w.finish(ctx, j, "done", "", time.Time{})
+	}
 	var out SentMessage
 	err = s.TG.Call(ctx, method, payload, &out)
 	var te *TelegramError
 	if errors.As(err, &te) && te.Code == 400 && strings.Contains(strings.ToLower(te.Description), "message is not modified") {
-		return true, w.finish(ctx, j, "done", "", time.Time{})
+		return true, done()
 	}
 	if err == nil {
-		if out.ID != payload["message_id"].(int64) || out.Chat.ID != j.chat || (j.kind == "archive" && out.ThreadID != j.thread) {
+		if out.ID != payload["message_id"].(int64) || out.Chat.ID != j.chat || (j.kind != "private" && out.ThreadID != j.thread) {
 			return true, w.finish(ctx, j, "failed", "edit_receipt_unconfirmed", time.Time{})
 		}
-		return true, w.finish(ctx, j, "done", "", time.Time{})
+		return true, done()
 	}
 	if errors.As(err, &te) {
 		if te.Code == 429 {

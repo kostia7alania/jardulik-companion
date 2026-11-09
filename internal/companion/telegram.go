@@ -92,6 +92,10 @@ func validMessageEntities(text string, entities []MessageEntity) error {
 			if e.URL != "" {
 				return errors.New("unexpected quote URL")
 			}
+		case "bold":
+			if e.URL != "" {
+				return errors.New("unexpected bold URL")
+			}
 		case "text_link":
 			if !validPostURL(e.URL) {
 				return errors.New("invalid Telegram post URL")

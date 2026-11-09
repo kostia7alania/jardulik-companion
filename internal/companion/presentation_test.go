@@ -21,7 +21,7 @@ func TestProfileLabelsTimeAndCaption(t *testing.T) {
 			t.Fatalf("missing %q in %q", want, text)
 		}
 	}
-	if got := displayTime("2026-12-07T20:39:45+04:00"); got != "7.12.26, 19:39 (пн, UTC+3)" {
+	if got := displayTime("2026-12-07T20:39:45+04:00"); got != "🕒 7.12.26, 19:39 (пн, UTC+3)" {
 		t.Fatal(got)
 	}
 	long := strings.Repeat("🙂", 800) + "FULL-END"

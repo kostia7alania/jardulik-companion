@@ -102,6 +102,20 @@ func run() error {
 			return statusErr
 		}
 		return json.NewEncoder(os.Stdout).Encode(status)
+	case "reaction-message-status":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik reaction-message-status")
+		}
+		policy, policyErr := s.Store.ReactionMessagePolicy(ctx, owner)
+		if policyErr != nil {
+			return policyErr
+		}
+		return json.NewEncoder(os.Stdout).Encode(policy)
+	case "reaction-message-set":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik reaction-message-set < policy.json")
+		}
+		return setReactionMessagePolicy(ctx, s, owner, os.Stdin, os.Stdout)
 	case "status":
 		if err = s.Store.Check(ctx); err != nil {
 			return err
@@ -231,7 +245,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, compatibility-status, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
 	}
 }
 func main() {

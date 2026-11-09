@@ -122,7 +122,7 @@ func (f *analysisPostFixture) state(t *testing.T, id int64) string {
 	return state
 }
 func analysisPostQuoted(payload analysisPostPayload) string {
-	if len(payload.Entities) != 1 {
+	if len(payload.Entities) == 0 {
 		return ""
 	}
 	entity := payload.Entities[0]
@@ -148,7 +148,7 @@ func TestAnalysisPostsExactQuoteReceiptAndDedup(t *testing.T) {
 		t.Fatal("wrong delivery state")
 	}
 	body := f.bodies[0]
-	if !strings.HasPrefix(body.Text, "🧩 Совместимость: 75% · Jardulik GPT\nОт: Own · 101\n9.11.26, 15:00 (пн, UTC+3)\n\n") || analysisPostQuoted(body) != content || body.Entities[0].Type != "expandable_blockquote" {
+	if !strings.HasPrefix(body.Text, "🧩 Совместимость: 75% · reported-model\n"+displayTime(f.now.UTC().Format(time.RFC3339Nano))+"\n\n") || analysisPostQuoted(body) != strings.ReplaceAll(content, "**", "") || body.Entities[0].Type != "expandable_blockquote" {
 		t.Fatalf("rewritten quote or header: %+v", body)
 	}
 	var message int64

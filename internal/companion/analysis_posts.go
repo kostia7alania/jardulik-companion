@@ -106,22 +106,19 @@ func analysisPostText(analysis ProfileAnalysis) (analysisPostPayload, error) {
 		return payload, errors.New("analysis post snapshot is not an eligible adult pair")
 	}
 	var response struct {
-		Content string `json:"content"`
+		Content string          `json:"content"`
+		Model   json.RawMessage `json:"model"`
 	}
 	if analysis.HTTPStatus != 200 || analysis.State != "response_received" || analysis.ObservedAtMillis <= 0 || json.Unmarshal(analysis.ResponseBody, &response) != nil || strings.TrimSpace(response.Content) == "" {
 		return payload, errors.New("analysis post has no successful GPT content")
 	}
-	name := strings.Join(strings.Fields(own.String("name")+" "+own.String("surName")), " ")
-	name, _ = telegramPrefix(name, 180)
-	if name == "" {
-		name = "Jardulik"
-	}
-	title := "🧩 Совместимость · Jardulik GPT"
+	model := analysisPostModel(analysis.Model, response.Model)
+	title := "🧩 Совместимость · " + model
 	if percent, known := analysisPostRating(response.Content); known {
-		title = fmt.Sprintf("🧩 Совместимость: %d%% · Jardulik GPT", percent)
+		title = fmt.Sprintf("🧩 Совместимость: %d%% · %s", percent, model)
 	}
-	prefix := fmt.Sprintf("%s\nОт: %s · %d\n%s\n\n", title, name, analysis.UpstreamID, displayTime(time.UnixMilli(analysis.ObservedAtMillis).UTC().Format(time.RFC3339Nano)))
-	content := response.Content
+	prefix := fmt.Sprintf("%s\n%s\n\n", title, displayTime(time.UnixMilli(analysis.ObservedAtMillis).UTC().Format(time.RFC3339Nano)))
+	content, bold := analysisPostBold(response.Content)
 	if textUnits(prefix+content) > 4096 {
 		const tail = "\n\nПродолжение: полный JSON по кнопке."
 		content, _ = telegramPrefix(content, 4096-textUnits(prefix+tail))
@@ -130,7 +127,7 @@ func analysisPostText(analysis ProfileAnalysis) (analysisPostPayload, error) {
 	} else {
 		payload.Text = prefix + content
 	}
-	payload.Entities = []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(content)}}
+	payload.Entities = analysisPostQuoteEntities(prefix, content, bold)
 	return payload, validMessageEntities(payload.Text, payload.Entities)
 }
 

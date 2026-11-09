@@ -15,7 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf16"
+	"unicode/utf8"
 )
 
 const debugResponseLimit = 2 << 20
@@ -432,12 +432,16 @@ func (d *debugHTTP) post(w http.ResponseWriter, r *http.Request, ss Session) {
 			}
 		}
 		message := ""
-		if v, ok := f["message"]; ok && json.Unmarshal(v, &message) != nil {
-			debugError(w, 400, "invalid_message")
-			return
+		if v, ok := f["message"]; ok {
+			if !utf8.Valid(v) || json.Unmarshal(v, &message) != nil {
+				debugError(w, 400, "invalid_message")
+				return
+			}
 		}
-		message = strings.TrimSpace(message)
-		if len(utf16.Encode([]rune(message))) > 500 || reaction == 3 && message == "" || reaction != 3 && message != "" {
+		if reaction != 1 {
+			message = strings.TrimSpace(message)
+		}
+		if validateReactionMessage(message) != nil || reaction == 3 && message == "" || reaction != 1 && reaction != 3 && message != "" {
 			debugError(w, 400, "invalid_reaction_message")
 			return
 		}

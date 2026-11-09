@@ -21,7 +21,7 @@ func displayTime(raw string) string {
 	}
 	value = value.In(time.FixedZone("UTC+3", 3*60*60))
 	weekdays := [...]string{"вс", "пн", "вт", "ср", "чт", "пт", "сб"}
-	return value.Format("2.01.06, 15:04") + " (" + weekdays[value.Weekday()] + ", UTC+3)"
+	return "🕒 " + value.Format("2.01.06, 15:04") + " (" + weekdays[value.Weekday()] + ", UTC+3)"
 }
 
 func forumTopicURL(chatID, threadID int64) string {

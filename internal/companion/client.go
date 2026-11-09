@@ -614,7 +614,21 @@ func (c *Client) Like(ctx context.Context, owner, id int64) (ReactionResult, err
 }
 
 func (c *Client) LikeGuarded(ctx context.Context, owner, id int64, guard func(context.Context) error) (ReactionResult, error) {
+	return c.likeGuarded(ctx, owner, id, nil, guard)
+}
+
+// An explicit message, including an empty string, never consumes the owner's rotation.
+func (c *Client) LikeWithMessageGuarded(ctx context.Context, owner, id int64, message string, guard func(context.Context) error) (ReactionResult, error) {
+	return c.likeGuarded(ctx, owner, id, &message, guard)
+}
+
+func (c *Client) likeGuarded(ctx context.Context, owner, id int64, explicit *string, guard func(context.Context) error) (ReactionResult, error) {
 	out := ReactionResult{Decision: ReactionUnknown}
+	if explicit != nil {
+		if err := validateReactionMessage(*explicit); err != nil {
+			return out, err
+		}
+	}
 	if err := c.Store.checkReactionAction(ctx, c.Store.DB, owner, id, c.Now()); err != nil {
 		return out, err
 	}
@@ -701,7 +715,30 @@ func (c *Client) LikeGuarded(ctx context.Context, owner, id int64, guard func(co
 	if err = ctx.Err(); err != nil {
 		return release(err)
 	}
-	body, err := c.exchange(ctx, http.MethodPost, "/reactions/addNew", current.Token, map[string]any{"reactionType": 1, "isDeleted": false, "userId": id, "fromUserId": current.UserID, "message": ""})
+	request, err := c.Store.prepareLikeMessage(ctx, owner, action, target, current, explicit)
+	if err != nil {
+		return release(err)
+	}
+	// Preparing the durable intent may have waited for another SQLite writer.
+	if guard != nil {
+		if err = guard(context.WithValue(ctx, claimedLikeContextKey{}, action)); err != nil {
+			return release(err)
+		}
+	}
+	if !c.Store.cfg.AllowReactions {
+		return release(ErrReactionDisabled)
+	}
+	if c.Store.Paused(ctx, owner) {
+		return release(ErrReactionPaused)
+	}
+	latest, bindingErr := c.Store.Session(ctx, owner)
+	if bindingErr != nil || latest.State != "connected" || latest.Generation != current.Generation || latest.UserID != current.UserID {
+		return release(ErrReactionSessionChanged)
+	}
+	if err = ctx.Err(); err != nil {
+		return release(err)
+	}
+	body, err := c.exchange(ctx, http.MethodPost, "/reactions/addNew", current.Token, json.RawMessage(request))
 	if err == nil {
 		out, err = decodeReactionResult(body, c.Now())
 	}

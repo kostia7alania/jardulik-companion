@@ -1202,6 +1202,8 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		{"actions", "reaction", `SELECT owner_id,profile_id,kind,state,response,created_at FROM actions WHERE state IN ('pending','succeeded','unknown','quota_waiting','quota_retried')`},
 		{"feed_filters", "filters", `SELECT owner_id,applied_json,include_others FROM feed_filters WHERE applied_json IS NOT NULL OR include_others<>0`},
 		{"autolike_settings", "autolike", "SELECT owner_id,mode,interval_seconds,series_count,daily_cap FROM autolike_settings"},
+		{"reaction_message_settings", "reaction-message-policy", "SELECT owner_id,mode,templates_json,telegram_username,revision FROM reaction_message_settings"},
+		{"reaction_message_intents", "reaction-message-intent", "SELECT action_id,owner_id,upstream_id,profile_id,generation,message,request_body,message_mode,policy_revision,template_index,reserved_cursor FROM reaction_message_intents"},
 		{"profile_contact_evidence", "contact", "SELECT owner_id,upstream_id,profile_id,source_bot_id,source_peer_id,source_locator_kind,source_message_locator,source_message_timestamp,contact_url,profile_url,evidence_kind FROM profile_contact_evidence"},
 		{"business_contact_connections", "business-connection", "SELECT owner_id,upstream_id,id,enabled FROM business_contact_connections"},
 		{"profile_business_contacts", "business-contact", "SELECT DISTINCT owner_id,upstream_id,profile_id,source_bot_id,connection_id,source_message_id,source_message_timestamp,contact_url,profile_url FROM profile_business_contacts"},

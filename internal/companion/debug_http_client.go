@@ -309,8 +309,17 @@ func (d *debugHTTP) write(w http.ResponseWriter, r *http.Request, ss Session, re
 			}
 			return
 		}
-		// Keep the existing shared action ledger, account budget and unknown-result stop.
-		result, err := s.Client.LikeGuarded(r.Context(), owner, target, func(ctx context.Context) error {
+		var request struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			if finish("cancelled", 0, nil, "invalid_message") {
+				debugError(w, 400, "invalid_message")
+			}
+			return
+		}
+		// Keep the shared ledger and send the exact text logged for this explicit request.
+		result, err := s.Client.LikeWithMessageGuarded(r.Context(), owner, target, request.Message, func(ctx context.Context) error {
 			if e := s.Client.debugBinding(ctx, owner, ss); e != nil {
 				return e
 			}

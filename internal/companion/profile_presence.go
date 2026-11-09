@@ -356,20 +356,7 @@ func (w *ProfileWatcher) deliverProfilePresence(ctx context.Context) (bool, erro
 	if err = tx.Commit(); err != nil {
 		return false, err
 	}
-	title := "Анкета недоступна"
-	if availability == "available" {
-		title = "Анкета снова доступна"
-	} else if reason == "feed_absent" {
-		title = "Анкета в этом обходе не обнаружена"
-	}
-	text := fmt.Sprintf("%s\nJardulik: %d\nОбнаружено: %s", title, profile, displayTime(observed))
-	if availability == "available" && changes != "" {
-		summary, rest := telegramPrefix(changes, 3400)
-		if rest != "" {
-			summary += "…"
-		}
-		text += "\n\nИзменения:\n" + summary
-	}
+	text := profilePresenceText(profile, availability, observed, reason, changes)
 
 	var message SentMessage
 	var lastSendErr error

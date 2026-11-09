@@ -709,8 +709,34 @@ func (s *Store) finishReactionAction(ctx context.Context, id int64, state string
 }
 
 func (s *Store) releaseUnsentReaction(ctx context.Context, id int64) error {
-	_, err := s.DB.ExecContext(ctx, "DELETE FROM actions WHERE id=? AND state='pending' AND response=''", id)
-	return err
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Reserve the writer before inspecting a legacy action or refunding its intent.
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='reaction_message_settings'"); err != nil {
+		return err
+	}
+	var tables int
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('reaction_message_settings','reaction_message_intents')").Scan(&tables); err != nil {
+		return err
+	}
+	if tables == 2 {
+		_, err = tx.ExecContext(ctx, `UPDATE reaction_message_settings AS p
+ SET next_cursor=(SELECT i.reserved_cursor FROM reaction_message_intents i WHERE i.action_id=?),updated_at=CURRENT_TIMESTAMP
+ WHERE EXISTS(SELECT 1 FROM reaction_message_intents i JOIN actions a ON a.id=i.action_id
+ WHERE i.action_id=? AND i.owner_id=p.owner_id AND i.policy_revision=p.revision
+ AND i.message_mode IN ('rotate','birthday') AND i.reserved_cursor>=0 AND p.next_cursor=i.reserved_cursor+1
+ AND a.owner_id=i.owner_id AND a.profile_id=i.profile_id AND a.kind='Like' AND a.state='pending' AND a.response='')`, id, id)
+		if err != nil {
+			return err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM actions WHERE id=? AND state='pending' AND response=''", id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) FinishAction(ctx context.Context, id int64, state string, response []byte) {
 	_, _ = s.DB.ExecContext(ctx, "UPDATE actions SET state=?,response=? WHERE id=?", state, string(response), id)

@@ -598,7 +598,10 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 				return true, c.stop(ctx, j, reason)
 			}
 			if err = c.checkpointHydration(ctx, j, 0, nil, false, c.now()); err != nil {
-				return true, c.stop(ctx, j, "checkpoint_failed")
+				if ctx.Err() != nil {
+					return true, ctx.Err()
+				}
+				return true, c.checkpointFailed(ctx, j, 0, "hydrate_complete", err)
 			}
 			return true, nil
 		}
@@ -691,7 +694,7 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 				if errors.Is(retryErr, errCrawlRetryObsolete) {
 					return true, nil
 				}
-				return true, errors.Join(retryErr, c.stop(ctx, j, "checkpoint_failed"))
+				return true, errors.Join(retryErr, c.checkpointFailed(ctx, j, target, "retry", retryErr))
 			}
 			return true, nil
 		}
@@ -711,7 +714,7 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 			if ctx.Err() != nil {
 				return true, ctx.Err()
 			}
-			return true, c.stop(ctx, j, "checkpoint_failed")
+			return true, c.checkpointFailed(ctx, j, target, "locations", err)
 		}
 		return true, nil
 	}
@@ -720,7 +723,7 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 			if ctx.Err() != nil {
 				return true, ctx.Err()
 			}
-			return true, c.stop(ctx, j, "checkpoint_failed")
+			return true, c.checkpointFailed(ctx, j, target, "hydrate_unavailable", err)
 		}
 		return true, nil
 	}
@@ -747,9 +750,25 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
 		}
-		return true, c.stop(ctx, j, "checkpoint_failed")
+		return true, c.checkpointFailed(ctx, j, target, "profile_page", err)
 	}
 	return true, nil
+}
+
+// Keep a terminal job failure observable without stopping the other crawl jobs.
+func (c *FeedCrawler) checkpointFailed(ctx context.Context, j *CrawlJob, target int64, stage string, cause error) error {
+	code := 0
+	var coded interface{ Code() int }
+	if errors.As(cause, &coded) {
+		code = coded.Code()
+	}
+	slog.Warn("feed crawl checkpoint failed", "kind", safeError(cause), "sqlite_code", code,
+		"error_type", fmt.Sprintf("%T", cause), "owner", j.Owner, "run_id", j.RunID,
+		"mode", j.Mode, "page", j.Page, "target", target, "stage", stage)
+	if err := c.stop(ctx, j, "checkpoint_failed"); err != nil {
+		return errors.Join(cause, err)
+	}
+	return nil
 }
 
 func (c *FeedCrawler) checkpointTx(ctx context.Context, j *CrawlJob, advance func(*sql.Tx, *CrawlJob) error) error {
@@ -758,6 +777,10 @@ func (c *FeedCrawler) checkpointTx(ctx context.Context, j *CrawlJob, advance fun
 		return err
 	}
 	defer tx.Rollback()
+	// Reserve the writer before reading a WAL snapshot shared with the poster.
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='feed_crawl_next'"); err != nil {
+		return err
+	}
 	var state, run string
 	var mode, page int
 	if err = tx.QueryRowContext(ctx, "SELECT run_id,state,mode,page FROM feed_crawls WHERE owner_id=?", j.Owner).Scan(&run, &state, &mode, &page); err != nil {

@@ -126,7 +126,7 @@ func TestArchiveChangePostsLikaRussianPremiumOnceAndRawPreserved(t *testing.T) {
 	if len(f.calls) != 1 {
 		t.Fatalf("notice count %d", len(f.calls))
 	}
-	for _, want := range []string{"✏️ Изменения анкеты\nСтрана: Южная Осетия → Россия\nГород: Цхинвал → Владикавказ\nPremium: да → нет", "Снимок: 8.11.26, 01:10 (вс, UTC+3)"} {
+	for _, want := range []string{"✏️ Изменения анкеты\nСтрана: Южная Осетия → Россия\nГород: Цхинвал → Владикавказ\nPremium: да → нет", "Снимок: " + displayTime("2026-11-07 22:10:00")} {
 		if !strings.Contains(f.calls[0], want) {
 			t.Fatalf("missing human change explanation %q", want)
 		}
@@ -339,7 +339,7 @@ func TestArchiveChangePostsRateLimitWaitRemainsPending(t *testing.T) {
 func TestArchiveChangeNoticeLongSourceIsBoundedAndHasFullJSONAction(t *testing.T) {
 	p := StoredProfile{VersionID: 77, FirstSeen: "2026-11-07 22:10:00"}
 	text, entities, keyboard := archiveChangeNotice(p, []string{"unknown: " + strings.Repeat("🙂", 5000)})
-	if textUnits(text) > 4096 || !strings.Contains(text, "Показана часть изменений") || !strings.HasSuffix(text, "Снимок: 8.11.26, 01:10 (вс, UTC+3)") {
+	if textUnits(text) > 4096 || !strings.Contains(text, "Показана часть изменений") || !strings.HasSuffix(text, "Снимок: "+displayTime("2026-11-07 22:10:00")) {
 		t.Fatal("notice budget or stable source time lost")
 	}
 	if err := validMessageEntities(text, entities); err != nil {
