@@ -703,7 +703,7 @@ func archiveProfileKeyboard(version int64) any {
 		{"text": "Описание в личку", "callback_data": fmt.Sprintf("av:%d", version)},
 		{"text": "JSON Jardulik в личку", "callback_data": fmt.Sprintf("aj:%d", version)},
 		{"text": "Исходные файлы ZIP", "callback_data": fmt.Sprintf("az:%d", version)},
-	}}}
+	}, {jardulikAppButton()}}}
 }
 
 // Each profile topic keeps its whole original ZIP followed by the visible card.

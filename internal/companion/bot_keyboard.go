@@ -183,7 +183,7 @@ func (s *Service) showKeyboardMenuLocked(ctx context.Context, owner int64) {
 	rows = append(rows,
 		[]map[string]string{b("⭐ Избранное", "favorites"), b("❤️ Лайки", "likes"), b("💞 Взаимные", "matches")},
 		[]map[string]string{b("⚙️ Настройки", "settings"), b("🔎 Фильтры", "filters")},
-		[]map[string]string{b("➡️ Следующая", "next")},
+		[]map[string]string{b("➡️ Следующая", "next"), jardulikAppButton()},
 	)
 	if owner == s.Config.OwnerID {
 		rows = append(rows, []map[string]string{b("📅 По возрасту", "ai:0")})

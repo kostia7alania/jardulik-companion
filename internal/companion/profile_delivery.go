@@ -22,6 +22,7 @@ func profileButtons(p StoredProfile, full, jsonSource bool) any {
 	if jsonSource {
 		rows = append(rows, []map[string]string{{"text": "JSON Jardulik", "callback_data": fmt.Sprintf("jv:%d", p.VersionID)}})
 	}
+	rows = append(rows, []map[string]string{jardulikAppButton()})
 	return map[string]any{"inline_keyboard": rows}
 }
 

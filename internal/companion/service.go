@@ -551,6 +551,7 @@ func mainButtons() any {
 		{{"text": "История", "callback_data": "history"}, {"text": "Аккаунт", "callback_data": "status"}},
 		{{"text": "Фильтры", "callback_data": "filters"}, {"text": "Настройки", "callback_data": "settings"}},
 		{{"text": "Подключение", "callback_data": "connect_help"}, {"text": "Помощь", "callback_data": "help"}},
+		{jardulikAppButton()},
 	}}
 }
 
