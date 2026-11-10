@@ -208,6 +208,11 @@ func (a *Archiver) groupCall(ctx context.Context, call func() error) error {
 		if err := a.groupSlot(ctx); err != nil {
 			return err
 		}
+		if owner, ok := ctx.Value(syncPublicationOwnerKey{}).(int64); ok {
+			if err := a.Store.requireSyncPublication(ctx, owner); err != nil {
+				return err
+			}
+		}
 		err := call()
 		if err == nil {
 			return nil
@@ -231,11 +236,26 @@ func (a *Archiver) groupCall(ctx context.Context, call func() error) error {
 }
 
 func (a *Archiver) processOne(ctx context.Context) error {
-	if handled, err := a.processQueuedRepair(ctx); handled || err != nil {
-		return err
+	unlock, locked, lockErr := a.Store.trySyncPublicationLock()
+	if lockErr != nil {
+		return lockErr
 	}
-	if handled, err := a.processQueuedZIPRepair(ctx); handled || err != nil {
-		return err
+	if !locked {
+		return nil
+	}
+	defer unlock()
+
+	allowed := a.Store.requireSyncPublication(ctx, a.Config.OwnerID)
+	if allowed != nil && !errors.Is(allowed, errSyncPublicationDeferred) {
+		return allowed
+	}
+	if allowed == nil {
+		if handled, err := a.processQueuedRepair(ctx); handled || err != nil {
+			return err
+		}
+		if handled, err := a.processQueuedZIPRepair(ctx); handled || err != nil {
+			return err
+		}
 	}
 	if a.Config.BackupChatID == 0 || a.Config.BackupThreadID <= 0 {
 		return nil
@@ -247,12 +267,17 @@ func (a *Archiver) processOne(ctx context.Context) error {
 	err := a.Store.DB.QueryRowContext(ctx, `SELECT v.owner_id,v.id FROM versions v
  LEFT JOIN archive_versions av ON av.version_id=v.id
  WHERE (av.version_id IS NULL OR av.state='pending')
- AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.version_id=v.id AND j.state='pending')
+ AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.version_id=v.id AND j.state='pending') `+a.Store.syncPublicationCandidates("v.owner_id", "v.id", "version")+`
  ORDER BY v.id LIMIT 1`).Scan(&owner, &version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
+		return err
+	}
+	if err = a.Store.requireSyncPublication(ctx, owner); errors.Is(err, errSyncPublicationDeferred) {
+		return nil
+	} else if err != nil {
 		return err
 	}
 	return a.mirrorVersion(ctx, owner, version)
@@ -866,6 +891,7 @@ func (a *Archiver) sendProfileCard(ctx context.Context, p StoredProfile, jobs []
 }
 
 func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) error {
+	ctx = context.WithValue(ctx, syncPublicationOwnerKey{}, owner)
 	p, err := a.Store.Version(ctx, owner, version)
 	if err != nil {
 		return err

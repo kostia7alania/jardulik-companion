@@ -78,7 +78,11 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 			start(debugRun)
 		}
 		start(s.Media.Run)
-		start(s.Watcher.RunChecks)
+		if s.Config.SyncCycleEnabled {
+			start(s.RunSyncCycles)
+		} else {
+			start(s.Watcher.RunChecks)
+		}
 		start(s.Crawler.Run)
 		start(s.Autoliker.Run)
 		start(s.runContacts)
@@ -96,6 +100,9 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		start(s.Watcher.RunPresence)
 		start(s.RunAnalysisPosts)
 		start(s.RunArchiveChangePosts)
+		if !s.Config.ArchivePaused {
+			start(s.RunOpeningPosts)
+		}
 	}
 	if s.Config.CompatibilityEnabled && (role == RuntimeAll || role == RuntimeCompatibility) {
 		start(s.runCompatibilityPlanner)

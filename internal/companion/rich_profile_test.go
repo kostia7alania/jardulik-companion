@@ -39,6 +39,44 @@ func richAck(n int) json.RawMessage {
 	raw, _ := json.Marshal(map[string]any{"blocks": []any{map[string]any{"type": "collage", "blocks": photos}}})
 	return raw
 }
+func assertRichProfileCaptions(t *testing.T, content map[string]any, photos int, body string) {
+	t.Helper()
+	blocks := content["blocks"].([]any)
+	if len(blocks) != 3 {
+		t.Fatal("profile body duplicated as a separate block")
+	}
+	head := blocks[0].(map[string]any)
+	if photos == 0 {
+		if head["type"] != "paragraph" || head["text"] != body {
+			t.Fatal("human body differs from shared renderer")
+		}
+		return
+	}
+	want := "photo"
+	if photos > 1 {
+		want = "collage"
+	}
+	if head["type"] != want || head["caption"].(map[string]any)["text"] != body {
+		t.Fatal("missing visible media caption", head["type"])
+	}
+	media := []any{head}
+	if photos > 1 {
+		media = head["blocks"].([]any)
+	}
+	if len(media) != photos {
+		t.Fatal("collage lost photos")
+	}
+	for _, item := range media {
+		photo := item.(map[string]any)
+		if photo["type"] != "photo" || photo["caption"].(map[string]any)["text"] != body {
+			t.Fatal("photo viewer lost its caption")
+		}
+		if _, nested := photo["photo"].(map[string]any)["caption"]; nested {
+			t.Fatal("caption placed in ignored InputMediaPhoto field")
+		}
+	}
+}
+
 func TestRichProfileSourceBodyAndAllMediaShapes(t *testing.T) {
 	for _, n := range []int{0, 1, 2, 4, 50} {
 		t.Run(fmt.Sprint(n), func(t *testing.T) {
@@ -48,26 +86,9 @@ func TestRichProfileSourceBodyAndAllMediaShapes(t *testing.T) {
 				t.Fatal(err)
 			}
 			blocks := card.Content["blocks"].([]any)
-			bodyIndex := 0
-			if n > 0 {
-				bodyIndex = 1
-				head := blocks[0].(map[string]any)
-				want := "photo"
-				if n > 1 {
-					want = "collage"
-				}
-				if head["type"] != want {
-					t.Fatal("wrong media shape", head["type"])
-				}
-				if n > 1 && len(head["blocks"].([]any)) != n {
-					t.Fatal("collage lost photos")
-				}
-			}
 			body, _, _, _ := splitPhotoFooter(profileText(p))
-			if blocks[bodyIndex].(map[string]any)["text"] != body {
-				t.Fatal("human body differs from shared renderer")
-			}
-			quote := blocks[bodyIndex+1].(map[string]any)
+			assertRichProfileCaptions(t, card.Content, n, body)
+			quote := blocks[1].(map[string]any)
 			parts := quote["text"].([]any)
 			if quote["type"] != "expandable_blockquote" || !strings.HasPrefix(parts[0].(string), "Не указано: языки\n") {
 				t.Fatal("fold order/shape changed")
@@ -78,8 +99,17 @@ func TestRichProfileSourceBodyAndAllMediaShapes(t *testing.T) {
 			if code["type"] != "code" || code["text"] != pretty.String() {
 				t.Fatal("source JSON omitted/changed fields")
 			}
-			if card.JSONBytes != pretty.Len() || card.JSONCharacters != utf8.RuneCount(pretty.Bytes()) || card.TextCharacters <= card.JSONCharacters {
-				t.Fatal("full text metrics wrong")
+			bodyCopies := 1
+			if n > 1 {
+				bodyCopies += n
+			}
+			footer := blocks[2].(map[string]any)["text"].([]any)
+			footerText := footer[0].(string) + footer[1].(string) + footer[2].(map[string]any)["text"].(string)
+			otherText := parts[0].(string) + pretty.String() + footerText
+			if card.JSONBytes != pretty.Len() || card.JSONCharacters != utf8.RuneCount(pretty.Bytes()) ||
+				card.TextBytes != bodyCopies*len(body)+len(otherText) ||
+				card.TextCharacters != bodyCopies*utf8.RuneCountInString(body)+utf8.RuneCountInString(otherText) {
+				t.Fatal("full text metrics omit captions")
 			}
 			refs := make([]string, n)
 			for i := range refs {
@@ -89,6 +119,7 @@ func TestRichProfileSourceBodyAndAllMediaShapes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			assertRichProfileCaptions(t, edit, n, body)
 			encoded, _ := json.Marshal(edit)
 			original, _ := json.Marshal(card.Content)
 			if bytes.Contains(encoded, []byte("attach://p")) || n > 0 && !bytes.Contains(original, []byte("attach://p0")) {
@@ -109,6 +140,13 @@ func TestRichProfileLimitsAreTypedBeforeHTTP(t *testing.T) {
 	p.RawJSON = string(raw)
 	if _, err := BuildRichProfileCard(p, jobs, ""); !errors.Is(err, ErrRichCardTooLarge) {
 		t.Fatal("total text not bounded", err)
+	}
+	p, jobs = richFixture(t, 4)
+	p.Profile["description"] = strings.Repeat("я", 6000)
+	raw, _ = json.Marshal(p.Profile)
+	p.RawJSON = string(raw)
+	if _, err := BuildRichProfileCard(p, jobs, ""); !errors.Is(err, ErrRichCardTooLarge) {
+		t.Fatal("repeated photo captions not bounded", err)
 	}
 	p, jobs = richFixture(t, 51)
 	if _, err := BuildRichProfileCard(p, jobs, ""); !errors.Is(err, ErrRichCardTooLarge) {

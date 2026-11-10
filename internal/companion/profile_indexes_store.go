@@ -82,6 +82,7 @@ func (s *Service) profileIndexEntries(ctx context.Context, owner, upstream int64
 		e.Name = profileIndexName(p, e.ID)
 		e.Birthday = profileAgeOrderKey(p["birthday"])
 		e.Zodiac = profileIndexZodiac(p, now)
+		e.Premium, e.PremiumKnown = profileIndexPremium(p)
 		e.Age, e.AgeKnown = autoInteger(p["age"])
 		e.AgeKnown = e.AgeKnown && e.Age > 0 && e.Age <= 111
 		entries = append(entries, e)

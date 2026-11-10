@@ -81,9 +81,15 @@ func analysisPostRatingWords(text string) []string {
 	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
 }
 
-var analysisPostRatingListPrefix = regexp.MustCompile(`^(?:[0-9]+[.)][\s*_]*|[-+*][\t ]+)`)
+var analysisPostRatingListPrefix = regexp.MustCompile(`^(?:[0-9]+[.)][\t ]*|[-+*][\t ]+)`)
 
 func analysisPostOverallHeading(content string, before int) bool {
+	overall, _ := analysisPostOverallHeadingStatus(content, before)
+	return overall
+}
+
+// The second result distinguishes an explicit heading from the legacy no-heading default.
+func analysisPostOverallHeadingStatus(content string, before int) (bool, bool) {
 	previous := content[:before]
 	for previous != "" {
 		previous = strings.TrimRight(previous, " \t\r\n")
@@ -114,15 +120,15 @@ func analysisPostOverallHeading(content string, before int) bool {
 			words = words[1:]
 		}
 		switch strings.Join(words, " ") {
-		case "итог", "итоговая оценка", "итоговая совместимость", "общая оценка", "общая совместимость", "общая оценка совместимости", "итоговая оценка совместимости", "оценка совместимости", "в целом":
-			return true
+		case "итог", "заключение", "вывод", "выводы", "итоговая оценка", "итоговая совместимость", "общая оценка", "общая совместимость", "общая оценка совместимости", "итоговая оценка совместимости", "оценка совместимости", "в целом":
+			return true, true
 		default:
 			if heading {
-				return false
+				return false, true
 			}
 		}
 	}
-	return true
+	return true, false
 }
 
 // Explicit overall forms are accepted only in an overall sentence/heading.
@@ -172,8 +178,11 @@ func analysisPostRatingContext(content string, start, end int) (eligible, denied
 	if analysisPostRatingRange.MatchString(suffix) {
 		return false, true
 	}
-	if boundary := strings.IndexAny(suffix, ".!?;\n"); boundary >= 0 {
+	if boundary := strings.IndexAny(suffix, ".!?;"); boundary >= 0 {
 		suffix = suffix[:boundary]
+	}
+	if paragraph := strings.Index(suffix, "\n\n"); paragraph >= 0 {
+		suffix = suffix[:paragraph]
 	}
 	words := analysisPostRatingWords(suffix)
 	for _, word := range words[:min(3, len(words))] {
@@ -211,9 +220,169 @@ func analysisPostRating(content string) (int, bool) {
 		}
 	}
 	if value < 0 {
-		return 0, false
+		if n, known := analysisPostFinalRating(content); known {
+			return n, true
+		}
+		return analysisPostProviderRating(content)
+	}
+	// Newly understood final prose must not contradict a strict overall form.
+	for _, match := range analysisPostAnyPercent.FindAllStringSubmatchIndex(content, -1) {
+		if n, known := analysisPostFinalRatingAt(content, match); known && n != value {
+			return 0, false
+		}
 	}
 	return value, true
+}
+
+var analysisPostAnyPercent = regexp.MustCompile(`([0-9]+(?:[.,][0-9]+)?)[\s*_]*%`)
+
+// A unique number under an explicit overall heading is a provider-reported
+// overall value even when its prose uses an unsupported verb. Unlabelled prose
+// or a category section never receives this fallback.
+func analysisPostFinalRating(content string) (int, bool) {
+	matches := analysisPostAnyPercent.FindAllStringSubmatchIndex(content, -1)
+	if len(matches) != 1 {
+		return 0, false
+	}
+	return analysisPostFinalRatingAt(content, matches[0])
+}
+
+func analysisPostFinalRatingAt(content string, match []int) (int, bool) {
+	return analysisPostRatingAt(content, match, true)
+}
+
+// A single unambiguous percentage may also be quoted from the provider response
+// without interpreting its prose as our own overall compatibility conclusion.
+func analysisPostProviderRating(content string) (int, bool) {
+	matches := analysisPostAnyPercent.FindAllStringSubmatchIndex(content, -1)
+	if len(matches) != 1 {
+		return 0, false
+	}
+	return analysisPostRatingAt(content, matches[0], false)
+}
+
+func analysisPostRatingAt(content string, match []int, requireOverall bool) (int, bool) {
+	n, err := strconv.Atoi(content[match[2]:match[3]])
+	if err != nil || n > 100 {
+		return 0, false
+	}
+	if requireOverall {
+		overall, found := analysisPostOverallHeadingStatus(content, match[0])
+		if !found || !overall {
+			return 0, false
+		}
+	}
+	lineStart := strings.LastIndex(content[:match[0]], "\n") + 1
+	if !requireOverall {
+		// A soft line wrap must not sever a minus, range or negated clause.
+		lineStart = strings.LastIndexAny(content[:match[0]], ".!?;") + 1
+		if paragraph := strings.LastIndex(content[:match[0]], "\n\n"); paragraph >= lineStart {
+			lineStart = paragraph + 2
+		}
+		if match[0] > 0 {
+			before, _ := utf8.DecodeLastRuneInString(content[:match[0]])
+			if before == '.' || before == ',' {
+				return 0, false
+			}
+		}
+	}
+	prefix := content[lineStart:match[0]]
+	if requireOverall {
+		prefix = content[:match[0]]
+	}
+	untrimmedPrefix := prefix
+	prefix = strings.TrimRight(prefix, " \t\r\n*_")
+	if prefix != "" {
+		before, size := utf8.DecodeLastRuneInString(prefix)
+		if unicode.IsDigit(before) || before == '-' || before == '−' || before == '.' || before == ',' {
+			return 0, false
+		}
+		if before == '–' || before == '—' {
+			label := strings.TrimRight(prefix[:len(prefix)-size], " \t*_")
+			last, _ := utf8.DecodeLastRuneInString(label)
+			// A spaced dash after a text label is a separator; an adjacent
+			// dash or one following a number remains a negative/range.
+			if !unicode.IsLetter(last) || !strings.ContainsAny(untrimmedPrefix[len(prefix):], " \t") {
+				return 0, false
+			}
+		}
+	}
+	if boundary := strings.LastIndexAny(content[lineStart:match[0]], ".!?;"); boundary >= 0 {
+		lineStart += boundary + 1
+	}
+	words := analysisPostRatingWords(content[lineStart:match[0]])
+	if requireOverall && !analysisPostOverallSubject(words) {
+		return 0, false
+	}
+	for _, word := range words {
+		switch word {
+		case "не", "нет", "нельзя", "отрицаю", "несовместимость", "например", "минус", "между", "до", "или":
+			return 0, false
+		}
+	}
+	suffix := content[match[1]:]
+	if analysisPostRatingRange.MatchString(suffix) {
+		return 0, false
+	}
+	if boundary := strings.IndexAny(suffix, ".!?;"); boundary >= 0 {
+		suffix = suffix[:boundary]
+	}
+	if paragraph := strings.Index(suffix, "\n\n"); paragraph >= 0 {
+		suffix = suffix[:paragraph]
+	}
+	words = analysisPostRatingWords(suffix)
+	for _, word := range words[:min(3, len(words))] {
+		if word == "не" || word == "нет" || word == "нельзя" {
+			return 0, false
+		}
+	}
+	if requireOverall && len(words) > 0 && words[0] == "по" {
+		return 0, false
+	}
+	return n, true
+}
+
+// Positive overall subjects are intentionally narrow; a heading alone cannot
+// turn an interests/psychology percentage in ordinary prose into an overall score.
+func analysisPostOverallSubject(words []string) bool {
+	for i, word := range words {
+		switch word {
+		case "совместимость", "совместимости":
+			if i+1 < len(words) && words[i+1] == "по" {
+				return false
+			}
+			if i == 0 {
+				return true
+			}
+			switch words[i-1] {
+			case "ваша", "вашу", "вашей", "наша", "нашу", "нашей", "общая", "общую", "общей", "итоговая", "итоговую", "итоговой", "суммарная", "суммарную", "оценил", "оценить", "оцениваю", "оценим", "оценили", "оценивал":
+				return true
+			case "оценка", "оценку", "оценке", "оценки":
+				if i == 1 {
+					return true
+				}
+				switch words[i-2] {
+				case "общая", "общую", "общей", "итоговая", "итоговую", "итоговой", "суммарная", "суммарную":
+					return true
+				}
+			}
+		case "оценка", "оценку", "оценке":
+			if len(words) == 1 {
+				return true
+			}
+			if i > 0 {
+				switch words[i-1] {
+				case "общая", "общую", "общей", "итоговая", "итоговую", "итоговой", "суммарная", "суммарную":
+					return true
+				}
+			}
+		case "итог":
+			if len(words) == 1 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func analysisPostText(analysis ProfileAnalysis) (analysisPostPayload, error) {
@@ -320,6 +489,12 @@ func (s *Service) deliverAnalysisPost(ctx context.Context) (bool, error) {
 	if a == nil || a.TG == nil || s.Config.OwnerID <= 0 || s.Config.OwnerID != a.Config.OwnerID || a.Config.BackupChatID == 0 || s.Config.ArchivePaused || a.Config.ArchivePaused {
 		return false, nil
 	}
+	if err := s.Store.requireSyncPublication(ctx, s.Config.OwnerID); err != nil {
+		if errors.Is(err, errSyncPublicationDeferred) {
+			return false, nil
+		}
+		return false, err
+	}
 	sendCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	for !a.mu.TryLock() {
@@ -328,6 +503,15 @@ func (s *Service) deliverAnalysisPost(ctx context.Context) (bool, error) {
 		}
 	}
 	defer a.mu.Unlock()
+
+	unlock, locked, lockErr := s.Store.trySyncPublicationLock()
+	if lockErr != nil {
+		return false, lockErr
+	}
+	if !locked {
+		return false, nil
+	}
+	defer unlock()
 	if err := s.initAnalysisPosts(sendCtx); err != nil {
 		return false, err
 	}
@@ -353,7 +537,7 @@ func (s *Service) deliverAnalysisPost(ctx context.Context) (bool, error) {
 	err = tx.QueryRowContext(sendCtx, `SELECT p.analysis_id,t.thread_id FROM analysis_posts p
  JOIN sessions se ON se.owner_id=p.owner_id AND se.upstream_id=p.upstream_id
  JOIN mirror_topics t ON t.profile_id=p.profile_id
- WHERE p.owner_id=? AND p.state='pending' AND p.next_attempt<=? AND t.thread_id>0 AND `+analysisPostReady+presenceGuard+`
+ WHERE p.owner_id=? AND p.state='pending' AND p.next_attempt<=? AND t.thread_id>0 `+s.Store.syncPublicationCandidates("p.owner_id", "p.analysis_id", "analysis")+` AND `+s.Store.syncAnalysisPostReady()+presenceGuard+`
  ORDER BY p.analysis_id DESC LIMIT 1`, s.Config.OwnerID, a.now().Unix()).Scan(&id, &thread)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, tx.Commit()
@@ -394,6 +578,9 @@ func (s *Service) deliverAnalysisPost(ctx context.Context) (bool, error) {
 	var lastSendErr error
 	attempted := false
 	err = a.groupCall(sendCtx, func() error {
+		if err := s.Store.requireSyncPublication(sendCtx, s.Config.OwnerID); err != nil {
+			return err
+		}
 		// Repeat the binding check after a confirmed 429, without another state transition.
 		binding := ` AND p.owner_id=? AND p.upstream_id=?
  AND EXISTS(SELECT 1 FROM sessions se WHERE se.owner_id=p.owner_id AND se.upstream_id=p.upstream_id)

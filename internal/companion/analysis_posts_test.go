@@ -515,27 +515,27 @@ func TestAnalysisPostRatingObservedOverallFormsAndAmbiguity(t *testing.T) {
 		{"Оценка совместимости — **75%**", 75, true},
 		{"**Совместимость**: **75%**", 75, true},
 		{"Эмоциональная совместимость: 90%.\nИтог: Совместимость: 75%", 75, true},
-		{"Астрологическая совместимость — 80%", 0, false},
-		{"**Астрология**\nСовместимость: 80%", 0, false},
-		{"**Общие интересы**\nСовместимость: 80%", 0, false},
-		{"**Психология**\nСовместимость: 85%", 0, false},
-		{"- **Психология**\nСовместимость: 85%", 0, false},
-		{"__Психология__\nСовместимость: 85%", 0, false},
-		{"+ __Общие интересы__\nСовместимость: 80%", 0, false},
+		{"Астрологическая совместимость — 80%", 80, true},
+		{"**Астрология**\nСовместимость: 80%", 80, true},
+		{"**Общие интересы**\nСовместимость: 80%", 80, true},
+		{"**Психология**\nСовместимость: 85%", 85, true},
+		{"- **Психология**\nСовместимость: 85%", 85, true},
+		{"__Психология__\nСовместимость: 85%", 85, true},
+		{"+ __Общие интересы__\nСовместимость: 80%", 80, true},
 		{"- **Итог**\nСовместимость: 75%", 75, true},
 		{"__Итог__\nСовместимость: 75%", 75, true},
 		{"**Психология**\nИтог. Совместимость: 75%", 75, true},
-		{"### Общие интересы\nОписание пары.\nСовместимость: 80%", 0, false},
-		{"Совместимость: 80% по общим интересам", 0, false},
+		{"### Общие интересы\nОписание пары.\nСовместимость: 80%", 80, true},
+		{"Совместимость: 80% по общим интересам", 80, true},
 		{"### Психология\nСовместимость: 85%\n### 8. Итог\nСовместимость: 75%. Благодаря вашим общим целям и взаимопониманию...", 75, true},
 		{"**Психология**\nОбщая совместимость: 75%", 75, true},
 		{"**Психология**\nИтоговая оценка совместимости: 75%", 75, true},
 		{"**Психология**\nВ целом, оцениваю вашу совместимость на 75%", 75, true},
 		{"Попробуй задать ей вопрос: ...\n\n### 8. Итог\nСовместимость: 75%. Благодаря вашим общим целям и взаимопониманию...", 75, true},
 		{"**7. Практические шаги**\nТекст\n8. **Итог**. Оценка совместимости — 75%.", 75, true},
-		{"**Психология**. Совместимость: 85%", 0, false},
-		{"Оценка совместимости по интересам: 80%", 0, false},
-		{"Совместимость: 80% по астрологии", 0, false},
+		{"**Психология**. Совместимость: 85%", 85, true},
+		{"Оценка совместимости по интересам: 80%", 80, true},
+		{"Совместимость: 80% по астрологии", 80, true},
 		{"Совместимость: 75%. Я оцениваю вашу совместимость на 80%", 0, false},
 		{"Совместимость: 75%. Оценка совместимости — **75%**", 75, true},
 		{"Совместимость: 75–80%", 0, false},
@@ -559,5 +559,100 @@ func TestAnalysisPostRatingObservedOverallFormsAndAmbiguity(t *testing.T) {
 		if known != test.known || (known && got != test.value) {
 			t.Fatalf("rating %q = %d,%v want %d,%v", test.content, got, known, test.value, test.known)
 		}
+	}
+}
+
+func TestAnalysisPostRatingExplicitFinalSectionFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name, content string
+		want          int
+		known         bool
+	}{
+		{"unsupported verb", "### 8. Итог\nЯ бы оценил вашу совместимость в 75%.", 75, true},
+		{"conclusion", "**Заключение**\nВашу совместимость я бы оценил на **85%**.", 85, true},
+		{"summary inline", "8. **Итог**. Я бы оценил вашу совместимость в 75%.", 75, true},
+		{"conclusion numbered", "8. **Вывод**\nОбщая оценка составила 80%.", 80, true},
+		{"provider zero", "### Итог\nИтоговая оценка 0%.", 0, true},
+		{"no heading", "Я бы оценил вашу совместимость в 75%.", 75, true},
+		{"ordinary interest subject", "### Итог\nОбщие интересы совпадают на 75%.", 75, true},
+		{"ordinary psychology subject", "### Итог\nПсихологическая совместимость оценивается в 75%.", 75, true},
+		{"bare final verb", "### Итог\nВ итоге получается 75%.", 75, true},
+		{"strict fallback conflict", "### Итог\nСовместимость: 75%.\nЯ бы оценил вашу совместимость в 85%.", 0, false},
+		{"strict and category", "### Общие интересы\nПсихология 80%.\n### Итог\nСовместимость: 75%.", 75, true},
+		{"category heading", "### Психология\nЯ бы оценил вашу совместимость в 75%.", 75, true},
+		{"nearest category", "### Итог\n### Общие интересы\nЯ бы поставил 75%.", 75, true},
+		{"negative", "### Итог\nЯ бы поставил -75%.", 0, false},
+		{"decimal", "### Итог\nЯ бы поставил 75.5%.", 0, false},
+		{"multiple percentages", "### Итог\nПсихология 80%, общий результат 75%.", 0, false},
+		{"one percent range", "### Итог\nЯ бы поставил от 70 до 75%.", 0, false},
+		{"prefix range", "### Итог\nЯ бы поставил 70–75%.", 0, false},
+		{"suffix range", "### Итог\nЯ бы поставил 75% — 80.", 0, false},
+		{"negation", "### Итог\nЯ не поставил бы 75%.", 0, false},
+		{"negated suffix", "### Итог\nОценка 75% не подходит.", 0, false},
+		{"partial suffix", "### Итог\nЯ бы поставил 75% по общим интересам.", 75, true},
+		{"out of range", "### Итог\nЯ бы поставил 175%.", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, known := analysisPostRating(tc.content)
+			if got != tc.want || known != tc.known {
+				t.Fatalf("got=%d,%v want=%d,%v", got, known, tc.want, tc.known)
+			}
+		})
+	}
+	if overall, found := analysisPostOverallHeadingStatus("Unlabelled text\n", len("Unlabelled text\n")); !overall || found {
+		t.Fatal("legacy no-heading semantics changed", overall, found)
+	}
+}
+
+func TestAnalysisPostProviderPercentageFallback(t *testing.T) {
+	for _, tc := range []struct {
+		text  string
+		value int
+		known bool
+	}{
+		{"75%", 75, true},
+		{"Jardulik ответил: **85%**.", 85, true},
+		{"Предыдущая фраза.\n**75%**", 75, true},
+		{"Единственный процент провайдера: 0%", 0, true},
+		{"Психология: 75%", 75, true},
+		{"Значение — 75%", 75, true},
+		{"75% и 80%", 0, false},
+		{"75% и 75%", 0, false},
+		{"75% — 80", 0, false},
+		{"70–75%", 0, false},
+		{"от 70 до 75%", 0, false},
+		{"от 70 до\n75%", 0, false},
+		{"Не могу оценить совместимость в\n75%", 0, false},
+		{"−\n75%", 0, false},
+		{"Не обсуждали оценку\n\n75%", 75, true},
+		{"−75%", 0, false},
+		{"− 75%", 0, false},
+		{"–75%", 0, false},
+		{"-75%", 0, false},
+		{"Не 75%", 0, false},
+		{"75% не подходит", 0, false},
+		{"75%\nне подходит", 0, false},
+		{"Совместимость: 75%\nне подходит", 0, false},
+		{"75%.\nНе обсуждали другое", 75, true},
+		{"Совместимость: 75%.\nНе обсуждали другое", 75, true},
+		{"Например, 75%", 0, false},
+		{"75.5%", 0, false},
+		{"175%", 0, false},
+	} {
+		got, known := analysisPostRating(tc.text)
+		if known != tc.known || (known && got != tc.value) {
+			t.Fatalf("%q got=%d,%v want=%d,%v", tc.text, got, known, tc.value, tc.known)
+		}
+	}
+	// The narrow explicit-final helper keeps its old semantic contract; only the
+	// final provider-response fallback can quote a category's unique percentage.
+	if _, known := analysisPostFinalRating("### Итог\nПсихологическая совместимость оценивается в 75%."); known {
+		t.Fatal("explicit overall helper accepted category")
+	}
+	f := newAnalysisPostFixture(t, "Ответ Jardulik: **75%**")
+	before := append([]byte(nil), f.analysis.ResponseBody...)
+	payload, err := analysisPostText(f.analysis)
+	if err != nil || !strings.HasPrefix(payload.Text, "🧩 Совместимость: 75%\n") || !bytes.Equal(before, f.analysis.ResponseBody) {
+		t.Fatal("display fallback changed captured response", err)
 	}
 }

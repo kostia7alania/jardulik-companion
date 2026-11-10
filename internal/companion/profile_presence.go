@@ -317,6 +317,15 @@ func (w *ProfileWatcher) deliverProfilePresence(ctx context.Context) (bool, erro
 		}
 	}
 	defer a.mu.Unlock()
+
+	unlock, locked, lockErr := w.Store.trySyncPublicationLock()
+	if lockErr != nil {
+		return false, lockErr
+	}
+	if !locked {
+		return false, nil
+	}
+	defer unlock()
 	if err := a.init(sendCtx); err != nil {
 		return false, err
 	}
@@ -325,11 +334,11 @@ func (w *ProfileWatcher) deliverProfilePresence(ctx context.Context) (bool, erro
 		return false, err
 	}
 	defer tx.Rollback()
-	var id, profile, thread int64
+	var id, owner, profile, thread int64
 	var availability, observed, reason, changes string
-	err = tx.QueryRowContext(sendCtx, `SELECT e.id,e.profile_id,t.thread_id,e.availability,e.observed_at,e.reason,e.changes_text
+	err = tx.QueryRowContext(sendCtx, `SELECT e.id,e.owner_id,e.profile_id,t.thread_id,e.availability,e.observed_at,e.reason,e.changes_text
  FROM profile_presence_events e JOIN mirror_topics t ON t.profile_id=e.profile_id
- WHERE e.state='pending' AND e.next_attempt<=? AND t.thread_id>0
+ WHERE e.state='pending' AND e.next_attempt<=? AND t.thread_id>0 `+w.Store.syncPublicationCandidates("e.owner_id", "e.id", "presence")+`
  AND NOT EXISTS(SELECT 1 FROM profile_presence_events prior WHERE prior.owner_id=e.owner_id AND prior.profile_id=e.profile_id AND prior.id<e.id AND prior.state IN ('pending','processing'))
  AND (e.version_id=0 OR EXISTS(
   SELECT 1 FROM archive_versions av WHERE av.version_id=e.version_id AND av.owner_id=e.owner_id AND av.profile_id=e.profile_id AND av.thread_id=t.thread_id AND (
@@ -338,11 +347,11 @@ func (w *ProfileWatcher) deliverProfilePresence(ctx context.Context) (bool, erro
        WHERE original.fingerprint=av.fingerprint AND original.profile_id=av.profile_id AND original.thread_id=t.thread_id AND original.state IN ('sent','partial') AND layout.state='sent'))
   )
  ))
- AND NOT EXISTS(SELECT 1 FROM versions v LEFT JOIN archive_versions av ON av.version_id=v.id WHERE v.owner_id=e.owner_id AND v.profile_id=e.profile_id AND (
+ AND NOT EXISTS(SELECT 1 FROM versions v LEFT JOIN archive_versions av ON av.version_id=v.id WHERE v.owner_id=e.owner_id AND v.profile_id=e.profile_id `+w.Store.syncPublicationCandidates("v.owner_id", "v.id", "version")+` AND (
    av.version_id IS NULL OR av.state IN ('pending','processing')
    OR (av.state IN ('sent','partial') AND NOT EXISTS(SELECT 1 FROM archive_profile_repairs layout WHERE layout.version_id=v.id AND layout.state='sent'))
  ))
- ORDER BY e.id LIMIT 1`, w.now().Unix()).Scan(&id, &profile, &thread, &availability, &observed, &reason, &changes)
+ ORDER BY e.id LIMIT 1`, w.now().Unix()).Scan(&id, &owner, &profile, &thread, &availability, &observed, &reason, &changes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, tx.Commit()
 	}
@@ -362,6 +371,9 @@ func (w *ProfileWatcher) deliverProfilePresence(ctx context.Context) (bool, erro
 	var lastSendErr error
 	attempted := false
 	err = a.groupCall(sendCtx, func() error {
+		if err := w.Store.requireSyncPublication(sendCtx, owner); err != nil {
+			return err
+		}
 		attempted = true
 		message, lastSendErr = a.TG.SendText(sendCtx, chat, thread, text, nil)
 		return lastSendErr

@@ -20,8 +20,9 @@ func profileIndexRenderedRows(t *testing.T, pages []profileIndexPayload, chat in
 		for _, entity := range page.Entities {
 			before, rest := telegramPrefix(page.Text, entity.Offset)
 			label, after := telegramPrefix(rest, entity.Length)
-			if entity.Type != "text_link" || !strings.HasSuffix(before, "\n") || (after != "" && !strings.HasPrefix(after, "\n")) || strings.Contains(label, "\n") {
-				t.Fatalf("link does not cover one complete row: %+v %q", entity, label)
+			tail := strings.SplitN(after, "\n", 2)[0]
+			if entity.Type != "text_link" || !strings.HasSuffix(before, "\n") || strings.Contains(label, "\n") || (tail != " ⭐️" && tail != " ⚪️" && tail != " ❔") {
+				t.Fatalf("link does not cover the label with status outside: %+v label=%q tail=%q", entity, label, tail)
 			}
 			if !strings.HasPrefix(entity.URL, strings.TrimSuffix(forumTopicURL(chat, 1), "1")) {
 				t.Fatalf("unexpected index target: %s", entity.URL)
@@ -90,19 +91,19 @@ func TestProfileIndexCompactNamesZodiacAndSourceStayExact(t *testing.T) {
 		t.Fatal("long name broke UTF-16 budget or UTF-8")
 	}
 	now := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
-	if got := profileIndexZodiac(profile, now); got != "♋" {
+	if got := profileIndexZodiac(profile, now); got != "♋️" {
 		t.Fatalf("unambiguous calendar sign: %q", got)
 	}
-	for _, birthday := range []any{nil, "2004-03-21", "2099-07-08", "2004-02-30", ""} {
-		if got := profileIndexZodiac(Profile{"birthday": birthday}, now); got != "" {
-			t.Fatalf("unknown/boundary birthday %v gained a sign: %q", birthday, got)
+	for _, birthday := range []any{nil, "2099-07-08", "2004-02-30", ""} {
+		if got := profileIndexZodiac(Profile{"birthday": birthday}, now); got != "❔" {
+			t.Fatalf("unknown birthday %v gained a sign: %q", birthday, got)
 		}
 	}
-	row := profileIndexRow(1, profileIndexEntry{ID: 17, Name: name, Age: 22, AgeKnown: true, Percent: 75, PercentKnown: true, Zodiac: "♋"})
-	if row != "1. Lika 🙂 Bazrova,22,75% ♋" || strings.Contains(row, "169") || strings.Contains(row, "#17") {
+	row := profileIndexRow(1, profileIndexEntry{ID: 17, Name: name, Age: 22, AgeKnown: true, Percent: 75, PercentKnown: true, Zodiac: "♋️"})
+	if row != "1 ♋️ 22, Lika 🙂 Bazrova, 75%" || strings.Contains(row, "169") || strings.Contains(row, "#17") {
 		t.Fatalf("non-compact profile row: %q", row)
 	}
-	if got := profileIndexRow(2, profileIndexEntry{ID: 18, Name: "Anna"}); got != "2. Anna,?,?%" {
+	if got := profileIndexRow(2, profileIndexEntry{ID: 18, Name: "Anna"}); got != "2 ❔ ?, Anna, —" {
 		t.Fatalf("missing fields became invented values: %q", got)
 	}
 	after, _ := json.Marshal(profile)
@@ -123,7 +124,7 @@ func TestProfileIndexPagesLinkWholeUTF16RowsAndKeepGlobalNumbers(t *testing.T) {
 		t.Fatalf("row-limit pagination: pages=%d err=%v", len(pages), err)
 	}
 	rows := profileIndexRenderedRows(t, pages, chat)
-	if len(rows) != 51 || rows[0] != "1. Name000🙂,23,75%" || rows[50] != "51. Name050🙂,23,75%" {
+	if len(rows) != 51 || rows[0] != "1 ❔ 23, Name000🙂, 75%" || rows[50] != "51 ❔ 23, Name050🙂, 75%" {
 		t.Fatalf("global numbering or compact labels changed: %v", rows)
 	}
 	if pages[0].Entities[0].URL != forumTopicURL(chat, 1000) || pages[1].Entities[0].URL != forumTopicURL(chat, 1050) {
@@ -140,7 +141,7 @@ func TestProfileIndexPagesLinkWholeUTF16RowsAndKeepGlobalNumbers(t *testing.T) {
 		t.Fatalf("UTF-16 budget did not split before row cap: %v", err)
 	}
 	longRows := profileIndexRenderedRows(t, longPages, chat)
-	if len(longRows) != len(entries) || !strings.HasPrefix(longRows[len(longRows)-1], "51. ") {
+	if len(longRows) != len(entries) || !strings.HasPrefix(longRows[len(longRows)-1], "51 ") {
 		t.Fatal("UTF-16 pagination lost entries or numbering")
 	}
 }
@@ -161,6 +162,74 @@ func TestProfileIndexEmptyAndInvalidDestinations(t *testing.T) {
 	} {
 		if _, err := renderProfileIndexPages(tc.kind, []profileIndexEntry{tc.entry}, tc.chat); err == nil {
 			t.Fatalf("invalid destination accepted: %+v", tc)
+		}
+	}
+}
+
+func TestProfileIndexZodiacCalendarBoundariesDoNotUseGreetingGuard(t *testing.T) {
+	now := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	for _, boundary := range []struct{ date, before, after string }{
+		{"2000-01-20", "♑️", "♒️"}, {"2000-02-19", "♒️", "♓️"},
+		{"2000-03-21", "♓️", "♈️"}, {"2000-04-20", "♈️", "♉️"},
+		{"2000-05-21", "♉️", "♊️"}, {"2000-06-21", "♊️", "♋️"},
+		{"2000-07-23", "♋️", "♌️"}, {"2000-08-23", "♌️", "♍️"},
+		{"2000-09-23", "♍️", "♎️"}, {"2000-10-23", "♎️", "♏️"},
+		{"2000-11-22", "♏️", "♐️"}, {"2000-12-22", "♐️", "♑️"},
+	} {
+		date, err := time.Parse("2006-01-02", boundary.date)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for offset := -2; offset <= 2; offset++ {
+			p := Profile{"birthday": date.AddDate(0, 0, offset).Format("2006-01-02")}
+			want := boundary.after
+			if offset < 0 {
+				want = boundary.before
+			}
+			if got := profileIndexZodiac(p, now); got != want {
+				t.Fatalf("boundary=%s offset=%d got=%s want=%s", boundary.date, offset, got, want)
+			}
+			if birthdayGreetingSign(p, now) != "neutral" {
+				t.Fatal("index presentation changed the existing greeting guard")
+			}
+		}
+	}
+	if got := profileIndexZodiac(Profile{"birthday": "2000-02-29T23:30:00-12:00"}, now); got != "♓️" {
+		t.Fatalf("leap day or source calendar timezone changed: %s", got)
+	}
+}
+
+func TestProfileIndexPremiumStrictSourceAndOutsideLink(t *testing.T) {
+	for _, tc := range []struct {
+		value          any
+		premium, known bool
+		icon           string
+	}{
+		{1, true, true, "⭐️"}, {int64(0), false, true, "⚪️"},
+		{json.Number("1"), true, true, "⭐️"}, {float64(0), false, true, "⚪️"},
+		{nil, false, false, "❔"}, {2, false, false, "❔"}, {"1", false, false, "❔"},
+		{true, false, false, "❔"}, {0.5, false, false, "❔"},
+	} {
+		p := Profile{"type": tc.value, "is_premium": true}
+		premium, known := profileIndexPremium(p)
+		if premium != tc.premium || known != tc.known {
+			t.Fatalf("type=%v: premium=%v known=%v", tc.value, premium, known)
+		}
+		e := profileIndexEntry{ID: 1, ThreadID: 2, CardID: 3, Name: "Сабина🙂", Age: 19, AgeKnown: true, Percent: 70, PercentKnown: true, Zodiac: "♑️", Premium: premium, PremiumKnown: known}
+		if got := profileIndexRow(37, e); got != "37 ♑️ 19, Сабина🙂, 70%" {
+			t.Fatalf("wrong horizontal label: %q", got)
+		}
+		for _, kind := range []string{profileIndexAge, profileIndexCompatibility} {
+			pages, err := renderProfileIndexPages(kind, []profileIndexEntry{e}, -1004401653948)
+			if err != nil || len(pages) != 1 || len(pages[0].Entities) != 1 {
+				t.Fatalf("bad status page: %+v %v", pages, err)
+			}
+			entity := pages[0].Entities[0]
+			_, rest := telegramPrefix(pages[0].Text, entity.Offset)
+			label, tail := telegramPrefix(rest, entity.Length)
+			if label != "1 ♑️ 19, Сабина🙂, 70%" || tail != " "+tc.icon || validMessageEntities(pages[0].Text, pages[0].Entities) != nil {
+				t.Fatalf("Premium included in UTF-16 click span: label=%q tail=%q", label, tail)
+			}
 		}
 	}
 }

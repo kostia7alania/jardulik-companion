@@ -609,3 +609,45 @@ func TestProfileIndexesZipRepairDoesNotReorderPublishedCards(t *testing.T) {
 		t.Fatalf("repaired ZIP replaced newer confirmed card link: %+v, %v", entries, err)
 	}
 }
+
+func TestProfileIndexesStoreMapsCurrentSourcePremiumWithoutMutatingRaw(t *testing.T) {
+	f := newProfileIndexesFixture(t)
+	ctx := context.Background()
+	for i, tc := range []struct {
+		value          any
+		premium, known bool
+	}{
+		{1, true, true}, {0, false, true}, {nil, false, false}, {2, false, false}, {"1", false, false},
+	} {
+		id := int64(20 + i)
+		f.add(t, id, 23, "Name", "2003-03-21")
+		p := Profile{"userId": id, "name": "Latest", "age": 23, "birthday": "2003-03-21", "is_premium": true}
+		if tc.value != nil {
+			p["type"] = tc.value
+		}
+		if _, err := f.s.Store.Archive(ctx, 123, []Profile{p}, "index-premium"); err != nil {
+			t.Fatal(err)
+		}
+		before, err := f.s.Store.Profile(ctx, 123, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries, err := f.s.profileIndexEntries(ctx, 123, 5696, f.now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got profileIndexEntry
+		for _, entry := range entries {
+			if entry.ID == id {
+				got = entry
+			}
+		}
+		if got.ID != id || got.Premium != tc.premium || got.PremiumKnown != tc.known || got.Zodiac != "♈️" {
+			t.Fatalf("type=%v: source display mapping %+v", tc.value, got)
+		}
+		after, err := f.s.Store.Profile(ctx, 123, id)
+		if err != nil || before.RawJSON != after.RawJSON {
+			t.Fatal("index mapping changed source raw JSON", err)
+		}
+	}
+}

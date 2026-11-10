@@ -142,6 +142,9 @@ func (w *ProfileWatcher) RunPresence(ctx context.Context) {
 // CheckOne consumes at most one due check, including failed or disconnected responses.
 // It never waits for a future slot and never sends a reaction.
 func (w *ProfileWatcher) CheckOne(ctx context.Context) (bool, error) {
+	if w.Config.SyncCycleEnabled {
+		return false, nil
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := ctx.Err(); err != nil {

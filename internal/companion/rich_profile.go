@@ -37,6 +37,8 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 	if len(photos) > 50 {
 		return card, fmt.Errorf("%w: media count", ErrRichCardTooLarge)
 	}
+	body, details, footer, link := splitPhotoFooter(profileText(p))
+	caption := map[string]any{"text": body}
 	var media []any
 	for i, photo := range photos {
 		if photo.ProfileID != p.ID || photo.VersionID != p.VersionID {
@@ -50,9 +52,8 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 			return card, errors.New("rich photo file unavailable")
 		}
 		card.Photos = append(card.Photos, photo.Path)
-		media = append(media, map[string]any{"type": "photo", "photo": map[string]any{"type": "photo", "media": fmt.Sprintf("attach://p%d", i)}})
+		media = append(media, map[string]any{"type": "photo", "photo": map[string]any{"type": "photo", "media": fmt.Sprintf("attach://p%d", i)}, "caption": caption})
 	}
-	body, details, footer, link := splitPhotoFooter(profileText(p))
 	if validPostURL(postLink) {
 		link = postLink
 	}
@@ -71,9 +72,12 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 	if len(media) == 1 {
 		blocks = append(blocks, media[0])
 	} else if len(media) > 1 {
-		blocks = append(blocks, map[string]any{"type": "collage", "blocks": media})
+		// PhotoViewer reads each photo caption; the collage caption shows the body once in chat.
+		blocks = append(blocks, map[string]any{"type": "collage", "blocks": media, "caption": caption})
+	} else {
+		blocks = append(blocks, map[string]any{"type": "paragraph", "text": body})
 	}
-	blocks = append(blocks, map[string]any{"type": "paragraph", "text": body}, map[string]any{"type": "expandable_blockquote", "text": []any{fold, map[string]any{"type": "code", "text": pretty.String()}}})
+	blocks = append(blocks, map[string]any{"type": "expandable_blockquote", "text": []any{fold, map[string]any{"type": "code", "text": pretty.String()}}})
 	footer = strings.TrimSpace(footer)
 	footerParts := []any{footer}
 	footerText := footer
@@ -88,8 +92,13 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 	if footerText != "" {
 		blocks = append(blocks, map[string]any{"type": "footer", "text": footerParts})
 	}
-	allText := body + fold + pretty.String() + footerText
-	card.TextBytes, card.TextCharacters = len(allText), utf8.RuneCountInString(allText)
+	bodyCopies := 1
+	if len(media) > 1 {
+		bodyCopies += len(media)
+	}
+	otherText := fold + pretty.String() + footerText
+	card.TextBytes = bodyCopies*len(body) + len(otherText)
+	card.TextCharacters = bodyCopies*utf8.RuneCountInString(body) + utf8.RuneCountInString(otherText)
 	if card.TextCharacters > 32768 {
 		return card, fmt.Errorf("%w: text length", ErrRichCardTooLarge)
 	}

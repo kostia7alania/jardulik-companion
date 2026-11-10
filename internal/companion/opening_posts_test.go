@@ -1,0 +1,385 @@
+package companion
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type openingPostsFixture struct {
+	s       *Service
+	now     time.Time
+	ticks   atomic.Int64
+	methods []string
+	texts   []openingPostPayload
+	respond func(*http.Request, string, map[string]json.RawMessage) (*http.Response, error)
+}
+
+func newOpeningPostsFixture(t *testing.T) *openingPostsFixture {
+	t.Helper()
+	c, store := archiveTestStore(t)
+	c.TelegramBase = "https://telegram.test"
+	ctx := context.Background()
+	if err := store.SaveSession(ctx, 123, Session{Token: "private-access", Refresh: "private-refresh", UserID: 5696, Generation: "opening-generation"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAccount(ctx, 123, Profile{"userId": 5696, "age": 33}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetReactionMessagePolicy(ctx, 123, "birthday", nil, "fixture_user"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConfigureReactionMessagePolicy(ctx, 123, ReactionMessagePolicyConfig{Mode: "birthday", TelegramUsername: "fixture_user", PreferDrafts: true, IronMix: true}); err != nil {
+		t.Fatal(err)
+	}
+	a := NewArchiver(c, store, NewTelegram(c), nil)
+	s := &Service{Config: c, Store: store, Archiver: a}
+	f := &openingPostsFixture{s: s, now: time.Date(2026, 11, 10, 8, 0, 0, 0, time.UTC)}
+	a.now = func() time.Time { return f.now.Add(time.Duration(f.ticks.Add(1)) * 10 * time.Second) }
+	a.TG.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+		method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		f.methods = append(f.methods, method)
+		if method != "createForumTopic" && method != "sendMessage" && method != "editMessageText" {
+			t.Fatalf("unexpected operation: %s", method)
+		}
+		var payload openingPostPayload
+		if method != "createForumTopic" {
+			encoded, _ := json.Marshal(body)
+			if err := json.Unmarshal(encoded, &payload); err != nil {
+				t.Fatal(err)
+			}
+			f.texts = append(f.texts, payload)
+			if _, err := openingPostBytes(payload); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(payload.Text, "private-access") || strings.Contains(payload.Text, "private-device") {
+				t.Fatal("private provenance exported")
+			}
+		}
+		if f.respond != nil {
+			return f.respond(r, method, body)
+		}
+		if method == "createForumTopic" {
+			return albumTestResponse(r, 200, `{"ok":true,"result":{"message_thread_id":700}}`), nil
+		}
+		var message int64
+		_ = json.Unmarshal(body["message_id"], &message)
+		if message == 0 {
+			message = 2000 + int64(len(f.methods))
+		}
+		return albumTestResponse(r, 200, fmt.Sprintf(`{"ok":true,"result":{"message_id":%d,"message_thread_id":700,"chat":{"id":-100123}}}`, message)), nil
+	})
+	if err := s.initOpeningPosts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+func (f *openingPostsFixture) addDraft(t *testing.T, id int64, name, message string) []byte {
+	t.Helper()
+	ctx := context.Background()
+	profile := Profile{"userId": id, "name": name, "age": 23, "height": 170, "birthday": "2003-04-10", "description": "люблю музыку"}
+	if _, err := f.s.Store.Archive(ctx, 123, []Profile{profile}, "opening-fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.Store.DB.Exec("INSERT OR REPLACE INTO mirror_topics(profile_id,thread_id) VALUES(?,?)", id, id+100); err != nil {
+		t.Fatal(err)
+	}
+	basis, hash, err := reactionDraftContent(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(map[string]any{"profile_id": id, "basis": basis, "state": "approved", "message": message, "review": reactionDraftReview{Approved: true, Notes: "reviewed", Evidence: []reactionDraftEvidence{{Field: "description", Quote: "музыку"}}}, "provenance": map[string]any{"device": "private-device", "first_pass": message}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.s.Store.DB.Exec(`INSERT INTO reaction_message_drafts(owner_id,upstream_id,profile_id,telegram_username,content_hash,basis_hash,state,message,capture_json,capture_sha) VALUES(123,5696,?,'fixture_user',?,?,'approved',?,?,?)`, id, hash, reactionDraftBindingHash(123, 5696, id, "fixture_user", hash), message, raw, digest(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+func (f *openingPostsFixture) step(t *testing.T) {
+	t.Helper()
+	if ok, err := f.s.deliverOpeningPost(context.Background()); !ok || err != nil {
+		t.Fatalf("delivery %v %v", ok, err)
+	}
+}
+func (f *openingPostsFixture) refresh(t *testing.T) {
+	t.Helper()
+	if _, err := f.s.Store.DB.Exec("UPDATE opening_audit_topics SET next_refresh=0"); err != nil {
+		t.Fatal(err)
+	}
+}
+func (f *openingPostsFixture) scalar(t *testing.T, query string, args ...any) string {
+	t.Helper()
+	var value string
+	if err := f.s.Store.DB.QueryRow(query, args...).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func TestOpeningPostsPreviewUsesCurrentRulesWithoutSendingOrMutating(t *testing.T) {
+	f := newOpeningPostsFixture(t)
+	raw := f.addDraft(t, 10, "Ира😀", "Ира😀, привет! Какая музыка тебе нравится? @fixture_user")
+	if err := f.s.Store.User(context.Background(), 456, "foreign"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.Store.DB.Exec(`INSERT INTO reaction_message_drafts(owner_id,upstream_id,profile_id,telegram_username,content_hash,basis_hash,state,message,capture_json,capture_sha) SELECT 456,111,99,telegram_username,content_hash,basis_hash,state,'FOREIGN',capture_json,capture_sha FROM reaction_message_drafts LIMIT 1`); err != nil {
+		t.Fatal(err)
+	}
+	cursor := f.scalar(t, "SELECT next_cursor FROM reaction_message_settings WHERE owner_id=123")
+	f.step(t)
+	f.step(t)
+	f.step(t)
+	if strings.Join(f.methods, ",") != "createForumTopic,sendMessage,sendMessage" {
+		t.Fatal(f.methods)
+	}
+	last := f.texts[len(f.texts)-1]
+	if !strings.Contains(last.Text, "Ира😀, дӕ бон хорз! Какая музыка тебе нравится? @fixture_user") || !strings.Contains(last.Text, "Предпросмотр") || !strings.Contains(last.Text, "strict8") || !strings.Contains(last.Text, "музыку") {
+		t.Fatal(last.Text)
+	}
+	var linked, folded bool
+	for _, e := range last.Entities {
+		linked = linked || e.Type == "text_link" && e.URL == "https://t.me/c/123/110"
+		folded = folded || e.Type == "expandable_blockquote"
+	}
+	if !linked || !folded {
+		t.Fatal(last.Entities)
+	}
+	if cursor != f.scalar(t, "SELECT next_cursor FROM reaction_message_settings WHERE owner_id=123") || f.scalar(t, "SELECT count(*) FROM actions") != "0" || f.scalar(t, "SELECT count(*) FROM reaction_message_intents") != "0" {
+		t.Fatal("preview changed outgoing state")
+	}
+	var stored []byte
+	if err := f.s.Store.DB.QueryRow("SELECT capture_json FROM reaction_message_drafts WHERE owner_id=123").Scan(&stored); err != nil || string(stored) != string(raw) {
+		t.Fatal("raw source changed", err)
+	}
+	if f.scalar(t, "SELECT count(*) FROM opening_audit_posts") != "2" {
+		t.Fatal("foreign draft entered audit")
+	}
+	if worked, err := f.s.deliverOpeningPost(context.Background()); worked || err != nil {
+		t.Fatalf("duplicate post: %v %v", worked, err)
+	}
+}
+
+func TestOpeningPostsFrozenIntentAndLegacyReceipt(t *testing.T) {
+	f := newOpeningPostsFixture(t)
+	f.addDraft(t, 19587, "Лена", "Лена, привет! Что слушаешь? @fixture_user")
+	f.addDraft(t, 10, "Ира", "Ира, привет! Что слушаешь? @fixture_user")
+	const frozen = "  Привет 😀 какой концерт запомнился? @old_handle \n"
+	req, _ := json.Marshal(map[string]any{"fromUserId": 5696, "userId": 10, "reactionType": 3, "isDeleted": false, "message": frozen})
+	r, err := f.s.Store.DB.Exec(`INSERT INTO actions(owner_id,profile_id,kind,state,response) VALUES(123,10,'Like','succeeded','{"success":true}')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, _ := r.LastInsertId()
+	if _, err = f.s.Store.DB.Exec(`INSERT INTO reaction_message_intents(action_id,owner_id,upstream_id,profile_id,generation,message,request_body,message_mode,policy_revision,template_index,reaction_type) VALUES(?,123,5696,10,'old-generation',?,?,'personal',2,-1,3)`, action, frozen, req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.Store.DB.Exec(debugAuditSchema); err != nil {
+		t.Fatal(err)
+	}
+	legacy, _ := json.Marshal(map[string]any{"fromUserId": 5696, "userId": 19587, "reactionType": 3, "isDeleted": false, "message": "Лена, привет! Какой концерт? @fixture_user"})
+	if _, err = f.s.Store.DB.Exec(`INSERT INTO debug_api_calls(owner_id,request_id,upstream_id,generation,path,target_id,reaction_type,request_body,response_body,http_status,state) VALUES(123,'legacy-opening-001',5696,'old-generation','/reactions/addNew',19587,3,?,'{"success":true}',200,'received')`, legacy); err != nil {
+		t.Fatal(err)
+	}
+	f.step(t)
+	f.step(t)
+	f.step(t)
+	f.step(t)
+	if !strings.Contains(f.texts[1].Text, frozen) || !strings.Contains(f.texts[1].Text, "подтверждена API") || strings.Contains(f.texts[1].Text, "дӕ бон хорз") {
+		t.Fatal("intent was regenerated", f.texts[1].Text)
+	}
+	if !strings.Contains(f.texts[2].Text, "прежний debug SuperLike") || !strings.Contains(f.texts[2].Text, "Лена, привет!") {
+		t.Fatal(f.texts[2].Text)
+	}
+	if f.scalar(t, "SELECT count(*) FROM opening_audit_posts WHERE kind IN ('intent','debug')") != "2" {
+		t.Fatal("missing receipt posts")
+	}
+}
+
+func TestOpeningPostsUnknownNewSendAndKnownEditRecovery(t *testing.T) {
+	f := newOpeningPostsFixture(t)
+	f.step(t)
+	f.respond = func(r *http.Request, method string, body map[string]json.RawMessage) (*http.Response, error) {
+		return nil, errors.New("transport closed")
+	}
+	if worked, err := f.s.deliverOpeningPost(context.Background()); !worked || err == nil {
+		t.Fatalf("unknown send: %v %v", worked, err)
+	}
+	if f.scalar(t, "SELECT state FROM opening_audit_posts WHERE item_key='formula'") != "uncertain" {
+		t.Fatal("unknown new send not quarantined")
+	}
+	f.refresh(t)
+	if worked, err := f.s.deliverOpeningPost(context.Background()); worked || err != nil {
+		t.Fatalf("unknown retried: %v %v", worked, err)
+	}
+	if _, err := f.s.Store.DB.Exec("UPDATE opening_audit_posts SET state='sending',message_id=55 WHERE item_key='formula'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.recoverOpeningPosts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.scalar(t, "SELECT state FROM opening_audit_posts WHERE item_key='formula'") != "pending" {
+		t.Fatal("known edit did not recover")
+	}
+	f.respond = func(r *http.Request, method string, body map[string]json.RawMessage) (*http.Response, error) {
+		if method != "editMessageText" {
+			t.Fatal("known message replaced")
+		}
+		return albumTestResponse(r, 400, `{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}`), nil
+	}
+	f.step(t)
+	if f.scalar(t, "SELECT state FROM opening_audit_posts WHERE item_key='formula'") != "sent" {
+		t.Fatal("known edit receipt not saved")
+	}
+}
+
+func TestOpeningPostsGenerationAndSourceGuardsBeforeOutbound(t *testing.T) {
+	for _, change := range []string{"generation", "profile", "handle"} {
+		t.Run(change, func(t *testing.T) {
+			f := newOpeningPostsFixture(t)
+			f.addDraft(t, 10, "Ира", "Ира, привет! Какая музыка? @fixture_user")
+			f.step(t)
+			f.step(t)
+			expected, err := f.s.Store.Session(context.Background(), 123)
+			if err != nil {
+				t.Fatal(err)
+			}
+			op, claimed, err := f.s.claimOpeningPost(context.Background(), expected)
+			if err != nil || !claimed {
+				t.Fatal(claimed, err)
+			}
+			switch change {
+			case "generation":
+				expected2 := expected
+				expected2.Generation = "new-generation"
+				if err = f.s.Store.SaveSession(context.Background(), 123, expected2); err != nil {
+					t.Fatal(err)
+				}
+			case "profile":
+				if _, err = f.s.Store.Archive(context.Background(), 123, []Profile{{"userId": 10, "name": "Ира", "age": 23, "height": 170, "description": "changed"}}, "changed"); err != nil {
+					t.Fatal(err)
+				}
+			case "handle":
+				if _, err = f.s.Store.ConfigureReactionMessagePolicy(context.Background(), 123, ReactionMessagePolicyConfig{Mode: "birthday", TelegramUsername: "other_user", PreferDrafts: true, IronMix: true}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err = f.s.markOpeningPostSending(context.Background(), op, expected); !errors.Is(err, errOpeningPostBinding) {
+				t.Fatalf("changed %s allowed: %v", change, err)
+			}
+			if len(f.methods) != 2 {
+				t.Fatal("guard performed outbound")
+			}
+		})
+	}
+}
+
+func TestOpeningPostsRefreshEditsKnownPreviewAndKeepsFrozenSources(t *testing.T) {
+	f := newOpeningPostsFixture(t)
+	f.addDraft(t, 10, "Ира", "Ира, привет! Какая музыка? @fixture_user")
+	f.step(t)
+	f.step(t)
+	f.step(t)
+	before := f.scalar(t, "SELECT message_id FROM opening_audit_posts WHERE item_key='draft:10'")
+	if _, err := f.s.Store.ConfigureReactionMessagePolicy(context.Background(), 123, ReactionMessagePolicyConfig{Mode: "birthday", TelegramUsername: "fixture_user", PreferDrafts: true, IronMix: false}); err != nil {
+		t.Fatal(err)
+	}
+	f.refresh(t)
+	f.step(t)
+	f.step(t)
+	if f.methods[len(f.methods)-1] != "editMessageText" || before != f.scalar(t, "SELECT message_id FROM opening_audit_posts WHERE item_key='draft:10'") {
+		t.Fatal("refresh replaced known message")
+	}
+	if !strings.Contains(f.texts[len(f.texts)-1].Text, "Ира, привет!") {
+		t.Fatal("current style not reflected")
+	}
+}
+
+func TestOpeningPostsUnavailableItemDoesNotBlockLaterRecipients(t *testing.T) {
+	for _, invalidBeforePlan := range []bool{false, true} {
+		t.Run(fmt.Sprint(invalidBeforePlan), func(t *testing.T) {
+			f := newOpeningPostsFixture(t)
+			f.addDraft(t, 10, "Ира", "Ира, привет! Какая музыка? @fixture_user")
+			f.addDraft(t, 11, "Лена", "Лена, привет! Какая музыка? @fixture_user")
+			if invalidBeforePlan {
+				if _, err := f.s.Store.Archive(context.Background(), 123, []Profile{{"userId": 10, "name": "Ира", "age": "invalid", "height": 170}}, "bad-source"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.step(t)
+			f.step(t)
+			if !invalidBeforePlan {
+				if _, err := f.s.Store.DB.Exec("UPDATE opening_audit_topics SET next_refresh=9223372036854775807"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.s.Store.DB.Exec("DELETE FROM mirror_topics WHERE profile_id=10"); err != nil {
+					t.Fatal(err)
+				}
+				if worked, err := f.s.deliverOpeningPost(context.Background()); !worked || !errors.Is(err, errOpeningPostSource) {
+					t.Fatalf("lost source: %v %v", worked, err)
+				}
+				if f.scalar(t, "SELECT state FROM opening_audit_posts WHERE item_key='draft:10'") != "error" {
+					t.Fatal("unavailable item kept pending")
+				}
+			}
+			f.step(t)
+			if !strings.Contains(f.texts[len(f.texts)-1].Text, "Лена") {
+				t.Fatal("valid later recipient starved")
+			}
+		})
+	}
+}
+
+func TestOpeningPostsStaleDraftShowsActualFallbackAndRecipe(t *testing.T) {
+	f := newOpeningPostsFixture(t)
+	original := f.addDraft(t, 10, "Ира", "Ира, привет! Какая музыка? @fixture_user")
+	changed := Profile{"userId": 10, "name": "Ира", "age": 23, "height": 170, "birthday": "2003-04-10", "description": "новое описание"}
+	if _, err := f.s.Store.Archive(context.Background(), 123, []Profile{changed}, "changed"); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := f.s.Store.Session(context.Background(), 123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.s.Store.DB.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	item, err := f.s.openingPostItemTx(context.Background(), tx, expected, "draft:10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(item.Payload.Text, "Запасной birthday") || !strings.Contains(item.Payload.Text, "Архив заготовки") || strings.Contains(item.Payload.Text, "Источник: approved") {
+		t.Fatal(item.Payload.Text)
+	}
+	actual, _, err := birthdayReactionMessage(changed, "fixture_user", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual = ironMixReactionMessage(actual, "Ира")
+	if !strings.Contains(item.Payload.Text, actual) {
+		t.Fatal("preview is not the actual fallback")
+	}
+	var recipe struct {
+		Capture []byte                `json:"draft_capture_bytes"`
+		Basis   Profile               `json:"current_basis"`
+		Policy  ReactionMessagePolicy `json:"policy"`
+	}
+	if err = json.Unmarshal(item.Source, &recipe); err != nil || string(recipe.Capture) != string(original) || recipe.Basis.String("description") != "новое описание" || !recipe.Policy.IronMix {
+		t.Fatal("incomplete preview recipe", err)
+	}
+}

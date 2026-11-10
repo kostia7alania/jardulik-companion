@@ -41,7 +41,7 @@ func (c *FeedCrawler) saveDailyCrawlMarker(ctx context.Context, owner int64, mar
 func (c *FeedCrawler) ScheduleDaily(ctx context.Context) (bool, error) {
 	s := c.Service
 	owner := s.Config.OwnerID
-	if !s.Config.DailyCrawl || owner <= 0 || s.foregroundPending() {
+	if s.Config.SyncCycleEnabled || !s.Config.DailyCrawl || owner <= 0 || s.foregroundPending() {
 		return false, nil
 	}
 	c.mu.Lock()

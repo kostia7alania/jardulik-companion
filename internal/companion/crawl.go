@@ -901,6 +901,15 @@ func (c *FeedCrawler) checkpointHydration(ctx context.Context, j *CrawlJob, targ
 				if err := tx.QueryRowContext(ctx, "SELECT version_id FROM queue WHERE owner_id=? AND profile_id=?", j.Owner, target).Scan(&version); err != nil {
 					return err
 				}
+				if c.Service.Config.SyncCycleEnabled {
+					if _, err := tx.ExecContext(ctx, syncFullReadsSchema); err != nil {
+						return err
+					}
+					binding := SyncCycle{OwnerID: j.Owner, UserID: j.UserID, Generation: j.Generation}
+					if err := recordSyncFullCaptureTx(ctx, tx, binding, target, version, observed); err != nil {
+						return err
+					}
+				}
 				state = "hydrated"
 			}
 			result, err := tx.ExecContext(ctx, "UPDATE crawl_location_results SET state=?,version_id=?,completed_at=? WHERE owner_id=? AND run_id=? AND profile_id=? AND state='pending'", state, version, c.now().UnixMilli(), j.Owner, j.RunID, target)

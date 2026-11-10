@@ -134,6 +134,15 @@ func scanProfileIndexTopic(row interface{ Scan(...any) error }) (profileIndexTop
 const profileIndexTopicColumns = "id,owner_id,upstream_id,generation,kind,chat_id,thread_id,state,next_refresh"
 
 func (s *Service) refreshProfileIndexPlan(ctx context.Context, expected Session) error {
+	if s.Store.cfg.SyncCycleEnabled {
+		var frozen bool
+		if err := s.Store.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_publication_manifests pm JOIN sync_cycles sc ON sc.id=pm.cycle_id WHERE sc.owner_id=? AND sc.upstream_id=? AND sc.generation=? AND sc.stage='publishing' AND pm.indexes_frozen=1)`, s.Config.OwnerID, expected.UserID, expected.Generation).Scan(&frozen); err != nil {
+			return err
+		}
+		if frozen {
+			return nil
+		}
+	}
 	var due bool
 	now := s.Archiver.now()
 	if err := s.Store.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM profile_index_topics WHERE owner_id=? AND upstream_id=? AND generation=? AND chat_id=? AND next_refresh<=?)`, s.Config.OwnerID, expected.UserID, expected.Generation, s.Config.BackupChatID, now.UnixMilli()).Scan(&due); err != nil {
@@ -378,6 +387,12 @@ func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 	if !s.profileIndexesAllowed() {
 		return false, nil
 	}
+	if err := s.Store.requireSyncPublication(ctx, s.Config.OwnerID); err != nil {
+		if errors.Is(err, errSyncPublicationDeferred) {
+			return false, nil
+		}
+		return false, err
+	}
 	a := s.Archiver
 	send, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
@@ -387,6 +402,21 @@ func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 		}
 	}
 	defer a.mu.Unlock()
+
+	unlock, locked, lockErr := s.Store.trySyncPublicationLock()
+	if lockErr != nil {
+		return false, lockErr
+	}
+	if !locked {
+		return false, nil
+	}
+	defer unlock()
+	if err := s.Store.requireSyncPublication(send, s.Config.OwnerID); err != nil {
+		if errors.Is(err, errSyncPublicationDeferred) {
+			return false, nil
+		}
+		return false, err
+	}
 	if err := s.initProfileIndexes(send); err != nil {
 		return false, err
 	}
@@ -415,6 +445,9 @@ func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 	var receipt []byte
 	var thread, message int64
 	err = a.groupCall(send, func() error {
+		if err := s.Store.requireSyncPublication(send, s.Config.OwnerID); err != nil {
+			return err
+		}
 		if e := s.markProfileIndexSending(send, op, expected); e != nil {
 			return e
 		}

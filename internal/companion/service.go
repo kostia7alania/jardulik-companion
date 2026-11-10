@@ -606,6 +606,9 @@ func (s *Service) status(ctx context.Context, owner int64) {
 		mode = "включены"
 	}
 	text := fmt.Sprintf("%s\nАнкет: %d, снимков: %d\nФото сохранено: %d, в очереди: %d\nИзбранное: %d\nОтправлено лайков ботом: %d\nРеакции в Jardulik: %s", state, n["profiles"], n["versions"], n["photos"], n["pending_photos"], n["favorites"], n["likes"], mode)
+	if syncStatus := s.SyncStatusText(ctx, owner); syncStatus != "" {
+		text += "\n" + syncStatus
+	}
 	text += "\n" + s.AutolikeStatus(ctx, owner)
 	text += "\n" + s.ContactStatusText(ctx, owner)
 	if owner == s.Config.OwnerID {

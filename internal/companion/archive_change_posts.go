@@ -323,6 +323,12 @@ func (s *Service) deliverArchiveChangePost(ctx context.Context) (bool, error) {
 	if a == nil || a.TG == nil || s.Config.OwnerID <= 0 || s.Config.BackupChatID == 0 || s.Config.ArchivePaused || a.Config.ArchivePaused {
 		return false, nil
 	}
+	if err := s.Store.requireSyncPublication(ctx, s.Config.OwnerID); err != nil {
+		if errors.Is(err, errSyncPublicationDeferred) {
+			return false, nil
+		}
+		return false, err
+	}
 	sendCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	for !a.mu.TryLock() {
@@ -331,6 +337,15 @@ func (s *Service) deliverArchiveChangePost(ctx context.Context) (bool, error) {
 		}
 	}
 	defer a.mu.Unlock()
+
+	unlock, locked, lockErr := s.Store.trySyncPublicationLock()
+	if lockErr != nil {
+		return false, lockErr
+	}
+	if !locked {
+		return false, nil
+	}
+	defer unlock()
 	if err := a.init(sendCtx); err != nil {
 		return false, err
 	}
@@ -343,7 +358,7 @@ func (s *Service) deliverArchiveChangePost(ctx context.Context) (bool, error) {
 	var version, profile, thread int64
 	var previous sql.NullInt64
 	err := s.Store.DB.QueryRowContext(sendCtx, `SELECT version_id,profile_id,thread_id,old_version_id FROM archive_change_posts n
- WHERE owner_id=? AND state='pending' AND next_attempt<=?
+ WHERE owner_id=? AND state='pending' AND next_attempt<=? `+s.Store.syncPublicationCandidates("n.owner_id", "n.version_id", "change")+`
  AND NOT EXISTS(SELECT 1 FROM profile_presence p WHERE p.owner_id=n.owner_id AND p.profile_id=n.profile_id AND p.availability='unavailable')
  AND NOT EXISTS(SELECT 1 FROM profile_presence_events e WHERE e.owner_id=n.owner_id AND e.profile_id=n.profile_id AND e.state IN ('pending','processing'))
  ORDER BY julianday(published_at) DESC,version_id DESC LIMIT 1`, s.Config.OwnerID, a.now().Unix()).Scan(&version, &profile, &thread, &previous)
@@ -397,6 +412,9 @@ func (s *Service) deliverArchiveChangePost(ctx context.Context) (bool, error) {
 	var lastSendErr error
 	attempted := false
 	err = a.groupCall(sendCtx, func() error {
+		if err := s.Store.requireSyncPublication(sendCtx, s.Config.OwnerID); err != nil {
+			return err
+		}
 		allowed, e := s.claimArchiveChangeSend(sendCtx, version)
 		if e != nil {
 			return e

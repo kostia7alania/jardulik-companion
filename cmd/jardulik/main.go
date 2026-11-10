@@ -93,6 +93,15 @@ func run() error {
 		return s.RunPoster(ctx)
 	case "serve-compatibility":
 		return s.RunCompatibility(ctx)
+	case "sync-status":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik sync-status")
+		}
+		status, statusErr := s.SyncStatus(ctx, owner)
+		if statusErr != nil {
+			return statusErr
+		}
+		return json.NewEncoder(os.Stdout).Encode(status)
 	case "compatibility-status":
 		if len(os.Args) != 2 {
 			return errors.New("usage: jardulik compatibility-status")
@@ -264,7 +273,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, sync-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
 	}
 }
 func main() {

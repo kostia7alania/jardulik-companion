@@ -65,12 +65,9 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 	if err != nil || session.UserID != job.FromUserID || session.Generation != job.Generation || session.State != "connected" || s.Store.Paused(ctx, job.OwnerID) {
 		return settle("cancelled", "session_changed")
 	}
-	filters, err := s.Autoliker.filters(ctx, job.OwnerID)
-	if err != nil {
-		return settle("cancelled", "filters_unavailable")
-	}
 	stored, err := s.Store.Profile(ctx, job.OwnerID, job.TargetUserID)
-	if err != nil || !compatibilityMatchesFilters(stored.Profile, filters) {
+	eligible, eligibilityErr := s.compatibilityEligible(ctx, *job, stored.Profile)
+	if err != nil || eligibilityErr != nil || !eligible {
 		return settle("cancelled", "outside_current_filters")
 	}
 	if compatibilityProfileHash(stored.Profile) != job.TargetHash {
@@ -112,17 +109,22 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 		return settle("queued", "preflight_unavailable")
 	}
 	target, decodeErr := debugProfile(targetRaw)
-	if decodeErr != nil || target.ID() != job.TargetUserID || !compatibilityMatchesFilters(target, filters) {
+	eligible, eligibilityErr = s.compatibilityEligible(ctx, *job, target)
+	if decodeErr != nil || target.ID() != job.TargetUserID || eligibilityErr != nil || !eligible {
 		return settle("cancelled", "outside_current_filters")
 	}
 	// Refresh the cache used by the planner before replacing a superseded input job.
 	sessionMu.Lock()
 	err = s.Client.debugBinding(ctx, job.OwnerID, session)
+	var captured []int64
 	if err == nil {
-		_, err = s.Store.ArchiveViewed(ctx, job.OwnerID, []Profile{target}, "GET /user/getUser")
+		captured, err = s.Store.ArchiveViewed(ctx, job.OwnerID, []Profile{target}, "GET /user/getUser")
 	}
 	if err == nil {
 		_, err = s.Store.recordProfilePresence(ctx, job.OwnerID, job.TargetUserID, true, targetObserved)
+	}
+	if err == nil && s.Config.SyncCycleEnabled && len(captured) == 1 {
+		err = s.Store.RecordSyncFullCapture(ctx, job.OwnerID, session, job.TargetUserID, captured[0], targetObserved)
 	}
 	sessionMu.Unlock()
 	if err != nil {
@@ -142,8 +144,11 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 		if s.foregroundPending() {
 			return ErrCompatibilityBusy
 		}
-		currentFilters, err := s.Autoliker.filters(guardCtx, job.OwnerID)
-		if err != nil || !compatibilityMatchesFilters(target, currentFilters) {
+		eligible, eligibilityErr := s.compatibilityEligible(guardCtx, *job, target)
+		if eligibilityErr != nil {
+			return eligibilityErr
+		}
+		if !eligible {
 			return ErrCompatibilityUnavailable
 		}
 		observed = s.Client.Now()
@@ -151,7 +156,7 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 		if gap <= 0 {
 			gap = time.Minute
 		}
-		if err = s.Store.StartCompatibilityJob(guardCtx, *job, ownRaw, targetRaw, request, observed, gap); err != nil {
+		if err := s.Store.StartCompatibilityJob(guardCtx, *job, ownRaw, targetRaw, request, observed, gap); err != nil {
 			return err
 		}
 		started = true

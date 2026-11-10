@@ -33,6 +33,7 @@ type Config struct {
 	RichCards                                          bool
 	ArchivePaused                                      bool
 	DailyCrawl                                         bool
+	SyncCycleEnabled                                   bool
 	MinFreeBytes                                       uint64
 	InitMaxAge                                         time.Duration
 	WatchInterval, WatchGap                            time.Duration
@@ -54,6 +55,15 @@ func LoadConfig() (Config, error) {
 			return c, errors.New("invalid COMPATIBILITY_INTERVAL_SECONDS")
 		}
 		c.CompatibilityGap = time.Duration(seconds) * time.Second
+	}
+	if raw := strings.TrimSpace(os.Getenv("SYNC_CYCLE_ENABLED")); raw != "" {
+		if raw != "true" && raw != "false" {
+			return c, errors.New("SYNC_CYCLE_ENABLED must be true or false")
+		}
+		c.SyncCycleEnabled = raw == "true"
+	}
+	if c.SyncCycleEnabled && !c.CompatibilityEnabled {
+		return c, errors.New("SYNC_CYCLE_ENABLED requires COMPATIBILITY_ENABLED=true")
 	}
 	c.DebugListen = strings.TrimSpace(os.Getenv("JARDULIK_DEBUG_LISTEN"))
 	if c.DebugListen != "" {

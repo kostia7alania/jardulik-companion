@@ -77,7 +77,10 @@ func (s *Store) InitCompatibility(ctx context.Context) error {
 	if _, err := s.DB.ExecContext(ctx, analysisSchema); err != nil {
 		return err
 	}
-	_, err := s.DB.ExecContext(ctx, compatibilitySchema)
+	if _, err := s.DB.ExecContext(ctx, compatibilitySchema); err != nil {
+		return err
+	}
+	_, err := s.DB.ExecContext(ctx, compatibilityCycleSchema)
 	return err
 }
 
@@ -147,13 +150,17 @@ func (s *Store) ClaimCompatibilityJob(ctx context.Context, now time.Time) (*Comp
 	} else if err != nil {
 		return nil, err
 	}
+	scope := " AND j.filter_hash<>'" + compatibilityArchiveScope + "'"
+	if s.cfg.SyncCycleEnabled {
+		scope = " AND " + compatibilityCycleScopeSQL
+	}
 	j, err := scanCompatibilityJob(tx.QueryRowContext(ctx, `SELECT `+compatibilityJobColumns+` FROM compatibility_jobs j
  JOIN compatibility_pairs p ON p.id=j.pair_id JOIN users u ON u.id=p.owner_id
  JOIN sessions s ON s.owner_id=p.owner_id AND s.upstream_id=p.from_user_id
  LEFT JOIN compatibility_schedule c ON c.owner_id=p.owner_id
  WHERE j.state='queued' AND j.next_at_ms<=? AND COALESCE(c.next_dispatch_ms,0)<=? AND u.paused=0 AND s.state='connected'
  AND json_valid(s.account_json) AND COALESCE(json_extract(s.account_json,'$.freezeState'),1)=0 AND json_extract(s.account_json,'$.age') BETWEEN 18 AND 111
- AND NOT EXISTS(SELECT 1 FROM compatibility_jobs blocked WHERE blocked.pair_id=j.pair_id AND blocked.state IN ('sending','unknown'))
+ AND NOT EXISTS(SELECT 1 FROM compatibility_jobs blocked WHERE blocked.pair_id=j.pair_id AND blocked.state IN ('sending','unknown'))`+scope+`
  ORDER BY COALESCE(c.last_dispatch_ms,0),j.id LIMIT 1`, now.UnixMilli(), now.UnixMilli()))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -264,6 +271,18 @@ func (s *Store) StartCompatibilityJob(ctx context.Context, j CompatibilityJob, o
 	}
 	if paused || session.State != "connected" || session.UserID != j.FromUserID || session.Generation != j.Generation {
 		return ErrCompatibilityUnavailable
+	}
+	if !s.cfg.SyncCycleEnabled && j.FilterHash == compatibilityArchiveScope {
+		return ErrCompatibilityUnavailable
+	}
+	if s.cfg.SyncCycleEnabled {
+		allowed, scopeErr := s.compatibilityCycleAllows(ctx, tx, j)
+		if scopeErr != nil {
+			return scopeErr
+		}
+		if !allowed || !compatibilityAdult(own) || !compatibilityAdult(target) {
+			return ErrCompatibilityUnavailable
+		}
 	}
 	var blocked bool
 	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM compatibility_jobs WHERE pair_id=? AND state IN ('sending','unknown'))", j.PairID).Scan(&blocked); err != nil {

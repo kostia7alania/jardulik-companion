@@ -21,6 +21,7 @@ type profileIndexEntry struct {
 	AgeKnown               bool
 	Percent                int
 	PercentKnown           bool
+	Premium, PremiumKnown  bool
 }
 
 type profileIndexPayload struct {
@@ -39,8 +40,48 @@ func profileIndexTitle(kind string) string {
 }
 
 func profileIndexZodiac(p Profile, now time.Time) string {
-	signs := map[string]string{"aries": "♈", "taurus": "♉", "gemini": "♊", "cancer": "♋", "leo": "♌", "virgo": "♍", "libra": "♎", "scorpio": "♏", "sagittarius": "♐", "capricorn": "♑", "aquarius": "♒", "pisces": "♓"}
-	return signs[birthdayGreetingSign(p, now)]
+	date, known := birthdayGreetingDate(p)
+	if !known || date.After(time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)) {
+		return "❔"
+	}
+	// The same calendar cutoffs as birthdayGreetingSign, without its editorial guard.
+	boundaries := [...]struct {
+		start int
+		icon  string
+	}{
+		{120, "♒️"}, {219, "♓️"}, {321, "♈️"}, {420, "♉️"},
+		{521, "♊️"}, {621, "♋️"}, {723, "♌️"}, {823, "♍️"},
+		{923, "♎️"}, {1023, "♏️"}, {1122, "♐️"}, {1222, "♑️"},
+	}
+	day := int(date.Month())*100 + date.Day()
+	icon := "♑️"
+	for _, boundary := range boundaries {
+		if day >= boundary.start {
+			icon = boundary.icon
+		}
+	}
+	return icon
+}
+
+func profileIndexPremium(p Profile) (premium, known bool) {
+	// Accept source numeric values only; strings and missing values are unknown.
+	switch p["type"].(type) {
+	case int, int64, float64, json.Number:
+	default:
+		return false, false
+	}
+	tier, valid := autoInteger(p["type"])
+	return tier == 1, valid && (tier == 0 || tier == 1)
+}
+
+func profileIndexPremiumIcon(e profileIndexEntry) string {
+	if !e.PremiumKnown {
+		return "❔"
+	}
+	if e.Premium {
+		return "⭐️"
+	}
+	return "⚪️"
 }
 
 func profileIndexName(p Profile, id int64) string {
@@ -87,18 +128,18 @@ func sortProfileIndex(kind string, entries []profileIndexEntry) []profileIndexEn
 }
 
 func profileIndexRow(n int, e profileIndexEntry) string {
-	age, percent := "?", "?%"
+	age, percent := "?", "—"
 	if e.AgeKnown {
 		age = strconv.FormatInt(e.Age, 10)
 	}
 	if e.PercentKnown {
 		percent = strconv.Itoa(e.Percent) + "%"
 	}
-	row := fmt.Sprintf("%d. %s,%s,%s", n, e.Name, age, percent)
-	if e.Zodiac != "" {
-		row += " " + e.Zodiac
+	sign := e.Zodiac
+	if sign == "" {
+		sign = "❔"
 	}
-	return row
+	return fmt.Sprintf("%d %s %s, %s, %s", n, sign, age, e.Name, percent)
 }
 
 func renderProfileIndexPages(kind string, entries []profileIndexEntry, chat int64) ([]profileIndexPayload, error) {
@@ -110,24 +151,25 @@ func renderProfileIndexPages(kind string, entries []profileIndexEntry, chat int6
 	if len(ordered) == 0 {
 		return []profileIndexPayload{{Text: title + "\n\nАнкет пока нет.", Entities: []MessageEntity{}}}, nil
 	}
-	type row struct{ text, link string }
+	type row struct{ label, tail, link string }
 	var chunks [][]row
 	current := []row{}
 	units := 0
 	for i, entry := range ordered {
-		text := profileIndexRow(i+1, entry)
+		label := profileIndexRow(i+1, entry)
+		tail := " " + profileIndexPremiumIcon(entry)
 		link := forumTopicURL(chat, entry.CardID)
 		if entry.ID <= 0 || entry.ThreadID <= 0 || entry.CardID <= 0 || link == "" {
 			return nil, errors.New("profile index has no confirmed card link")
 		}
 		// Leave room for the compact heading and page count as the archive grows.
-		if len(current) >= profileIndexRowsPerPage || units+1+textUnits(text) > 4096-80 {
+		if len(current) >= profileIndexRowsPerPage || units+1+textUnits(label+tail) > 4096-80 {
 			chunks = append(chunks, current)
 			current = nil
 			units = 0
 		}
-		current = append(current, row{text, link})
-		units += 1 + textUnits(text)
+		current = append(current, row{label, tail, link})
+		units += 1 + textUnits(label+tail)
 	}
 	if len(current) > 0 {
 		chunks = append(chunks, current)
@@ -138,8 +180,8 @@ func renderProfileIndexPages(kind string, entries []profileIndexEntry, chat int6
 		for _, r := range chunk {
 			payload.Text += "\n"
 			offset := textUnits(payload.Text)
-			payload.Text += r.text
-			payload.Entities = append(payload.Entities, MessageEntity{Type: "text_link", Offset: offset, Length: textUnits(r.text), URL: r.link})
+			payload.Text += r.label + r.tail
+			payload.Entities = append(payload.Entities, MessageEntity{Type: "text_link", Offset: offset, Length: textUnits(r.label), URL: r.link})
 		}
 		if textUnits(payload.Text) > 4096 {
 			return nil, errors.New("profile index exceeds Telegram message limit")

@@ -70,6 +70,17 @@ func (s *Service) planCompatibility(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	if s.Config.SyncCycleEnabled {
+		cycle, cycleErr := s.Store.SyncCycle(ctx, owner)
+		if cycleErr != nil {
+			return cycleErr
+		}
+		if cycle != nil && cycle.Stage != "complete" {
+			return s.deferCompatibilityPlan(ctx, owner, cycle.UserID, now)
+		}
+		// Daily cycle owns all compatibility planning when enabled.
+		return s.deferCompatibilityPlan(ctx, owner, 0, now)
+	}
 	session, err := s.Store.Session(ctx, owner)
 	if err != nil {
 		return err
@@ -192,18 +203,31 @@ func (s *Store) enqueueCompatibility(ctx context.Context, j CompatibilityJob, no
 	}
 	var existing int64
 	var state, reason string
-	var nextAt int64
+	var nextAt, updatedAt int64
 	var savedAnalysis sql.NullInt64
-	err = tx.QueryRowContext(ctx, "SELECT id,state,analysis_id,reason,next_at_ms FROM compatibility_jobs WHERE pair_id=? AND input_hash=?", j.PairID, j.InputHash).Scan(&existing, &state, &savedAnalysis, &reason, &nextAt)
+	err = tx.QueryRowContext(ctx, "SELECT id,state,analysis_id,reason,next_at_ms,updated_at_ms FROM compatibility_jobs WHERE pair_id=? AND input_hash=?", j.PairID, j.InputHash).Scan(&existing, &state, &savedAnalysis, &reason, &nextAt, &updatedAt)
 	if err == nil {
 		// An unavailable profile is checked again by the daily cycle, not every planner tick.
 		if state == "cancelled" && reason == "target_unavailable" && nextAt > now.UnixMilli() {
-			return tx.Commit()
+			returned := false
+			if j.FilterHash == compatibilityArchiveScope {
+				// A successful later source read can prove a same-content profile
+				// returned during this cycle. This job has never sent a GPT POST.
+				err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_full_reads r
+ WHERE r.owner_id=? AND r.upstream_id=? AND r.generation=? AND r.profile_id=? AND r.observed_at_ms>?
+ AND EXISTS(SELECT 1 FROM profile_presence p WHERE p.owner_id=r.owner_id AND p.profile_id=r.profile_id AND p.availability='available'))`, j.OwnerID, j.FromUserID, j.Generation, j.TargetUserID, updatedAt).Scan(&returned)
+				if err != nil {
+					return err
+				}
+			}
+			if !returned {
+				return tx.Commit()
+			}
 		}
 		if state == "succeeded" && savedAnalysis.Valid {
 			_, err = tx.ExecContext(ctx, "UPDATE compatibility_pairs SET latest_analysis_id=?,updated_at_ms=? WHERE id=? AND (latest_analysis_id IS NULL OR latest_analysis_id<>?)", savedAnalysis.Int64, now.UnixMilli(), j.PairID, savedAnalysis.Int64)
 		} else if state == "queued" || state == "cancelled" {
-			_, err = tx.ExecContext(ctx, `UPDATE compatibility_jobs SET generation=?,version_id=?,filter_hash=?,own_profile=?,target_profile=?,state='queued',reason='',next_at_ms=0,updated_at_ms=?
+			_, err = tx.ExecContext(ctx, `UPDATE compatibility_jobs SET generation=?,version_id=?,filter_hash=?,own_profile=?,target_profile=?,state='queued',reason=CASE WHEN state='cancelled' THEN '' ELSE reason END,next_at_ms=CASE WHEN state='cancelled' THEN 0 ELSE next_at_ms END,updated_at_ms=?
  WHERE id=? AND state IN ('queued','cancelled') AND length(request_body)=0`, j.Generation, j.VersionID, j.FilterHash, j.OwnProfile, j.TargetProfile, now.UnixMilli(), existing)
 		}
 		if err != nil {
