@@ -174,7 +174,7 @@ func parseReactionDraft(raw []byte) (reactionDraftInput, Profile, string, error)
 
 func reactionDraftHoldTx(ctx context.Context, tx *sql.Tx, owner, upstream, profile int64) error {
 	var held bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM reaction_message_drafts WHERE owner_id=? AND upstream_id=? AND profile_id=? AND state='hold')", owner, upstream, profile).Scan(&held); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM reaction_message_drafts d WHERE d.owner_id=? AND d.upstream_id=? AND d.profile_id=? AND d.state='hold' AND NOT EXISTS(SELECT 1 FROM reaction_message_hold_resolutions r WHERE r.draft_id=d.id AND r.owner_id=d.owner_id AND r.upstream_id=d.upstream_id AND r.profile_id=d.profile_id))`, owner, upstream, profile).Scan(&held); err != nil {
 		return err
 	}
 	if held {
@@ -330,11 +330,11 @@ func (s *Store) ImportReactionMessageDrafts(ctx context.Context, owner int64, ra
 }
 
 func (s *Store) ReactionMessageDraftStatus(ctx context.Context, owner int64) (map[string]int, error) {
-	result := map[string]int{"approved": 0, "hold": 0}
+	result := map[string]int{"approved": 0, "hold": 0, "resolved_hold": 0}
 	if err := s.initReactionMessages(ctx); err != nil {
 		return nil, err
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT d.state,count(*) FROM reaction_message_drafts d JOIN sessions s ON s.owner_id=d.owner_id AND s.upstream_id=d.upstream_id WHERE d.owner_id=? GROUP BY d.state`, owner)
+	rows, err := s.DB.QueryContext(ctx, `SELECT CASE WHEN d.state='hold' AND EXISTS(SELECT 1 FROM reaction_message_hold_resolutions r WHERE r.draft_id=d.id AND r.owner_id=d.owner_id AND r.upstream_id=d.upstream_id AND r.profile_id=d.profile_id) THEN 'resolved_hold' ELSE d.state END AS status,count(*) FROM reaction_message_drafts d JOIN sessions s ON s.owner_id=d.owner_id AND s.upstream_id=d.upstream_id WHERE d.owner_id=? GROUP BY status`, owner)
 	if err != nil {
 		return nil, err
 	}

@@ -169,7 +169,7 @@ func TestArchiveChangeRowsObserverMissingNullUnknownAndPhotoIdentity(t *testing.
 	reordered[0].SHA, reordered[1].SHA = "b", "a"
 	reordered[2].SHA = "d"
 	photos := strings.Join(archiveChangePhotoRows(oldJobs, reordered), "\n")
-	if photos != "Фотографии: изменён порядок/позиции\nМиниатюры: добавлено 1, убрано 1" {
+	if photos != "📷 Фото и превью: фото (изменён порядок/позиции); превью (добавлено 1, убрано 1)" {
 		t.Fatalf("photo role/order/SHA change lost: %s", photos)
 	}
 }
@@ -463,5 +463,34 @@ func TestArchiveChangePostsBlockedLatestDoesNotStarveOlderReadyTopic(t *testing.
 	}
 	if worked, err := f.service.deliverArchiveChangePost(context.Background()); !worked || err != nil || calls != 1 || archiveChangeState(t, f, ready) != "sent" || archiveChangeState(t, f, blocked) != "pending" {
 		t.Fatal("blocked newest publication starved another ready topic")
+	}
+}
+
+func TestArchiveChangePhotoRowsCombinePhotoAndPreviewWithoutLosingCounts(t *testing.T) {
+	cases := []struct {
+		name          string
+		before, after []MediaJob
+		want          string
+	}{
+		{"same counts", []MediaJob{{Role: "photos", SHA: "old-photo"}, {Role: "miniPhotos", SHA: "old-preview"}}, []MediaJob{{Role: "photos", SHA: "new-photo"}, {Role: "miniPhotos", SHA: "new-preview"}}, "📷 Фото и превью: добавлено 1, убрано 1 (в каждом наборе)"},
+		{"different counts", []MediaJob{{Role: "photos", SHA: "a"}, {Role: "photos", Position: 1, SHA: "b"}, {Role: "miniPhotos", SHA: "preview-a"}}, []MediaJob{{Role: "photos", SHA: "a"}, {Role: "photos", Position: 1, SHA: "c"}, {Role: "photos", Position: 2, SHA: "d"}, {Role: "miniPhotos", SHA: "preview-a"}, {Role: "miniPhotos", Position: 1, SHA: "preview-b"}}, "📷 Фото и превью: фото (добавлено 2, убрано 1); превью (добавлено 1, убрано 0)"},
+		{"photo only", []MediaJob{{Role: "photos", SHA: "old"}, {Role: "miniPhotos", SHA: "same"}}, []MediaJob{{Role: "photos", SHA: "new"}, {Role: "miniPhotos", SHA: "same"}}, "Фотографии: добавлено 1, убрано 1"},
+		{"preview only", []MediaJob{{Role: "photos", SHA: "same"}, {Role: "miniPhotos", SHA: "old"}}, []MediaJob{{Role: "photos", SHA: "same"}, {Role: "miniPhotos", SHA: "new"}}, "Миниатюры: добавлено 1, убрано 1"},
+		{"both reordered", []MediaJob{{Role: "photos", SHA: "a"}, {Role: "photos", Position: 1, SHA: "b"}, {Role: "miniPhotos", SHA: "c"}, {Role: "miniPhotos", Position: 1, SHA: "d"}}, []MediaJob{{Role: "photos", SHA: "b"}, {Role: "photos", Position: 1, SHA: "a"}, {Role: "miniPhotos", SHA: "d"}, {Role: "miniPhotos", Position: 1, SHA: "c"}}, "📷 Фото и превью: изменён порядок/позиции (в каждом наборе)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			beforeRaw, _ := json.Marshal(tc.before)
+			afterRaw, _ := json.Marshal(tc.after)
+			rows := archiveChangePhotoRows(tc.before, tc.after)
+			if len(rows) != 1 || rows[0] != tc.want || strings.Contains(rows[0], "\n") {
+				t.Fatalf("expected one complete media line, got %v", rows)
+			}
+			beforeNow, _ := json.Marshal(tc.before)
+			afterNow, _ := json.Marshal(tc.after)
+			if string(beforeNow) != string(beforeRaw) || string(afterNow) != string(afterRaw) {
+				t.Fatal("summary changed source media inventory")
+			}
+		})
 	}
 }

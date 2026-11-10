@@ -107,6 +107,11 @@ func run() error {
 			return errors.New("usage: jardulik reaction-draft-import < reviewed.json")
 		}
 		return importReactionMessageDrafts(ctx, s, owner, os.Stdin, os.Stdout)
+	case "reaction-hold-resolve":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik reaction-hold-resolve < resolution.json")
+		}
+		return resolveReactionMessageHold(ctx, s, owner, os.Stdin, os.Stdout)
 	case "reaction-draft-status":
 		if len(os.Args) != 2 {
 			return errors.New("usage: jardulik reaction-draft-status")
@@ -259,7 +264,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
 	}
 }
 func main() {

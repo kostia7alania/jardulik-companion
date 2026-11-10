@@ -81,7 +81,7 @@ func (s *Store) initReactionMessages(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='reaction_message_settings'"); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, reactionMessageSchema+reactionMessageDraftTable); err != nil {
+	if _, err = tx.ExecContext(ctx, reactionMessageSchema+reactionMessageDraftTable+reactionMessageHoldResolutionTable); err != nil {
 		return err
 	}
 	for _, column := range []string{"prefer_drafts", "iron_mix"} {

@@ -1203,6 +1203,7 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		{"feed_filters", "filters", `SELECT owner_id,applied_json,include_others FROM feed_filters WHERE applied_json IS NOT NULL OR include_others<>0`},
 		{"autolike_settings", "autolike", "SELECT owner_id,mode,interval_seconds,series_count,daily_cap FROM autolike_settings"},
 		{"reaction_message_settings", "reaction-message-policy", "SELECT owner_id,mode,templates_json,telegram_username,revision FROM reaction_message_settings"},
+		{"reaction_message_hold_resolutions", "reaction-message-hold-resolution", "SELECT draft_id,owner_id,upstream_id,profile_id,evidence_json,evidence_sha FROM reaction_message_hold_resolutions"},
 		{"reaction_message_drafts", "reaction-message-draft", "SELECT owner_id,upstream_id,profile_id,telegram_username,content_hash,basis_hash,state,message,capture_json,capture_sha FROM reaction_message_drafts"},
 		{"reaction_message_intents", "reaction-message-intent", "SELECT action_id,owner_id,upstream_id,profile_id,generation,message,request_body,message_mode,policy_revision,template_index,reserved_cursor FROM reaction_message_intents"},
 		{"profile_contact_evidence", "contact", "SELECT owner_id,upstream_id,profile_id,source_bot_id,source_peer_id,source_locator_kind,source_message_locator,source_message_timestamp,contact_url,profile_url,evidence_kind FROM profile_contact_evidence"},
