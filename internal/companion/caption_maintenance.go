@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const captionDesignRevision = "2026-11-10-profile-links-copy-id-v7"
+const captionDesignRevision = "2026-11-11-profile-copy-button-v8"
 const captionNoticeRevision = "2026-11-10-rating-short-photo-v1"
 const captionMaintenanceSchema = `
 CREATE TABLE IF NOT EXISTS caption_maintenance_jobs (
@@ -415,6 +415,9 @@ func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMainte
 		return "", nil, err
 	}
 	payload := map[string]any{"chat_id": j.chat, "message_id": ids[0]}
+	if j.kind == "archive" {
+		payload["reply_markup"] = legacyProfileCopyMarkup(p.ID)
+	}
 	if len(photos) == 0 {
 		payload["text"] = card.Text
 		payload["entities"] = card.Entities
