@@ -15,6 +15,7 @@ import (
 )
 
 const captionDesignRevision = "2026-11-10-model-bold-clock-v3"
+const captionNoticeRevision = "2026-11-10-rating-short-photo-v1"
 const captionMaintenanceSchema = `
 CREATE TABLE IF NOT EXISTS caption_maintenance_jobs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, revision TEXT NOT NULL, kind TEXT NOT NULL,
@@ -48,6 +49,9 @@ func (s *Service) ScheduleCaptionMaintenance(ctx context.Context) error {
 		return err
 	}
 	if revision == captionDesignRevision {
+		if err = s.scheduleCaptionNoticesTx(ctx, tx); err != nil {
+			return err
+		}
 		return tx.Commit()
 	}
 	if _, err = tx.ExecContext(ctx, "UPDATE caption_maintenance_jobs SET state='superseded',error='newer_design_revision',updated_at=CURRENT_TIMESTAMP WHERE revision<>? AND state IN ('pending','retry')", captionDesignRevision); err != nil {
@@ -93,7 +97,102 @@ func (s *Service) ScheduleCaptionMaintenance(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='caption_design_revision'", captionDesignRevision); err != nil {
 		return err
 	}
+	if err = s.scheduleCaptionNoticesTx(ctx, tx); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+// A scoped pass uses existing v3 jobs; archive/private/presence snapshots stay as-is.
+func (s *Service) scheduleCaptionNoticesTx(ctx context.Context, tx *sql.Tx) error {
+	const key = "caption_notice_revision"
+	if _, err := tx.ExecContext(ctx, "INSERT OR IGNORE INTO meta(key,value) VALUES(?,'')", key); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key=?", key); err != nil {
+		return err
+	}
+	var revision string
+	if err := tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key=?", key).Scan(&revision); err != nil {
+		return err
+	}
+	if revision == captionNoticeRevision {
+		return nil
+	}
+	var targets []captionMaintenanceJob
+	var exists bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='analysis_posts')").Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		rows, err := tx.QueryContext(ctx, `SELECT p.analysis_id,p.owner_id,COALESCE(a.version_id,0),json_array(p.message_id),p.response_sha,p.chat_id,p.thread_id,a.response_body
+ FROM analysis_posts p JOIN profile_analyses a ON a.id=p.analysis_id AND a.owner_id=p.owner_id AND a.upstream_id=p.upstream_id AND a.profile_id=p.profile_id
+ JOIN sessions se ON se.owner_id=a.owner_id AND se.upstream_id=a.upstream_id
+ JOIN mirror_topics t ON t.profile_id=p.profile_id AND t.thread_id=p.thread_id
+ WHERE p.owner_id=? AND p.state='sent' AND p.message_id>0 AND p.chat_id=? AND p.thread_id>0 AND p.thread_id<>? AND `+analysisPostSuccessSQL("a"), s.Config.OwnerID, s.Config.BackupChatID, s.Config.BackupThreadID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var j captionMaintenanceJob
+			var raw []byte
+			if err = rows.Scan(&j.receipt, &j.owner, &j.version, &j.inventory, &j.source, &j.chat, &j.thread, &raw); err != nil {
+				rows.Close()
+				return err
+			}
+			if digest(raw) == j.source {
+				j.kind = "analysis"
+				targets = append(targets, j)
+			}
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+	}
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='archive_change_posts')").Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		rows, err := tx.QueryContext(ctx, `SELECT n.version_id,n.owner_id,json_array(n.message_id),n.thread_id
+ FROM archive_change_posts n JOIN versions v ON v.id=n.version_id AND v.owner_id=n.owner_id AND v.profile_id=n.profile_id
+ JOIN versions old ON old.id=n.old_version_id AND old.owner_id=n.owner_id AND old.profile_id=n.profile_id
+ JOIN mirror_topics t ON t.profile_id=n.profile_id AND t.thread_id=n.thread_id
+ JOIN archive_versions av ON av.version_id=n.version_id AND av.owner_id=n.owner_id AND av.profile_id=n.profile_id AND av.thread_id=n.thread_id
+ JOIN archive_receipts r ON r.source_sha=av.source_sha AND r.kind='profile_version' AND r.chat_id=? AND r.thread_id=n.thread_id AND r.message_id>0 AND r.file_id<>''
+ WHERE n.owner_id=? AND n.state='sent' AND n.message_id>0 AND n.thread_id>0 AND n.thread_id<>?`, s.Config.BackupChatID, s.Config.OwnerID, s.Config.BackupThreadID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var j captionMaintenanceJob
+			if err = rows.Scan(&j.receipt, &j.owner, &j.inventory, &j.thread); err != nil {
+				rows.Close()
+				return err
+			}
+			j.version = j.receipt
+			j.kind = "change"
+			j.chat = s.Config.BackupChatID
+			targets = append(targets, j)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+	}
+	for _, j := range targets {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO caption_maintenance_jobs(revision,kind,receipt_id,owner_id,version_id,inventory,source_sha,chat_id,thread_id)
+ VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(revision,kind,receipt_id) DO UPDATE SET state='pending',attempts=0,next_attempt=0,error='',updated_at=CURRENT_TIMESTAMP
+ WHERE caption_maintenance_jobs.owner_id=excluded.owner_id AND caption_maintenance_jobs.version_id=excluded.version_id
+ AND caption_maintenance_jobs.inventory=excluded.inventory AND caption_maintenance_jobs.source_sha=excluded.source_sha
+ AND caption_maintenance_jobs.chat_id=excluded.chat_id AND caption_maintenance_jobs.thread_id=excluded.thread_id`, captionDesignRevision, j.kind, j.receipt, j.owner, j.version, j.inventory, j.source, j.chat, j.thread); err != nil {
+			return err
+		}
+	}
+	_, err := tx.ExecContext(ctx, "UPDATE meta SET value=? WHERE key=?", captionNoticeRevision, key)
+	return err
 }
 
 type captionMaintenanceWorker struct {

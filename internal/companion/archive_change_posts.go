@@ -206,29 +206,34 @@ func archiveChangePhotoRows(before, after []MediaJob) []string {
 		if added != 0 || removed != 0 {
 			summary = fmt.Sprintf("добавлено %d, убрано %d", added, removed)
 		}
-		switch role {
-		case "photos":
-			photoChange = summary
-		case "miniPhotos":
-			previewChange = summary
-		default:
+		if role != "photos" && role != "miniPhotos" {
 			lines = append(lines, "Файлы "+role+": "+summary)
+			continue
+		}
+		var parts []string
+		if added > 0 {
+			parts = append(parts, fmt.Sprintf("добавлено: %d", added))
+		}
+		if removed > 0 {
+			parts = append(parts, fmt.Sprintf("убрано: %d", removed))
+		}
+		summary = strings.Join(parts, ", ")
+		if summary == "" {
+			summary = "изменён порядок"
+		}
+		if role == "photos" {
+			photoChange = summary
+		} else {
+			previewChange = summary
 		}
 	}
-	var media []string
-	switch {
-	case photoChange != "" && previewChange != "":
-		summary := photoChange + " (в каждом наборе)"
-		if photoChange != previewChange {
-			summary = "фото (" + photoChange + "); превью (" + previewChange + ")"
-		}
-		media = append(media, "📷 Фото и превью: "+summary)
-	case photoChange != "":
-		media = append(media, "Фотографии: "+photoChange)
-	case previewChange != "":
-		media = append(media, "Миниатюры: "+previewChange)
+	if photoChange == "" {
+		photoChange = previewChange
 	}
-	return append(media, lines...)
+	if photoChange != "" {
+		lines = append([]string{"фото: " + photoChange}, lines...)
+	}
+	return lines
 }
 
 func archiveProfileChangeRows(before, after Profile, oldPhotos, newPhotos []MediaJob) []string {

@@ -169,7 +169,7 @@ func TestArchiveChangeRowsObserverMissingNullUnknownAndPhotoIdentity(t *testing.
 	reordered[0].SHA, reordered[1].SHA = "b", "a"
 	reordered[2].SHA = "d"
 	photos := strings.Join(archiveChangePhotoRows(oldJobs, reordered), "\n")
-	if photos != "📷 Фото и превью: фото (изменён порядок/позиции); превью (добавлено 1, убрано 1)" {
+	if photos != "фото: изменён порядок" {
 		t.Fatalf("photo role/order/SHA change lost: %s", photos)
 	}
 }
@@ -466,17 +466,20 @@ func TestArchiveChangePostsBlockedLatestDoesNotStarveOlderReadyTopic(t *testing.
 	}
 }
 
-func TestArchiveChangePhotoRowsCombinePhotoAndPreviewWithoutLosingCounts(t *testing.T) {
+func TestArchiveChangePhotoRowsUseCompactLogicalPhotoSummary(t *testing.T) {
 	cases := []struct {
 		name          string
 		before, after []MediaJob
 		want          string
 	}{
-		{"same counts", []MediaJob{{Role: "photos", SHA: "old-photo"}, {Role: "miniPhotos", SHA: "old-preview"}}, []MediaJob{{Role: "photos", SHA: "new-photo"}, {Role: "miniPhotos", SHA: "new-preview"}}, "📷 Фото и превью: добавлено 1, убрано 1 (в каждом наборе)"},
-		{"different counts", []MediaJob{{Role: "photos", SHA: "a"}, {Role: "photos", Position: 1, SHA: "b"}, {Role: "miniPhotos", SHA: "preview-a"}}, []MediaJob{{Role: "photos", SHA: "a"}, {Role: "photos", Position: 1, SHA: "c"}, {Role: "photos", Position: 2, SHA: "d"}, {Role: "miniPhotos", SHA: "preview-a"}, {Role: "miniPhotos", Position: 1, SHA: "preview-b"}}, "📷 Фото и превью: фото (добавлено 2, убрано 1); превью (добавлено 1, убрано 0)"},
-		{"photo only", []MediaJob{{Role: "photos", SHA: "old"}, {Role: "miniPhotos", SHA: "same"}}, []MediaJob{{Role: "photos", SHA: "new"}, {Role: "miniPhotos", SHA: "same"}}, "Фотографии: добавлено 1, убрано 1"},
-		{"preview only", []MediaJob{{Role: "photos", SHA: "same"}, {Role: "miniPhotos", SHA: "old"}}, []MediaJob{{Role: "photos", SHA: "same"}, {Role: "miniPhotos", SHA: "new"}}, "Миниатюры: добавлено 1, убрано 1"},
-		{"both reordered", []MediaJob{{Role: "photos", SHA: "a"}, {Role: "photos", Position: 1, SHA: "b"}, {Role: "miniPhotos", SHA: "c"}, {Role: "miniPhotos", Position: 1, SHA: "d"}}, []MediaJob{{Role: "photos", SHA: "b"}, {Role: "photos", Position: 1, SHA: "a"}, {Role: "miniPhotos", SHA: "d"}, {Role: "miniPhotos", Position: 1, SHA: "c"}}, "📷 Фото и превью: изменён порядок/позиции (в каждом наборе)"},
+		{"added without zero removal", nil, []MediaJob{{Role: "photos", SHA: "new"}, {Role: "miniPhotos", SHA: "new-preview"}}, "фото: добавлено: 1"},
+		{"removed without zero addition", []MediaJob{{Role: "photos", SHA: "old"}, {Role: "miniPhotos", SHA: "old-preview"}}, nil, "фото: убрано: 1"},
+		{"preview-only addition", []MediaJob{{Role: "photos", SHA: "same"}}, []MediaJob{{Role: "photos", SHA: "same"}, {Role: "miniPhotos", SHA: "preview"}}, "фото: добавлено: 1"},
+		{"same counts", []MediaJob{{Role: "photos", SHA: "old-photo"}, {Role: "miniPhotos", SHA: "old-preview"}}, []MediaJob{{Role: "photos", SHA: "new-photo"}, {Role: "miniPhotos", SHA: "new-preview"}}, "фото: добавлено: 1, убрано: 1"},
+		{"different counts", []MediaJob{{Role: "photos", SHA: "a"}, {Role: "photos", Position: 1, SHA: "b"}, {Role: "miniPhotos", SHA: "preview-a"}}, []MediaJob{{Role: "photos", SHA: "a"}, {Role: "photos", Position: 1, SHA: "c"}, {Role: "photos", Position: 2, SHA: "d"}, {Role: "miniPhotos", SHA: "preview-a"}, {Role: "miniPhotos", Position: 1, SHA: "preview-b"}}, "фото: добавлено: 2, убрано: 1"},
+		{"photo only", []MediaJob{{Role: "photos", SHA: "old"}, {Role: "miniPhotos", SHA: "same"}}, []MediaJob{{Role: "photos", SHA: "new"}, {Role: "miniPhotos", SHA: "same"}}, "фото: добавлено: 1, убрано: 1"},
+		{"preview only", []MediaJob{{Role: "photos", SHA: "same"}, {Role: "miniPhotos", SHA: "old"}}, []MediaJob{{Role: "photos", SHA: "same"}, {Role: "miniPhotos", SHA: "new"}}, "фото: добавлено: 1, убрано: 1"},
+		{"both reordered", []MediaJob{{Role: "photos", SHA: "a"}, {Role: "photos", Position: 1, SHA: "b"}, {Role: "miniPhotos", SHA: "c"}, {Role: "miniPhotos", Position: 1, SHA: "d"}}, []MediaJob{{Role: "photos", SHA: "b"}, {Role: "photos", Position: 1, SHA: "a"}, {Role: "miniPhotos", SHA: "d"}, {Role: "miniPhotos", Position: 1, SHA: "c"}}, "фото: изменён порядок"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

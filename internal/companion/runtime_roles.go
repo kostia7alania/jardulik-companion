@@ -91,6 +91,7 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		if !s.Config.ArchivePaused {
 			start(s.Archiver.Run)
 			start(s.RunCaptionMaintenance)
+			start(s.RunProfileIndexes)
 		}
 		start(s.Watcher.RunPresence)
 		start(s.RunAnalysisPosts)

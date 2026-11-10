@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const analysisPostsSchema = `CREATE TABLE IF NOT EXISTS analysis_posts (
@@ -68,24 +70,148 @@ type analysisPostPayload struct {
 	Keyboard any             `json:"reply_markup,omitempty"`
 }
 
-var analysisPostRatingPattern = regexp.MustCompile(`(?i)оценка[\s*_]+совместимости[\s*_]*(?:[:—–][\s*_]*|-[\s*_]+)?([0-9]{1,3})[\s*_]*%`)
+var analysisPostRatingPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)(?:оценка[\s*_]+совместимости[\s*_]*(?::[\s*_]*|[—–-][\s*_]+)?|совместимость[\s*_]*(?::[\s*_]*|[—–-][\s*_]+))([0-9]{1,3})[\s*_]*%`),
+	regexp.MustCompile(`(?i)совместимость[\s*_]+можно[\s*_]+оценить[\s*_]+в[\s*_]+([0-9]{1,3})[\s*_]*%`),
+	regexp.MustCompile(`(?i)(?:я[\s*_]+)?оцениваю[\s*_]+вашу[\s*_]+совместимость[\s*_]+на[\s*_]+([0-9]{1,3})[\s*_]*%`),
+}
+var analysisPostRatingRange = regexp.MustCompile(`(?i)^[\s*_]*(?:[-–—/±…]|\.{2,}|(?:до|или|и)[\s*_]+)[\s*_]*[0-9]`)
+
+func analysisPostRatingWords(text string) []string {
+	return strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+}
+
+var analysisPostRatingListPrefix = regexp.MustCompile(`^(?:[0-9]+[.)][\s*_]*|[-+*][\t ]+)`)
+
+func analysisPostOverallHeading(content string, before int) bool {
+	previous := content[:before]
+	for previous != "" {
+		previous = strings.TrimRight(previous, " \t\r\n")
+		start := strings.LastIndex(previous, "\n") + 1
+		line := strings.TrimSpace(previous[start:])
+		previous = previous[:start]
+		markdown := strings.HasPrefix(line, "#")
+		if markdown {
+			line = strings.TrimSpace(strings.TrimLeft(line, "#"))
+		}
+		numbered := analysisPostRatingListPrefix.MatchString(line)
+		line = analysisPostRatingListPrefix.ReplaceAllString(line, "")
+		heading := markdown || numbered || strings.HasSuffix(line, ":")
+		for _, marker := range []string{"**", "__"} {
+			if strings.HasPrefix(line, marker) {
+				if close := strings.Index(line[2:], marker); close >= 0 {
+					line = line[2 : close+2]
+					heading = true
+				}
+				break
+			}
+		}
+		words := analysisPostRatingWords(line)
+		for len(words) > 0 {
+			if _, err := strconv.Atoi(words[0]); err != nil {
+				break
+			}
+			words = words[1:]
+		}
+		switch strings.Join(words, " ") {
+		case "итог", "итоговая оценка", "итоговая совместимость", "общая оценка", "общая совместимость", "общая оценка совместимости", "итоговая оценка совместимости", "оценка совместимости", "в целом":
+			return true
+		default:
+			if heading {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// Explicit overall forms are accepted only in an overall sentence/heading.
+// A category heading or a negated/ranged statement must not become a display score.
+func analysisPostRatingContext(content string, start, end int) (eligible, denied bool) {
+	if start > 0 {
+		before, _ := utf8.DecodeLastRuneInString(content[:start])
+		if unicode.IsLetter(before) || unicode.IsDigit(before) {
+			return false, false
+		}
+	}
+	lineStart := strings.LastIndex(content[:start], "\n") + 1
+	prefixStart := lineStart
+	if boundary := strings.LastIndexAny(content[lineStart:start], ".!?;"); boundary >= 0 {
+		prefixStart = lineStart + boundary + 1
+	}
+	prefix := analysisPostRatingWords(content[prefixStart:start])
+	overall := false
+	for _, word := range prefix {
+		switch word {
+		case "не", "нет", "нельзя", "отрицаю":
+			return false, true
+		case "итог", "итоговая", "итоговую", "общая", "общую", "суммарная":
+			overall = true
+		}
+	}
+	for _, word := range prefix {
+		if _, err := strconv.Atoi(word); err == nil {
+			continue
+		}
+		switch word {
+		case "итог", "итоговая", "итоговую", "общая", "общую", "суммарная", "ваша", "вашу", "наша", "оценка", "в", "целом", "я":
+		default:
+			return false, false
+		}
+	}
+	for i := 1; i < len(prefix); i++ {
+		if prefix[i-1] == "в" && prefix[i] == "целом" {
+			overall = true
+		}
+	}
+	// Include a heading before a sentence separator on the current line.
+	if !overall && !analysisPostOverallHeading(content, start) {
+		return false, false
+	}
+	suffix := content[end:]
+	if analysisPostRatingRange.MatchString(suffix) {
+		return false, true
+	}
+	if boundary := strings.IndexAny(suffix, ".!?;\n"); boundary >= 0 {
+		suffix = suffix[:boundary]
+	}
+	words := analysisPostRatingWords(suffix)
+	for _, word := range words[:min(3, len(words))] {
+		if word == "не" || word == "нет" || word == "нельзя" {
+			return false, true
+		}
+	}
+	// A qualifier after the percentage ("по ...") describes a partial dimension.
+	if len(words) > 0 && words[0] == "по" {
+		return false, false
+	}
+	return true, false
+}
 
 // This is a display quote from the provider, not a normalized compatibility score.
 func analysisPostRating(content string) (int, bool) {
-	matches := analysisPostRatingPattern.FindAllStringSubmatch(content, -1)
-	if len(matches) == 0 {
-		return 0, false
-	}
 	value := -1
-	for _, match := range matches {
-		n, err := strconv.Atoi(match[1])
-		if err != nil || n > 100 {
-			return 0, false
+	for _, pattern := range analysisPostRatingPatterns {
+		for _, match := range pattern.FindAllStringSubmatchIndex(content, -1) {
+			eligible, denied := analysisPostRatingContext(content, match[0], match[1])
+			if denied {
+				return 0, false
+			}
+			if !eligible {
+				continue
+			}
+			n, err := strconv.Atoi(content[match[2]:match[3]])
+			if err != nil || n > 100 {
+				return 0, false
+			}
+			if value >= 0 && value != n {
+				return 0, false
+			}
+			value = n
 		}
-		if value >= 0 && value != n {
-			return 0, false
-		}
-		value = n
+	}
+	if value < 0 {
+		return 0, false
 	}
 	return value, true
 }

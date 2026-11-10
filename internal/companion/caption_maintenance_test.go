@@ -332,3 +332,144 @@ func TestCaptionMaintenanceInvalidRichMarkerNeverFallsBackToAlbum(t *testing.T) 
 		})
 	}
 }
+
+func noticeScopeMarkExistingDesign(t *testing.T, s *Service) {
+	t.Helper()
+	if _, err := s.Store.DB.Exec(captionMaintenanceSchema); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.SetMeta(context.Background(), "caption_design_revision", captionDesignRevision); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCaptionNoticeScopeEnrollsLateSentChangeWithoutResettingOtherKinds(t *testing.T) {
+	s, j := threadChangeMaintenanceFixture(t)
+	ctx := context.Background()
+	noticeScopeMarkExistingDesign(t, s)
+	if _, err := s.Store.DB.Exec("UPDATE archive_change_posts SET message_id=3034 WHERE version_id=?", j.receipt); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"archive", "private", "presence"} {
+		if _, err := s.Store.DB.Exec(`INSERT INTO caption_maintenance_jobs(revision,kind,receipt_id,owner_id,version_id,inventory,chat_id,thread_id,state,attempts,next_attempt,error)
+ VALUES(?,?,77,123,?,'[42]',?,55,'done',4,12345,'preserve')`, captionDesignRevision, kind, j.version, s.Config.BackupChatID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := map[string]string{}
+	for _, kind := range []string{"archive", "private", "presence"} {
+		before[kind] = threadNoticeRowHash(t, s.Store, "SELECT * FROM caption_maintenance_jobs WHERE kind=?", kind)
+	}
+	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var state, inventory string
+	if err := s.Store.DB.QueryRow("SELECT state,inventory FROM caption_maintenance_jobs WHERE revision=? AND kind='change' AND receipt_id=?", captionDesignRevision, j.receipt).Scan(&state, &inventory); err != nil || state != "pending" || inventory != "[3034]" {
+		t.Fatalf("late confirmed notice missed: %s %s %v", state, inventory, err)
+	}
+	for kind, hash := range before {
+		if hash != threadNoticeRowHash(t, s.Store, "SELECT * FROM caption_maintenance_jobs WHERE kind=?", kind) {
+			t.Fatalf("scoped pass changed %s", kind)
+		}
+	}
+	if s.Store.Meta(ctx, "caption_design_revision") != captionDesignRevision || s.Store.Meta(ctx, "caption_notice_revision") != captionNoticeRevision {
+		t.Fatal("scoped pass changed global revision or failed its own marker")
+	}
+	if _, err := s.Store.DB.Exec("UPDATE caption_maintenance_jobs SET state='done',attempts=3,next_attempt=54321,error='done-marker' WHERE kind='change'"); err != nil {
+		t.Fatal(err)
+	}
+	after := threadNoticeRowHash(t, s.Store, "SELECT * FROM caption_maintenance_jobs WHERE kind='change'")
+	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if after != threadNoticeRowHash(t, s.Store, "SELECT * FROM caption_maintenance_jobs WHERE kind='change'") || watchCount(t, s.Store, "caption_maintenance_jobs") != 4 {
+		t.Fatal("repeated scoped schedule requeued or duplicated completed notice")
+	}
+}
+
+func captionNoticeAnalysisReceipt(t *testing.T) (*analysisPostFixture, int64) {
+	t.Helper()
+	f := newAnalysisPostFixture(t, "1. Тема\nОценка совместимости 75%.")
+	f.ready(t)
+	s := f.service
+	if err := s.seedAnalysisPosts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.DB.Exec("UPDATE analysis_posts SET state='sent',chat_id=?,thread_id=55,message_id=700,response_sha=? WHERE analysis_id=?", s.Config.BackupChatID, digest(f.analysis.ResponseBody), f.analysis.ID); err != nil {
+		t.Fatal(err)
+	}
+	noticeScopeMarkExistingDesign(t, s)
+	result, err := s.Store.DB.Exec(`INSERT INTO caption_maintenance_jobs(revision,kind,receipt_id,owner_id,version_id,inventory,source_sha,chat_id,thread_id,state,attempts,next_attempt,error)
+ VALUES(?,'analysis',?,?,?,'[700]',?,?,55,'done',5,99999,'old-design')`, captionDesignRevision, f.analysis.ID, s.Config.OwnerID, f.analysis.VersionID, digest(f.analysis.ResponseBody), s.Config.BackupChatID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, id
+}
+
+func TestCaptionNoticeScopeRequeuesDoneAnalysisExactlyOnce(t *testing.T) {
+	f, id := captionNoticeAnalysisReceipt(t)
+	s := f.service
+	ctx := context.Background()
+	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var state, source string
+	var attempts, next int64
+	if err := s.Store.DB.QueryRow("SELECT state,attempts,next_attempt,source_sha FROM caption_maintenance_jobs WHERE id=?", id).Scan(&state, &attempts, &next, &source); err != nil || state != "pending" || attempts != 0 || next != 0 || source != digest(f.analysis.ResponseBody) {
+		t.Fatal("done GPT receipt was not requeued with unchanged source", err)
+	}
+	if f.calls != 0 {
+		t.Fatal("scheduling sent or edited a message")
+	}
+	if _, err := s.Store.DB.Exec("UPDATE caption_maintenance_jobs SET state='done',attempts=2,error='' WHERE id=?", id); err != nil {
+		t.Fatal(err)
+	}
+	after := threadNoticeRowHash(t, s.Store, "SELECT * FROM caption_maintenance_jobs WHERE id=?", id)
+	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if after != threadNoticeRowHash(t, s.Store, "SELECT * FROM caption_maintenance_jobs WHERE id=?", id) {
+		t.Fatal("scoped marker did not protect completed GPT job")
+	}
+}
+
+func TestCaptionNoticeScopeDoesNotCrossOwnerOrCurrentSource(t *testing.T) {
+	for _, bad := range []string{"job_owner", "job_source", "post_source", "response_body", "session", "live_owner"} {
+		t.Run(bad, func(t *testing.T) {
+			f, id := captionNoticeAnalysisReceipt(t)
+			s := f.service
+			var err error
+			switch bad {
+			case "job_owner":
+				_, err = s.Store.DB.Exec("UPDATE caption_maintenance_jobs SET owner_id=456 WHERE id=?", id)
+			case "job_source":
+				_, err = s.Store.DB.Exec("UPDATE caption_maintenance_jobs SET source_sha='different-source' WHERE id=?", id)
+			case "post_source":
+				_, err = s.Store.DB.Exec("UPDATE analysis_posts SET response_sha='different-source' WHERE analysis_id=?", f.analysis.ID)
+			case "response_body":
+				_, err = s.Store.DB.Exec("UPDATE profile_analyses SET response_body=? WHERE id=?", []byte(`{"content":"other confirmed object"}`), f.analysis.ID)
+			case "session":
+				_, err = s.Store.DB.Exec("UPDATE sessions SET upstream_id=upstream_id+1 WHERE owner_id=?", s.Config.OwnerID)
+			case "live_owner":
+				if err = s.Store.User(context.Background(), 456, "test"); err == nil {
+					_, err = s.Store.DB.Exec("UPDATE analysis_posts SET owner_id=456 WHERE analysis_id=?", f.analysis.ID)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := threadNoticeRowHash(t, s.Store, "SELECT * FROM caption_maintenance_jobs WHERE id=?", id)
+			if err = s.ScheduleCaptionMaintenance(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if before != threadNoticeRowHash(t, s.Store, "SELECT * FROM caption_maintenance_jobs WHERE id=?", id) || watchCount(t, s.Store, "caption_maintenance_jobs") != 1 || f.calls != 0 {
+				t.Fatal("scoped schedule retargeted stale or other-owner source")
+			}
+		})
+	}
+}
