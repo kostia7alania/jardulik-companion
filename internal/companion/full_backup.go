@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const fullBundleFormat = "jardulik-companion-full/v2"
@@ -24,6 +25,47 @@ const personBundleFormat = "jardulik-companion-person/v2"
 const fullBundleLimit int64 = 1 << 30
 const fullBundleRestoreLimit int64 = 2 << 30
 const fullBundleEntries = 100000
+
+var errFullBackupDisk = errors.New("insufficient disk space for full backup while preserving the configured reserve")
+var errFullBackupMedia = errors.New("source media hash or size mismatch")
+
+// The nested ZIP and encrypted output share a filesystem and can grow concurrently.
+type fullBackupDisk struct {
+	path    string
+	reserve uint64
+	mu      sync.Mutex
+}
+
+func (d *fullBackupDisk) check(needed uint64) error {
+	free, err := FreeBytes(d.path)
+	if err != nil {
+		return err
+	}
+	if free < d.reserve || free-d.reserve < needed {
+		return errFullBackupDisk
+	}
+	return nil
+}
+
+type fullBackupDiskWriter struct {
+	disk    *fullBackupDisk
+	file    *os.File
+	written int64
+}
+
+func (w *fullBackupDiskWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > fullBundleLimit-w.written {
+		return 0, errArchiveBudget
+	}
+	w.disk.mu.Lock()
+	defer w.disk.mu.Unlock()
+	if err := w.disk.check(uint64(len(p))); err != nil {
+		return 0, err
+	}
+	n, err := w.file.Write(p)
+	w.written += int64(n)
+	return n, err
+}
 
 // FullBackupArtifact is built locally. This path has no Telegram sender and does
 // not enable scheduled full backups; transport approval is a separate step.
@@ -313,6 +355,18 @@ func (a *Archiver) buildFullBackupLocked(ctx context.Context, ifChanged bool) (r
 	if err = os.MkdirAll(dir, 0700); err != nil {
 		return result, err
 	}
+	disk := &fullBackupDisk{path: dir, reserve: a.Config.MinFreeBytes}
+	var pages, pageSize uint64
+	if err = a.Store.DB.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pages); err != nil {
+		return result, err
+	}
+	if err = a.Store.DB.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return result, err
+	}
+	// VACUUM INTO can use scratch space as well as the compacted snapshot.
+	if err = disk.check(pages * pageSize * 2); err != nil {
+		return result, err
+	}
 	work, err := os.MkdirTemp(dir, ".full-build-")
 	if err != nil {
 		return result, err
@@ -352,17 +406,46 @@ func (a *Archiver) buildFullBackupLocked(ctx context.Context, ifChanged bool) (r
 		reusable.Reused = true
 		return reusable, nil
 	}
-	path, manifest, err := a.fullZIPFromSnapshot(ctx, db, snapshotPath, work, result.SourceFingerprint)
+	out, err := os.CreateTemp(work, "artifact-*")
 	if err != nil {
 		return result, err
 	}
-	defer os.Remove(path)
-	result.SourceSHA, _, err = fileDigest(path)
-	if err != nil {
+	defer out.Close()
+	stageName := out.Name()
+	timestamp := a.now().UTC().Format("20060102T150405Z")
+	encrypted := &fullBackupDiskWriter{disk: disk, file: out}
+	sourceHash := sha256.New()
+	encryptedHash := sha256.New()
+	reader, writer := io.Pipe()
+	var manifest fullManifest
+	done := make(chan error, 1)
+	go func() {
+		var zipErr error
+		manifest, zipErr = a.fullZIPFromSnapshot(ctx, db, snapshotPath, work, result.SourceFingerprint, io.MultiWriter(writer, sourceHash), disk)
+		writer.CloseWithError(zipErr)
+		done <- zipErr
+	}()
+	sealErr := sealFullBackup(io.MultiWriter(encrypted, encryptedHash), reader, a.Config.BackupKey)
+	reader.CloseWithError(sealErr)
+	zipErr := <-done
+	if sealErr != nil {
+		return result, sealErr
+	}
+	if zipErr != nil {
+		return result, zipErr
+	}
+	if err = out.Sync(); err != nil {
 		return result, err
 	}
-	result.Path = path + ".enc"
-	if err = sealFullBackupFile(path, result.Path, a.Config.BackupKey); err != nil {
+	if err = out.Close(); err != nil {
+		return result, err
+	}
+	if err = ctx.Err(); err != nil {
+		return result, err
+	}
+	name := fmt.Sprintf("%s__jardulik-full__%d-profiles-%s.zip.enc", timestamp, len(manifest.People), strings.TrimPrefix(filepath.Base(stageName), "artifact-"))
+	result.Path = filepath.Join(dir, name)
+	if err = os.Link(stageName, result.Path); err != nil {
 		return result, err
 	}
 	keep := false
@@ -371,13 +454,17 @@ func (a *Archiver) buildFullBackupLocked(ctx context.Context, ifChanged bool) (r
 			os.Remove(result.Path)
 		}
 	}()
-	result.EncryptedSHA, result.ByteSize, err = fileDigest(result.Path)
+	destination, err := os.Open(dir)
 	if err != nil {
 		return result, err
 	}
-	if result.ByteSize > fullBundleLimit {
-		return result, errArchiveBudget
+	defer destination.Close()
+	if err = destination.Sync(); err != nil {
+		return result, err
 	}
+	result.SourceSHA = hex.EncodeToString(sourceHash.Sum(nil))
+	result.EncryptedSHA = hex.EncodeToString(encryptedHash.Sum(nil))
+	result.ByteSize = encrypted.written
 	result.Profiles = len(manifest.People)
 	result.MediaFiles = len(manifest.Media)
 	for _, p := range manifest.People {
@@ -399,11 +486,23 @@ func (a *Archiver) buildFullBackupLocked(ctx context.Context, ifChanged bool) (r
 	return result, nil
 }
 
-func (a *Archiver) fullZIPFromSnapshot(ctx context.Context, db *sql.DB, snapshotPath, work, fingerprint string) (path string, manifest fullManifest, err error) {
+func fullBackupMediaEstimate(ctx context.Context, db *sql.DB) (total, largestPerson int64, err error) {
+	err = db.QueryRowContext(ctx, `WITH embedded AS (
+ SELECT DISTINCT v.profile_id,j.sha,m.size FROM media_jobs j JOIN versions v ON v.id=j.version_id JOIN media m ON m.sha=j.sha WHERE j.state='complete'
+), profile_sizes AS (
+ SELECT SUM(size) AS bytes FROM embedded GROUP BY profile_id
+), standalone AS (
+ SELECT COALESCE(SUM(m.size),0) AS bytes FROM media m WHERE m.sha NOT IN (SELECT sha FROM embedded)
+)
+SELECT COALESCE(SUM(bytes),0)+(SELECT bytes FROM standalone),COALESCE(MAX(bytes),0) FROM profile_sizes`).Scan(&total, &largestPerson)
+	return total, largestPerson, err
+}
+
+func (a *Archiver) fullZIPFromSnapshot(ctx context.Context, db *sql.DB, snapshotPath, work, fingerprint string, dst io.Writer, disk *fullBackupDisk) (manifest fullManifest, err error) {
 	manifest = fullManifest{Format: fullBundleFormat, CapturedAt: nowStamp(), AppVersion: Version, SourceFingerprint: fingerprint, Coverage: map[string]any{"telegram_server_bytes_verified": false, "media_embedded": true}}
 	manifest.Media, err = fullSnapshotMedia(ctx, db)
 	if err != nil {
-		return "", manifest, err
+		return manifest, err
 	}
 	var mediaBytes int64
 	inventory := make(map[string]fullMedia, len(manifest.Media))
@@ -411,61 +510,47 @@ func (a *Archiver) fullZIPFromSnapshot(ctx context.Context, db *sql.DB, snapshot
 		inventory[m.SHA] = m
 		mediaBytes += m.Size
 	}
-	var estimate int64
-	err = db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size),0) FROM (SELECT DISTINCT v.profile_id,j.sha,m.size FROM media_jobs j JOIN versions v ON v.id=j.version_id JOIN media m ON m.sha=j.sha WHERE j.state='complete')`).Scan(&estimate)
+	estimate, largestPersonMedia, err := fullBackupMediaEstimate(ctx, db)
 	if err != nil {
-		return "", manifest, err
+		return manifest, err
 	}
 	info, err := os.Stat(snapshotPath)
 	if err != nil {
-		return "", manifest, err
+		return manifest, err
 	}
-	estimate += mediaBytes + info.Size() + serviceManifestLimit
+	estimate += info.Size() + serviceManifestLimit
 	if estimate > fullBundleLimit {
-		return "", manifest, errArchiveBudget
+		return manifest, errArchiveBudget
 	}
-	free, err := FreeBytes(a.Config.DataDir)
-	if err != nil {
-		return "", manifest, err
-	}
-	if free < a.Config.MinFreeBytes+uint64(estimate)*3 {
-		return "", manifest, errors.New("insufficient reserved disk for whole full backup")
+	// The stream writes one encrypted archive and at most one nested profile ZIP.
+	// Include room for profile metadata, the terminal records, and ZIP overhead.
+	needed := estimate + largestPersonMedia + info.Size() + 2*serviceManifestLimit + (1 << 20)
+	if err = disk.check(uint64(needed)); err != nil {
+		return manifest, err
 	}
 	rows, err := db.QueryContext(ctx, "SELECT DISTINCT profile_id FROM versions ORDER BY profile_id")
 	if err != nil {
-		return "", manifest, err
+		return manifest, err
 	}
 	var ids []int64
 	for rows.Next() {
 		var id int64
 		if err = rows.Scan(&id); err != nil {
 			rows.Close()
-			return "", manifest, err
+			return manifest, err
 		}
 		if id <= 0 || len(ids) >= fullBundleEntries {
 			rows.Close()
-			return "", manifest, errArchiveBudget
+			return manifest, errArchiveBudget
 		}
 		ids = append(ids, id)
 	}
 	err = rows.Err()
 	rows.Close()
 	if err != nil {
-		return "", manifest, err
+		return manifest, err
 	}
-	f, err := os.CreateTemp(filepath.Join(a.Config.DataDir, "backups"), a.now().UTC().Format("20060102T150405Z")+fmt.Sprintf("__jardulik-full__%d-profiles-*.zip", len(ids)))
-	if err != nil {
-		return "", manifest, err
-	}
-	path = f.Name()
-	success := false
-	defer func() {
-		f.Close()
-		if !success {
-			os.Remove(path)
-		}
-	}()
-	z := zip.NewWriter(f)
+	z := zip.NewWriter(dst)
 	add := func(e archiveFile, eerr error) error {
 		if eerr == nil {
 			manifest.Files = append(manifest.Files, e)
@@ -473,48 +558,51 @@ func (a *Archiver) fullZIPFromSnapshot(ctx context.Context, db *sql.DB, snapshot
 		return eerr
 	}
 	if err = add(addZipFile(z, "jardulik.sqlite", snapshotPath)); err != nil {
-		return path, manifest, err
+		return manifest, err
 	}
 	recovery := a.fullRecoveryConfig()
 	b, err := json.MarshalIndent(recovery, "", "  ")
 	if err != nil {
-		return path, manifest, err
+		return manifest, err
 	}
 	if err = add(addZipBytes(z, "recovery-config.json", b)); err != nil {
-		return path, manifest, err
+		return manifest, err
 	}
 	if sessionInfo, statErr := os.Lstat(a.Config.transferSessionPath()); statErr == nil {
 		if !sessionInfo.Mode().IsRegular() || sessionInfo.Size() > 1<<20 {
-			return path, manifest, errors.New("invalid encrypted transfer session")
+			return manifest, errors.New("invalid encrypted transfer session")
 		}
 		if err = add(addZipFile(z, "telegram-bot-session.enc", a.Config.transferSessionPath())); err != nil {
-			return path, manifest, err
+			return manifest, err
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return path, manifest, errors.New("encrypted transfer session unavailable")
+		return manifest, errors.New("encrypted transfer session unavailable")
 	}
 	embedded := map[string]bool{}
 	var index strings.Builder
 	index.WriteString("Jardulik | один ZIP на анкету | все сохранённые версии и исходные фото\n")
 	for _, id := range ids {
 		if err = ctx.Err(); err != nil {
-			return path, manifest, err
+			return manifest, err
 		}
-		personPath, person, line, e := a.personZIPFromSnapshot(ctx, db, id, work, inventory, embedded)
+		personPath, person, line, e := a.personZIPFromSnapshot(ctx, db, id, work, inventory, embedded, disk)
 		if e != nil {
-			return path, manifest, e
+			return manifest, e
 		}
 		person.Filename = fmt.Sprintf("profiles/jardulik-%d.zip", id)
 		entry, e := addStoredZipFile(z, person.Filename, personPath)
-		os.Remove(personPath)
+		removeErr := os.Remove(personPath)
 		if e != nil {
-			return path, manifest, e
+			return manifest, e
+		}
+		if removeErr != nil {
+			return manifest, removeErr
 		}
 		manifest.Files = append(manifest.Files, entry)
 		manifest.People = append(manifest.People, person)
 		fmt.Fprintf(&index, "%s | %s | SHA-256 %s\n", line, person.Filename, entry.SHA256)
 		if index.Len() > serviceManifestLimit {
-			return path, manifest, errArchiveBudget
+			return manifest, errArchiveBudget
 		}
 	}
 	for _, m := range manifest.Media {
@@ -523,26 +611,26 @@ func (a *Archiver) fullZIPFromSnapshot(ctx context.Context, db *sql.DB, snapshot
 		}
 		source, e := a.mediaSourcePath(m.SHA)
 		if e != nil {
-			return path, manifest, e
+			return manifest, e
 		}
 		entry, e := addZipFile(z, archiveMediaName(m.SHA, m.MIME), source)
 		if e != nil {
-			return path, manifest, e
+			return manifest, e
 		}
 		if entry.SHA256 != m.SHA || entry.ByteSize != m.Size {
-			return path, manifest, errors.New("source media hash or size mismatch")
+			return manifest, errFullBackupMedia
 		}
 		manifest.Files = append(manifest.Files, entry)
 	}
 	if err = add(addZipBytes(z, "index.txt", []byte(index.String()))); err != nil {
-		return path, manifest, err
+		return manifest, err
 	}
 	var pending, failed int64
 	if err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM media_jobs WHERE state='pending'").Scan(&pending); err != nil {
-		return path, manifest, err
+		return manifest, err
 	}
 	if err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM media_jobs WHERE state='error'").Scan(&failed); err != nil {
-		return path, manifest, err
+		return manifest, err
 	}
 	manifest.Coverage["pending_media"] = pending
 	manifest.Coverage["failed_media"] = failed
@@ -551,35 +639,21 @@ func (a *Archiver) fullZIPFromSnapshot(ctx context.Context, db *sql.DB, snapshot
 	manifest.Coverage["original_media_bytes"] = mediaBytes
 	b, err = json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
-		return path, manifest, err
+		return manifest, err
 	}
 	if len(b) > serviceManifestLimit {
-		return path, manifest, errArchiveBudget
+		return manifest, errArchiveBudget
 	}
 	if _, err = addZipBytes(z, "manifest.json", b); err != nil {
-		return path, manifest, err
+		return manifest, err
 	}
 	if err = z.Close(); err != nil {
-		return path, manifest, err
+		return manifest, err
 	}
-	if err = f.Sync(); err != nil {
-		return path, manifest, err
-	}
-	if err = f.Close(); err != nil {
-		return path, manifest, err
-	}
-	info, err = os.Stat(path)
-	if err != nil {
-		return path, manifest, err
-	}
-	if info.Size() > fullBundleLimit {
-		return path, manifest, errArchiveBudget
-	}
-	success = true
-	return path, manifest, nil
+	return manifest, nil
 }
 
-func (a *Archiver) personZIPFromSnapshot(ctx context.Context, db *sql.DB, id int64, work string, inventory map[string]fullMedia, embedded map[string]bool) (path string, person fullPerson, line string, err error) {
+func (a *Archiver) personZIPFromSnapshot(ctx context.Context, db *sql.DB, id int64, work string, inventory map[string]fullMedia, embedded map[string]bool, disk *fullBackupDisk) (path string, person fullPerson, line string, err error) {
 	person.ProfileID = id
 	f, err := os.CreateTemp(work, ".person-*.zip")
 	if err != nil {
@@ -593,7 +667,7 @@ func (a *Archiver) personZIPFromSnapshot(ctx context.Context, db *sql.DB, id int
 			os.Remove(path)
 		}
 	}()
-	z := zip.NewWriter(f)
+	z := zip.NewWriter(&fullBackupDiskWriter{disk: disk, file: f})
 	manifest := personManifest{Format: personBundleFormat, ProfileID: id}
 	seen := map[string]bool{}
 	rows, err := db.QueryContext(ctx, "SELECT id,owner_id,raw_json,first_seen,last_seen FROM versions WHERE profile_id=? ORDER BY id", id)
@@ -651,7 +725,7 @@ func (a *Archiver) personZIPFromSnapshot(ctx context.Context, db *sql.DB, id int
 				return path, person, "", e
 			}
 			if entry.SHA256 != j.SHA || entry.ByteSize != m.Size {
-				return path, person, "", errors.New("source media hash or size mismatch")
+				return path, person, "", errFullBackupMedia
 			}
 			manifest.Files = append(manifest.Files, entry)
 		}

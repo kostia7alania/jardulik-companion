@@ -283,12 +283,7 @@ func (c *Client) refreshLocked(ctx context.Context, owner int64, s Session) (Ses
 	if err != nil {
 		return s, err
 	}
-	decoded, err := unseal(c.Store.cfg.SessionKey, previous, sessionPurpose(owner))
-	if err != nil {
-		return s, errors.New("session decryption failed")
-	}
-	var current Session
-	if json.Unmarshal(decoded, &current) != nil || state != "connected" || upstream != s.UserID || current.UserID != s.UserID || current.Generation != s.Generation || current.Token != s.Token || current.Refresh != s.Refresh {
+	if state != "connected" || upstream != s.UserID || !bytes.Equal(previous, s.encrypted) {
 		return s, errors.New("сессия изменилась; старый запрос отменён")
 	}
 	// Other actors may pause or replace the session during HTTP; only this exact snapshot may change.
@@ -327,6 +322,7 @@ func (c *Client) refreshLocked(ctx context.Context, owner int64, s Session) (Ses
 	if changed != 1 {
 		return s, errors.New("сессия изменилась; старый запрос отменён")
 	}
+	s.encrypted = encoded
 	return s, nil
 }
 
@@ -389,9 +385,7 @@ func (c *Client) requestSessionObserved(ctx context.Context, owner int64, method
 	if errors.As(err, &ue) && (ue.Status == 403 || ue.Status == 429 || ue.Kind == "unexpected_response_or_challenge") {
 		mu := c.lock(owner)
 		mu.Lock()
-		if current, e := c.Store.Session(ctx, owner); e == nil && current.Generation == s.Generation && current.Token == s.Token {
-			c.Store.SessionState(ctx, owner, "paused", ue.Kind)
-		}
+		c.Store.setSessionStateIfCurrent(ctx, owner, s, "paused", ue.Kind)
 		mu.Unlock()
 	}
 	return b, observed, c.observeProfileUnavailable(ctx, owner, s, method, path, b, err, observed)
@@ -831,9 +825,9 @@ func (c *Client) positiveGuarded(ctx context.Context, owner, id int64, kind Posi
 		var upstream *UpstreamError
 		if errors.As(err, &upstream) {
 			if upstream.Status == 401 {
-				c.Store.SessionState(writeCtx, owner, "reconnect_required", "reaction_auth_not_confirmed")
+				c.Store.setSessionStateIfCurrent(writeCtx, owner, current, "reconnect_required", "reaction_auth_not_confirmed")
 			} else if upstream.Status == 403 || upstream.Status == 429 || upstream.Kind == "unexpected_response_or_challenge" {
-				c.Store.SessionState(writeCtx, owner, "paused", upstream.Kind)
+				c.Store.setSessionStateIfCurrent(writeCtx, owner, current, "paused", upstream.Kind)
 			}
 		}
 		persistErr := c.Store.finishReactionAction(writeCtx, action, "unknown", body, time.Time{})

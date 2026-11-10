@@ -43,6 +43,7 @@ type Session struct {
 	Generation string          `json:"generation,omitempty"`
 	State      string          `json:"-"`
 	Account    json.RawMessage `json:"-"`
+	encrypted  []byte
 }
 type Profile map[string]any
 type StoredProfile struct {
@@ -116,13 +117,13 @@ func (s *Store) SaveSession(ctx context.Context, owner int64, session Session) e
 }
 func (s *Store) Session(ctx context.Context, owner int64) (Session, error) {
 	var session Session
-	var b []byte
+	var encrypted []byte
 	var raw string
-	err := s.DB.QueryRowContext(ctx, "SELECT encrypted,state,account_json FROM sessions WHERE owner_id=?", owner).Scan(&b, &session.State, &raw)
+	err := s.DB.QueryRowContext(ctx, "SELECT encrypted,state,account_json FROM sessions WHERE owner_id=?", owner).Scan(&encrypted, &session.State, &raw)
 	if err != nil {
 		return session, err
 	}
-	b, err = unseal(s.cfg.SessionKey, b, sessionPurpose(owner))
+	b, err := unseal(s.cfg.SessionKey, encrypted, sessionPurpose(owner))
 	if err != nil {
 		return session, errors.New("session decryption failed")
 	}
@@ -130,10 +131,18 @@ func (s *Store) Session(ctx context.Context, owner int64) (Session, error) {
 	err = json.Unmarshal(b, &session)
 	session.State = state
 	session.Account = json.RawMessage(raw)
+	if err == nil {
+		session.encrypted = encrypted
+	}
 	return session, err
 }
 func (s *Store) SessionState(ctx context.Context, owner int64, state, reason string) {
 	_, _ = s.DB.ExecContext(ctx, "UPDATE sessions SET state=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE owner_id=?", state, reason, owner)
+}
+
+// A provider failure can change only the connected session used for the request.
+func (s *Store) setSessionStateIfCurrent(ctx context.Context, owner int64, expected Session, state, reason string) {
+	_, _ = s.DB.ExecContext(ctx, `UPDATE sessions SET state=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE owner_id=? AND upstream_id=? AND encrypted=? AND state='connected'`, state, reason, owner, expected.UserID, expected.encrypted)
 }
 func (s *Store) SaveAccount(ctx context.Context, owner int64, p Profile) error {
 	b, err := json.Marshal(p)

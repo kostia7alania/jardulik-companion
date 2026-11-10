@@ -154,14 +154,10 @@ func (c *Client) debugFailure(ctx context.Context, owner int64, ss Session, err 
 	mu := c.lock(owner)
 	mu.Lock()
 	defer mu.Unlock()
-	current, e := c.Store.Session(ctx, owner)
-	if e != nil || current.Generation != ss.Generation || current.Token != ss.Token {
-		return
-	}
 	if upstream.Status == 401 {
-		c.Store.SessionState(ctx, owner, "reconnect_required", "debug_auth_not_confirmed")
+		c.Store.setSessionStateIfCurrent(ctx, owner, ss, "reconnect_required", "debug_auth_not_confirmed")
 	} else if upstream.Status == 403 || upstream.Status == 429 || upstream.Kind == "unexpected_response_or_challenge" {
-		c.Store.SessionState(ctx, owner, "paused", upstream.Kind)
+		c.Store.setSessionStateIfCurrent(ctx, owner, ss, "paused", upstream.Kind)
 	}
 }
 func (c *Client) debugRead(ctx context.Context, owner int64, expected Session, path string) (int, []byte, error) {

@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -124,6 +126,11 @@ func TestFullBackupRoundTripKeepsVersionsObserversAndOriginals(t *testing.T) {
 	if _, err = s.DB.ExecContext(ctx, "INSERT INTO media(sha,size,mime,path) VALUES(?,?,?,?)", orphanSHA, len(orphan), "image/webp", "media/"+orphanSHA); err != nil {
 		t.Fatal(err)
 	}
+	estimatedMedia, largestPerson, err := fullBackupMediaEstimate(ctx, s.DB)
+	embeddedBytes := int64(len("original-jpeg-bytes") + len("original-png-bytes"))
+	if err != nil || estimatedMedia != embeddedBytes+int64(len(orphan)) || largestPerson != embeddedBytes {
+		t.Fatalf("unexpected media estimate: total %d, largest %d, error %v", estimatedMedia, largestPerson, err)
+	}
 	a := NewArchiver(c, s, nil, nil)
 	artifact, err := a.BuildFullBackup(ctx, false)
 	if err != nil {
@@ -135,6 +142,24 @@ func TestFullBackupRoundTripKeepsVersionsObserversAndOriginals(t *testing.T) {
 	info, err := os.Stat(artifact.Path)
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("artifact permissions: %v", err)
+	}
+	encryptedSHA, size, err := fileDigest(artifact.Path)
+	if err != nil || encryptedSHA != artifact.EncryptedSHA || size != artifact.ByteSize {
+		t.Fatalf("encrypted archive metadata disagrees with file: %v", err)
+	}
+	encrypted, err := os.Open(artifact.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainHash := sha256.New()
+	err = openFullBackup(plainHash, encrypted, c.BackupKey)
+	encrypted.Close()
+	if err != nil || hex.EncodeToString(plainHash.Sum(nil)) != artifact.SourceSHA {
+		t.Fatalf("source hash disagrees with decrypted archive: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Dir(artifact.Path))
+	if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(artifact.Path) {
+		t.Fatalf("backup directory contains staging files: %v, %v", entries, err)
 	}
 	z := fullTestOpen(t, artifact.Path, c.BackupKey)
 	files := fullTestZipBytes(t, &z.Reader)
@@ -198,6 +223,61 @@ func TestFullBackupRoundTripKeepsVersionsObserversAndOriginals(t *testing.T) {
 	}
 	if err = RestoreArchive(artifact.Path, dest, c.BackupKey); err == nil {
 		t.Fatal("nonempty restore destination replaced")
+	}
+}
+
+func TestFullBackupDiskReserveReportsActionableJobError(t *testing.T) {
+	ctx := context.Background()
+	c, s := archiveTestStore(t)
+	c.MinFreeBytes = ^uint64(0)
+	c.FullBackupEnabled = true
+	c.TelegramAPIID = 1
+	c.TelegramAPIHash = "fixture"
+	c.TransferHelper = "unused"
+	a := NewArchiver(c, s, nil, nil)
+	if err := a.RequestFullBackup(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	processed, err := a.processNextFullBackup(ctx)
+	if !processed || !errors.Is(err, errFullBackupDisk) {
+		t.Fatalf("processed = %v, error = %v", processed, err)
+	}
+	var state, code string
+	if err = s.DB.QueryRowContext(ctx, "SELECT state,error FROM full_backup_jobs").Scan(&state, &code); err != nil {
+		t.Fatal(err)
+	}
+	if state != "error" || code != "full_backup_insufficient_disk" || !strings.Contains(a.fullBackupStatus(ctx), "Освободите место") {
+		t.Fatalf("unexpected job status: %q, %q", state, code)
+	}
+	entries, err := os.ReadDir(filepath.Join(c.DataDir, "backups"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("disk preflight left a backup file: %v, %v", entries, err)
+	}
+}
+
+func TestFullBackupStreamErrorDoesNotPublishArtifact(t *testing.T) {
+	ctx := context.Background()
+	c, s := archiveTestStore(t)
+	profile := Profile{"userId": 99, "name": "Пример", "photos": []string{"https://mini.jardulik.app/one.jpg"}}
+	ids, err := s.Archive(ctx, 123, []Profile{profile}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sha := fullTestMedia(t, c, s, ids[0], []byte("original"), "image/jpeg")
+	if err = os.WriteFile(filepath.Join(c.DataDir, "media", sha), []byte("replaced"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a := NewArchiver(c, s, nil, nil)
+	if _, err = a.BuildFullBackup(ctx, false); !errors.Is(err, errFullBackupMedia) {
+		t.Fatalf("expected archive writer to fail on changed source media, got %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(c.DataDir, "backups"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("failed stream left backup or staging files: %v, %v", entries, err)
+	}
+	var count int
+	if err = s.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM full_backup_artifacts").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("failed stream registered an artifact: %d, %v", count, err)
 	}
 }
 
@@ -333,11 +413,10 @@ func TestFullBackupInventoryAndFingerprintUseSameSnapshot(t *testing.T) {
 	if err = os.MkdirAll(filepath.Join(c.DataDir, "backups"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	path, m, err := a.fullZIPFromSnapshot(ctx, db, snapshot, t.TempDir(), fp)
+	m, err := a.fullZIPFromSnapshot(ctx, db, snapshot, t.TempDir(), fp, io.Discard, &fullBackupDisk{path: c.DataDir, reserve: c.MinFreeBytes})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(path)
 	if len(m.People) != 1 || m.People[0].ProfileID != 99 || m.SourceFingerprint != fp {
 		t.Fatal("live source state leaked into captured bundle")
 	}

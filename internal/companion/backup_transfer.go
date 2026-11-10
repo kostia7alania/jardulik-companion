@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const transferOutputLimit = 64 << 10
@@ -110,6 +112,9 @@ func (a *Archiver) fullBackupStatus(ctx context.Context) string {
 	}
 	if err != nil {
 		return "Ошибка состояния полного бэкапа"
+	}
+	if detail == "full_backup_insufficient_disk" {
+		return fmt.Sprintf("Полный бэкап: %s. Освободите место для сборки с сохранением дискового резерва.", displayTime(at))
 	}
 	if detail != "" {
 		return fmt.Sprintf("Полный бэкап: %s, %s (%s)", state, displayTime(at), detail)
@@ -245,7 +250,21 @@ func (a *Archiver) processNextFullBackup(ctx context.Context) (bool, error) {
 		}
 		job.artifact, err = a.buildFullBackupLocked(ctx, job.daily)
 		if err != nil {
-			_, _ = a.Store.DB.ExecContext(context.WithoutCancel(ctx), "UPDATE full_backup_jobs SET state='error',error='full_backup_build_failed',updated_at=CURRENT_TIMESTAMP WHERE id=?", job.id)
+			code := "full_backup_build_failed"
+			var sqliteErr interface{ Code() int }
+			switch {
+			case errors.Is(err, errFullBackupDisk), errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT),
+				errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqlite3.SQLITE_FULL:
+				code = "full_backup_insufficient_disk"
+			case errors.Is(err, errArchiveBudget):
+				code = "full_backup_size_limit"
+			case errors.Is(err, errFullBackupMedia):
+				code = "full_backup_source_media_invalid"
+			}
+			_, _ = a.Store.DB.ExecContext(context.WithoutCancel(ctx), "UPDATE full_backup_jobs SET state='error',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", code, job.id)
+			if code == "full_backup_insufficient_disk" {
+				return true, errFullBackupDisk
+			}
 			return true, errors.New("full backup build failed")
 		}
 		if job.artifact.Unchanged {

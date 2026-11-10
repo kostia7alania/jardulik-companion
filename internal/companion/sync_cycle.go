@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,11 @@ const syncFullReadsSchema = `CREATE TABLE IF NOT EXISTS sync_full_reads (
 );
 `
 
+const syncCycleBindingChanged = "source_binding_or_pause_changed"
+
+const syncCycleActiveIndex = `CREATE UNIQUE INDEX IF NOT EXISTS sync_cycle_active_owner
+ ON sync_cycles(owner_id) WHERE stage NOT IN ('complete', 'superseded');`
+
 const syncCycleSchema = `
 CREATE TABLE IF NOT EXISTS sync_cycles (
  id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -25,7 +31,7 @@ CREATE TABLE IF NOT EXISTS sync_cycles (
  search_run_id TEXT NOT NULL, started_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
  next_cycle_ms INTEGER NOT NULL, reason TEXT NOT NULL DEFAULT '', last_tick_ms INTEGER NOT NULL DEFAULT 0
 );
-CREATE UNIQUE INDEX IF NOT EXISTS sync_cycle_active_owner ON sync_cycles(owner_id) WHERE stage<>'complete';
+` + syncCycleActiveIndex + `
 CREATE TABLE IF NOT EXISTS sync_refresh_items (
  cycle_id TEXT NOT NULL REFERENCES sync_cycles(id) ON DELETE CASCADE, profile_id INTEGER NOT NULL,
  state TEXT NOT NULL DEFAULT 'pending', version_id INTEGER NOT NULL DEFAULT 0,
@@ -60,8 +66,26 @@ func scanSyncCycle(row interface{ Scan(...any) error }) (*SyncCycle, error) {
 }
 
 func (s *Store) InitSyncCycles(ctx context.Context) error {
-	_, err := s.DB.ExecContext(ctx, syncCycleSchema+syncFullReadsSchema+syncPublicationSchema+watchSchema+profilePresenceSchema)
-	return err
+	if _, err := s.DB.ExecContext(ctx, syncCycleSchema+syncFullReadsSchema+syncPublicationSchema+watchSchema+profilePresenceSchema); err != nil {
+		return err
+	}
+	var indexSQL string
+	if err := s.DB.QueryRowContext(ctx, "SELECT sql FROM sqlite_schema WHERE type='index' AND name='sync_cycle_active_owner'").Scan(&indexSQL); err != nil {
+		return err
+	}
+	if strings.Contains(indexSQL, "'superseded'") {
+		return nil
+	}
+	// Keep the name for older processes that still run their IF NOT EXISTS schema.
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "DROP INDEX sync_cycle_active_owner;"+syncCycleActiveIndex); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) SyncCycle(ctx context.Context, owner int64) (*SyncCycle, error) {
@@ -169,8 +193,27 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 	if err != nil {
 		return false, err
 	}
-	if previous != nil && (previous.Stage != "complete" || now.UnixMilli() < previous.NextCycle) {
-		return false, nil
+	supersede := false
+	if previous != nil {
+		if now.UnixMilli() < previous.NextCycle {
+			return false, nil
+		}
+		if previous.Stage != "complete" {
+			if previous.Stage != "blocked" || previous.Reason != syncCycleBindingChanged ||
+				previous.UserID != ss.UserID || previous.Generation == ss.Generation {
+				return false, nil
+			}
+			// A frozen manifest proves the old cycle reached publication preparation.
+			// Search/refresh blocks require their original operator recovery.
+			if err = s.Store.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_publication_manifests
+ WHERE cycle_id=? AND owner_id=? AND upstream_id=? AND generation=?)`,
+				previous.ID, owner, previous.UserID, previous.Generation).Scan(&supersede); err != nil {
+				return false, err
+			}
+			if !supersede {
+				return false, nil
+			}
+		}
 	}
 	j, err := s.Store.CrawlStatus(ctx, owner)
 	if err != nil {
@@ -180,7 +223,12 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 	if j != nil && !j.active() && !(j.State == "done" && j.Reason == "empty_page") {
 		return false, nil
 	}
-	adopt := syncBroadRun(j, ss) && (j.active() || (previous == nil && j.StartedAt <= now.UnixMilli() && now.UnixMilli() < j.StartedAt+(24*time.Hour).Milliseconds()))
+	adopt := false
+	if syncBroadRun(j, ss) && (!supersede || j.StartedAt >= previous.NextCycle) {
+		recent := j.StartedAt <= now.UnixMilli() && now.UnixMilli() < j.StartedAt+(24*time.Hour).Milliseconds()
+		// A retry can adopt a fresh run that finished before the replacement cycle was committed.
+		adopt = j.active() || (recent && (previous == nil || supersede))
+	}
 	if j != nil && j.active() && !adopt {
 		return false, nil
 	}
@@ -211,12 +259,23 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 	if err = syncCycleBindingTx(ctx, tx, s.Store, cycle); err != nil {
 		return false, err
 	}
+	if supersede {
+		result, err := tx.ExecContext(ctx, `UPDATE sync_cycles SET stage='superseded',updated_at_ms=?
+ WHERE id=? AND owner_id=? AND upstream_id=? AND generation=? AND stage='blocked' AND reason=? AND next_cycle_ms<=?`,
+			now.UnixMilli(), previous.ID, owner, previous.UserID, previous.Generation, syncCycleBindingChanged, now.UnixMilli())
+		if err != nil {
+			return false, err
+		}
+		if n, err := result.RowsAffected(); err != nil || n != 1 {
+			return false, err
+		}
+	}
 	var exists bool
-	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sync_cycles WHERE owner_id=? AND (stage<>'complete' OR next_cycle_ms>?))", owner, now.UnixMilli()).Scan(&exists); err != nil {
+	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sync_cycles WHERE owner_id=? AND (stage NOT IN ('complete', 'superseded') OR next_cycle_ms>?))", owner, now.UnixMilli()).Scan(&exists); err != nil {
 		return false, err
 	}
 	if exists {
-		return false, tx.Commit()
+		return false, nil
 	}
 	var sameRun bool
 	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM feed_crawls WHERE owner_id=? AND run_id=? AND upstream_id=? AND generation=? AND state IN ('queued','running','done'))", owner, j.RunID, ss.UserID, ss.Generation).Scan(&sameRun); err != nil {
@@ -308,7 +367,7 @@ func (s *Service) SyncCycleStep(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	if paused || blocked || session.UserID != c.UserID || session.Generation != c.Generation {
-		return false, s.Store.syncCycleTransition(ctx, *c, "blocked", "source_binding_or_pause_changed", now)
+		return false, s.Store.syncCycleTransition(ctx, *c, "blocked", syncCycleBindingChanged, now)
 	}
 	// A challenge/source pause requires normal recovery; no automatic unpause or replacement.
 	if session.State != "connected" {
