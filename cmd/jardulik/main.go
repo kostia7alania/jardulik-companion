@@ -22,7 +22,7 @@ func run() error {
 	if len(os.Args) > 1 {
 		command = os.Args[1]
 	}
-	if (command == "serve-bot-parser" || command == "serve-poster" || command == "serve-compatibility") && len(os.Args) != 2 {
+	if (command == "serve-bot-parser" || command == "serve-poster" || command == "serve-compatibility" || command == "serve-miniapp") && len(os.Args) != 2 {
 		return errors.New("usage: jardulik " + command)
 	}
 	if command == "version" {
@@ -43,7 +43,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	roles := map[string]companion.RuntimeRole{"serve": companion.RuntimeAll, "serve-bot-parser": companion.RuntimeBotParser, "serve-poster": companion.RuntimePoster, "serve-compatibility": companion.RuntimeCompatibility}
+	roles := map[string]companion.RuntimeRole{"serve": companion.RuntimeAll, "serve-bot-parser": companion.RuntimeBotParser, "serve-poster": companion.RuntimePoster, "serve-compatibility": companion.RuntimeCompatibility, "serve-miniapp": companion.RuntimeMiniApp}
 	if role, serving := roles[command]; serving {
 		if logErr := companion.InstallOperationsLogger(c, role); logErr != nil {
 			slog.Warn("operations log unavailable", "kind", fmt.Sprintf("%T", logErr))
@@ -99,6 +99,19 @@ func run() error {
 		return s.RunPoster(ctx)
 	case "serve-compatibility":
 		return s.RunCompatibility(ctx)
+	case "serve-miniapp":
+		return s.RunMiniApp(ctx)
+	case "miniapp-test-card":
+		if len(os.Args) != 3 {
+			return errors.New("usage: jardulik miniapp-test-card <userId>")
+		}
+		profile, parseErr := strconv.ParseInt(os.Args[2], 10, 64)
+		if parseErr != nil || profile <= 0 {
+			return errors.New("invalid profile userId")
+		}
+		result, sendErr := s.SendMiniAppTestCard(ctx, profile)
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"userId": profile, "message_id": result.Message.ID, "already_sent": result.AlreadySent})
+		return sendErr
 	case "sync-status":
 		if len(os.Args) != 2 {
 			return errors.New("usage: jardulik sync-status")
@@ -300,7 +313,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, sync-status, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, serve-miniapp, miniapp-test-card, sync-status, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, version")
 	}
 }
 func main() {

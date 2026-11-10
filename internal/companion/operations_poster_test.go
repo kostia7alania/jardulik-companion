@@ -357,3 +357,52 @@ func TestOperationsStatusIncludesOpeningTimelineWhileArchivePaused(t *testing.T)
 		t.Fatal(text, err, f.calls)
 	}
 }
+
+func TestOperationsStatusOptionalMiniAppHeartbeatHasIndependentFreshness(t *testing.T) {
+	for _, test := range []struct {
+		name, raw, icon string
+		present         bool
+	}{
+		{"absent", "", "", false},
+		{"fresh", "fresh", "🟢", true},
+		{"stale", "stale", "🔴", true},
+		{"future_boundary", "future30", "🟢", true},
+		{"future_excess", "future31", "🔴", true},
+		{"empty", "", "⚪️", true},
+		{"malformed", "invalid", "⚪️", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newOperationsFixture(t)
+			if err := f.s.Store.SetMeta(context.Background(), "operations_heartbeat:all", fmt.Sprintf(`{"at_ms":%d}`, f.now.UnixMilli())); err != nil {
+				t.Fatal(err)
+			}
+			raw := test.raw
+			switch raw {
+			case "fresh":
+				raw = fmt.Sprintf(`{"at_ms":%d}`, f.now.UnixMilli())
+			case "stale":
+				raw = fmt.Sprintf(`{"at_ms":%d}`, f.now.Add(-91*time.Second).UnixMilli())
+			case "future30":
+				raw = fmt.Sprintf(`{"at_ms":%d}`, f.now.Add(30*time.Second).UnixMilli())
+			case "future31":
+				raw = fmt.Sprintf(`{"at_ms":%d}`, f.now.Add(31*time.Second).UnixMilli())
+			}
+			if test.present {
+				if err := f.s.Store.SetMeta(context.Background(), "operations_heartbeat:miniapp", raw); err != nil {
+					t.Fatal(err)
+				}
+			}
+			text, err := f.s.OperationsStatus(context.Background())
+			if err != nil || len(f.calls) != 0 {
+				t.Fatal(text, err, f.calls)
+			}
+			if !test.present {
+				if strings.Contains(text, "Mini App") {
+					t.Fatal("unconfigured gateway appeared", text)
+				}
+			} else if !strings.Contains(text, test.icon+" Mini App") {
+				t.Fatal("gateway inherited unrelated worker heartbeat", text)
+			}
+		})
+	}
+}

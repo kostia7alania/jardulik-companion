@@ -201,10 +201,10 @@ func TestOperationsCollectorBoundsOnePassAndHeartbeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	var count int
-	if err := s.Store.DB.QueryRow("SELECT occurrence_count FROM operations_events").Scan(&count); err != nil || count != 48 {
+	if err := s.Store.DB.QueryRow("SELECT occurrence_count FROM operations_events").Scan(&count); err != nil || count != 38 {
 		t.Fatal("unbounded collector pass", count, err)
 	}
-	for range 6 {
+	for range 7 {
 		if err := s.collectOperationsLogs(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -321,8 +321,42 @@ func TestOperationsFloodStillCollectsDurableStateAndMetaErrors(t *testing.T) {
 	if err := s.Store.DB.QueryRow("SELECT COUNT(*) FROM operations_events WHERE message IN ('Ошибка фонового задания','Последняя ошибка воркера')").Scan(&count); err != nil || count != 2 {
 		t.Fatal("continuous logs starved the state or metadata channel", count, err)
 	}
-	if err := s.Store.DB.QueryRow("SELECT SUM(occurrence_count) FROM operations_events WHERE message='caption edit unavailable'").Scan(&count); err != nil || count != 192 {
+	if err := s.Store.DB.QueryRow("SELECT SUM(occurrence_count) FROM operations_events WHERE message='caption edit unavailable'").Scan(&count); err != nil || count < 152 || count > 190 {
 		t.Fatal("roles did not receive their bounded share", count, err)
+	}
+	if err := s.collectOperationsLogs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.DB.QueryRow("SELECT COUNT(DISTINCT role) FROM operations_events WHERE message='caption edit unavailable'").Scan(&count); err != nil || count != 5 {
+		t.Fatal("rotation starved the fifth role", count, err)
+	}
+}
+
+func TestOperationsMiniAppRoleLoggerAndHeartbeat(t *testing.T) {
+	s := operationsTestService(t)
+	s.Config.Token = "fixture-token"
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	defer slog.SetDefault(previous)
+	if err := InstallOperationsLogger(s.Config, RuntimeMiniApp); err != nil {
+		t.Fatal(err)
+	}
+	handler := slog.Default().Handler().(*operationsLogHandler)
+	defer handler.sink.writer.(*os.File).Close()
+	slog.Warn("miniapp unavailable", "kind", "fixture_failure")
+	if err := s.Store.UpdateOperationsHeartbeat(context.Background(), RuntimeMiniApp); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.collectOperationsLogs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := s.Store.DB.QueryRow("SELECT COUNT(*) FROM operations_events WHERE role='miniapp'").Scan(&count); err != nil || count != 2 {
+		t.Fatal("miniapp startup or warning was missed", count, err)
+	}
+	var heartbeat map[string]int64
+	if json.Unmarshal([]byte(s.Store.Meta(context.Background(), "operations_heartbeat:miniapp")), &heartbeat) != nil || heartbeat["pid"] != int64(os.Getpid()) {
+		t.Fatal("standalone miniapp heartbeat was missed", heartbeat)
 	}
 }
 

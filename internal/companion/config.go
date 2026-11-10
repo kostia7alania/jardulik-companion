@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,6 +24,7 @@ type Config struct {
 	DataDir, Token, APIBase, TelegramBase              string
 	UserAgent                                          string
 	DebugListen                                        string
+	MiniAppListen, MiniAppPublicOrigin                 string
 	CompatibilityEnabled                               bool
 	CompatibilityGap                                   time.Duration
 	TelegramAPIID, TransferBytesPerSecond              int64
@@ -72,6 +74,11 @@ func LoadConfig() (Config, error) {
 		if err != nil || host != "127.0.0.1" || parseErr != nil || n < 0 || n > 65535 {
 			return c, errors.New("JARDULIK_DEBUG_LISTEN must use 127.0.0.1 and a valid port")
 		}
+	}
+	c.MiniAppListen = strings.TrimSpace(os.Getenv("JARDULIK_MINIAPP_LISTEN"))
+	c.MiniAppPublicOrigin = strings.TrimSuffix(strings.TrimSpace(os.Getenv("JARDULIK_MINIAPP_PUBLIC_ORIGIN")), "/")
+	if err := validateMiniAppEndpoint(c.MiniAppListen, c.MiniAppPublicOrigin); err != nil {
+		return c, err
 	}
 	c.UserAgent = strings.TrimSpace(os.Getenv("JARDULIK_USER_AGENT"))
 	if c.UserAgent == "" {
@@ -152,6 +159,26 @@ func LoadConfig() (Config, error) {
 		}
 	}
 	return c, nil
+}
+
+func validateMiniAppEndpoint(listen, origin string) error {
+	if listen == "" && origin == "" {
+		return nil
+	}
+	host, port, err := net.SplitHostPort(listen)
+	number, portErr := strconv.Atoi(port)
+	address := net.ParseIP(host)
+	if err != nil || portErr != nil || number < 1 || number > 65535 || address == nil ||
+		(!address.IsLoopback() && !address.IsPrivate() && !address.IsUnspecified()) {
+		return errors.New("JARDULIK_MINIAPP_LISTEN must use an explicit local or container IP and a valid port")
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Opaque != "" ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.ForceQuery || u.RawPath != "" ||
+		origin != "https://"+u.Host || strings.ContainsAny(u.Host, "\r\n\x00") {
+		return errors.New("JARDULIK_MINIAPP_PUBLIC_ORIGIN must be an HTTPS origin without a path or credentials")
+	}
+	return nil
 }
 
 func seal(key, plain []byte, purpose string) ([]byte, error) {

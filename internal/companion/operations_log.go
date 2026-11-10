@@ -20,7 +20,7 @@ import (
 	"unicode"
 )
 
-var operationsRoles = []RuntimeRole{RuntimeAll, RuntimeBotParser, RuntimePoster, RuntimeCompatibility}
+var operationsRoles = []RuntimeRole{RuntimeAll, RuntimeBotParser, RuntimePoster, RuntimeCompatibility, RuntimeMiniApp}
 var operationsProcessStarted = time.Now().UnixMilli()
 
 const operationsRecordLimit = 16 << 10

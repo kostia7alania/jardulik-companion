@@ -9,7 +9,7 @@ import (
 func (s *Service) runOperationsHeartbeat(ctx context.Context, role RuntimeRole) {
 	roles := []RuntimeRole{role}
 	if role == RuntimeAll {
-		roles = operationsRoles
+		roles = []RuntimeRole{RuntimeAll, RuntimeBotParser, RuntimePoster, RuntimeCompatibility}
 	}
 	for ctx.Err() == nil {
 		for _, current := range roles {

@@ -18,6 +18,7 @@ const (
 	RuntimeBotParser     RuntimeRole = "bot-parser"
 	RuntimePoster        RuntimeRole = "poster"
 	RuntimeCompatibility RuntimeRole = "compatibility"
+	RuntimeMiniApp       RuntimeRole = "miniapp"
 )
 
 // RunBackground holds role locks until the caller cancels ctx and invokes wait.

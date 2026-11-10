@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="no-referrer">
+  <title>Анкета</title>
+  <style>
+    :root { color-scheme: dark; --bg: #17212b; --surface: #223140; --text: #f5f7fb; --muted: #8a9baa; --accent: #8c2638; font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); min-height: 100dvh; font-size: 16px; line-height: 1.55; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    button { font: inherit; color: inherit; cursor: pointer; }
+    button:disabled { cursor: default; }
+    :focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+    [hidden] { display: none !important; }
+    .toolbar { position: sticky; top: 0; z-index: 2; height: 40px; background: var(--surface); display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 16px; }
+    .toolbar a, .id-button { min-height: 36px; display: inline-flex; align-items: center; color: var(--text); text-decoration: none; font-size: 13px; }
+    .toolbar a { border-bottom: 2px solid var(--accent); }
+    .id-button { background: none; border: 0; padding: 0; color: #c5d0d9; white-space: nowrap; }
+    main { max-width: 760px; margin: 0 auto; padding-bottom: max(28px, env(safe-area-inset-bottom)); }
+    .heading { padding: 22px 20px 18px; }
+    h1 { font-size: clamp(1.45rem, 1.15rem + 1.2vw, 1.9rem); line-height: 1.3; letter-spacing: -.025em; font-weight: 650; margin: 0; overflow-wrap: anywhere; }
+    .status { padding: 30px 20px; color: #c5d0d9; }
+    .status p { margin: 0 0 12px; }
+    .retry { background: var(--accent); border: 0; border-radius: 8px; padding: 9px 16px; font-weight: 600; }
+    .gallery { display: grid; grid-auto-flow: column; grid-auto-columns: 100%; overflow-x: auto; overscroll-behavior-x: contain; scroll-snap-type: x mandatory; scrollbar-width: thin; scrollbar-color: var(--muted) var(--bg); }
+    .photo { margin: 0; min-width: 0; scroll-snap-align: center; }
+    .photo-button { display: grid; place-items: center; width: 100%; height: min(68dvh, 660px); min-height: 240px; aspect-ratio: 4 / 5; padding: 0; border: 0; background: #101820; position: relative; }
+    .photo-button img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; }
+    .photo-message { padding: 24px; color: var(--muted); font-size: 14px; white-space: pre-line; }
+    figcaption { padding: 8px 20px 0; font-size: 12px; color: var(--muted); text-align: right; }
+    .profile-text { margin: 0; padding: 20px; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .raw { margin: 0 20px; border-top: 1px solid #344655; }
+    .raw summary { padding: 14px 0; font-size: 14px; color: var(--muted); cursor: pointer; }
+    .raw pre { margin: 0; padding: 0 0 16px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.5; color: #c5d0d9; }
+    dialog { width: 100%; max-width: none; height: 100dvh; max-height: none; margin: 0; padding: 0 0 max(24px, env(safe-area-inset-bottom)); border: 0; background: #101820; color: var(--text); }
+    dialog::backdrop { background: #101820; }
+    .dialog-toolbar { position: sticky; top: 0; height: 40px; display: flex; justify-content: flex-end; align-items: center; background: #101820; z-index: 1; padding: 0 16px; }
+    .close { border: 0; background: none; font-size: 14px; min-height: 36px; padding: 0 4px; }
+    .full-photo { display: block; width: 100%; height: 72dvh; object-fit: contain; }
+    .full-caption { max-width: 70ch; margin: 0 auto; padding: 20px; font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
+    @media (min-width: 780px) { .toolbar { padding-inline: max(20px, calc((100% - 720px) / 2)); } .heading { padding-top: 28px; } }
+  </style>
+  <script src="https://telegram.org/js/telegram-web-app.js?62"></script>
+</head>
+<body>
+  <nav class="toolbar" aria-label="Режим просмотра">
+    <a id="mutuals" hidden>Связи</a>
+    <button class="id-button" id="copy-id" type="button" hidden aria-label="Скопировать ID анкеты"></button>
+  </nav>
+  <main>
+    <section class="status" id="status" role="status" aria-live="polite">
+      <p id="message">Загружаем анкету…</p>
+      <button class="retry" id="retry" type="button" hidden>Повторить</button>
+    </section>
+    <article id="profile" hidden>
+      <header class="heading"><h1 id="title"></h1></header>
+      <div class="gallery" id="gallery" aria-label="Фотографии анкеты" hidden></div>
+      <pre class="profile-text" id="profile-text"></pre>
+      <details class="raw"><summary>Исходный JSON</summary><pre id="raw-json"></pre></details>
+    </article>
+  </main>
+  <dialog id="photo-dialog" aria-label="Фотография и текст анкеты">
+    <div class="dialog-toolbar"><button class="close" id="close-photo" type="button">Закрыть</button></div>
+    <img class="full-photo" id="full-photo" alt="">
+    <pre class="full-caption" id="full-caption"></pre>
+  </dialog>
+  <script>
+    'use strict';
+    const $ = (id) => document.getElementById(id);
+    const target = new URLSearchParams(location.search).get('id');
+    const targetID = Number(target);
+    const validTarget = /^[1-9]\d*$/.test(target || '') && Number.isSafeInteger(targetID);
+    const app = window.Telegram?.WebApp;
+    const blobURLs = new Set();
+    let controller;
+    let generation = 0;
+    let fullText = '';
+
+    function releasePhotos() {
+      for (const url of blobURLs) URL.revokeObjectURL(url);
+      blobURLs.clear();
+      $('full-photo').removeAttribute('src');
+    }
+
+    function errorText(error) {
+      if (error.status === 401 || error.status === 403) return 'Открой анкету кнопкой бота';
+      if (error.status === 409) return 'Просмотр приостановлен или сессия недоступна. Проверь подключение в боте и повтори.';
+      if (error.status === 404) return 'Анкета или фото не найдены в архиве. Открой анкету заново кнопкой бота.';
+      return 'Не удалось загрузить анкету. Проверь соединение и повтори.';
+    }
+
+    async function request(url, options) {
+      const response = await fetch(url, { cache: 'no-store', credentials: 'omit', redirect: 'error', ...options });
+      if (!response.ok) {
+        const error = new Error('Request failed');
+        error.status = response.status;
+        throw error;
+      }
+      return response;
+    }
+
+    function openPhoto(url, label) {
+      if (typeof $('photo-dialog').showModal !== 'function') return;
+      $('full-photo').src = url;
+      $('full-photo').alt = label;
+      $('full-caption').textContent = fullText;
+      $('photo-dialog').showModal();
+    }
+
+    async function loadPhotos(media, token, signal, run) {
+      const photos = Array.isArray(media) ? media : [];
+      const gallery = $('gallery');
+      gallery.hidden = photos.length === 0;
+      const slots = photos.map((photo, index) => {
+        const label = `Фото ${index + 1} из ${photos.length}`;
+        const figure = document.createElement('figure');
+        figure.className = 'photo';
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'photo-button';
+        button.disabled = true;
+        button.setAttribute('aria-label', `Открыть ${label.toLowerCase()}`);
+        const message = document.createElement('span');
+        message.className = 'photo-message';
+        message.textContent = 'Загружаем фото…';
+        button.append(message);
+        const caption = document.createElement('figcaption');
+        caption.textContent = `${index + 1} / ${photos.length}`;
+        figure.append(button, caption);
+        gallery.append(figure);
+        return { photo, button, message, label };
+      });
+      // Keep authorized original downloads sequential on mobile connections.
+      for (const slot of slots) {
+        if (signal.aborted || run !== generation) return;
+        try {
+          if (!/^\/miniapp\/media\/[1-9]\d*$/.test(slot.photo.url || '')) throw new Error('Invalid media URL');
+          const response = await request(slot.photo.url, { headers: { Authorization: `Bearer ${token}` }, signal });
+          const blob = await response.blob();
+          if (signal.aborted || run !== generation) return;
+          const url = URL.createObjectURL(blob);
+          blobURLs.add(url);
+          const image = new Image();
+          image.alt = slot.label;
+          image.decoding = 'async';
+          image.hidden = true;
+          image.onload = () => {
+            slot.message.remove();
+            image.hidden = false;
+            slot.button.disabled = false;
+          };
+          image.onerror = () => {
+            image.remove();
+            slot.message.textContent = 'Фото не открывается. Нажми, чтобы повторить.';
+            slot.button.disabled = false;
+            slot.button.onclick = load;
+            URL.revokeObjectURL(url);
+            blobURLs.delete(url);
+          };
+          image.src = url;
+          slot.button.append(image);
+          slot.button.onclick = () => openPhoto(url, slot.label);
+        } catch (error) {
+          if (signal.aborted || run !== generation) return;
+          slot.message.textContent = errorText(error) + '\nНажми, чтобы повторить.';
+          slot.button.disabled = false;
+          slot.button.onclick = load;
+        }
+      }
+    }
+
+    async function load() {
+      controller?.abort();
+      controller = new AbortController();
+      const signal = controller.signal;
+      const run = ++generation;
+      releasePhotos();
+      if ($('photo-dialog').open) $('photo-dialog').close();
+      $('gallery').replaceChildren();
+      $('gallery').scrollLeft = 0;
+      $('profile').hidden = true;
+      $('status').hidden = false;
+      $('retry').hidden = true;
+      $('message').textContent = 'Загружаем анкету…';
+      if (!validTarget || !app?.initData) {
+        $('message').textContent = 'Открой анкету кнопкой бота';
+        return;
+      }
+      try {
+        const authResponse = await request('/miniapp/auth', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ initData: app.initData, targetUserId: targetID }), signal
+        });
+        const auth = await authResponse.json();
+        if (typeof auth.token !== 'string' || !auth.token) throw new Error('Missing token');
+        const response = await request(`/miniapp/profile?id=${targetID}`, { headers: { Authorization: `Bearer ${auth.token}` }, signal });
+        const profile = await response.json();
+        if (run !== generation || signal.aborted) return;
+        if (profile.id !== targetID || typeof profile.formattedText !== 'string') throw new Error('Invalid profile');
+        fullText = profile.formattedText;
+        const newline = fullText.indexOf('\n');
+        $('title').textContent = newline < 0 ? fullText : fullText.slice(0, newline);
+        $('profile-text').textContent = newline < 0 ? '' : fullText.slice(newline + 1);
+        $('raw-json').textContent = JSON.stringify(profile.raw, null, 2);
+        document.title = $('title').textContent || 'Анкета';
+        $('profile').hidden = false;
+        $('status').hidden = true;
+        await loadPhotos(profile.media, auth.token, signal, run);
+      } catch (error) {
+        if (run !== generation || signal.aborted) return;
+        $('message').textContent = errorText(error);
+        $('retry').hidden = false;
+      }
+    }
+
+    if (validTarget) {
+      $('mutuals').href = `/mutuals?targetUserId=${targetID}&noCheck=1${location.hash}`;
+      $('mutuals').hidden = false;
+      $('copy-id').textContent = `ID ${targetID}`;
+      $('copy-id').hidden = false;
+      $('copy-id').onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(String(targetID));
+          $('copy-id').textContent = 'Скопировано';
+          setTimeout(() => { $('copy-id').textContent = `ID ${targetID}`; }, 1800);
+        } catch {
+          $('copy-id').textContent = `ID ${targetID}`;
+          $('copy-id').setAttribute('aria-label', `Не удалось скопировать. ID ${targetID}`);
+        }
+      };
+    }
+    $('retry').onclick = load;
+    $('close-photo').onclick = () => $('photo-dialog').close();
+    $('photo-dialog').addEventListener('close', () => $('full-photo').removeAttribute('src'));
+    window.addEventListener('pagehide', () => { controller?.abort(); releasePhotos(); });
+    window.addEventListener('pageshow', (event) => { if (event.persisted) load(); });
+    app?.ready();
+    load();
+  </script>
+</body>
+</html>

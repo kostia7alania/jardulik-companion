@@ -13,9 +13,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -47,6 +50,50 @@ func NewClient(s *Store, c Config) *Client {
 }
 func (c *Client) lock(owner int64) *sync.Mutex {
 	return c.Store.SessionMutex(owner)
+}
+
+// Keep this file in place: unlinking it would let another process lock a different inode.
+func (c *Client) sessionFileLock(ctx context.Context, owner int64) (*os.File, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(c.Store.cfg.DataDir, fmt.Sprintf("session-%d.lock", owner)), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = errors.New("session lock is not a regular file")
+	}
+	if err == nil {
+		err = f.Chmod(0600)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	for {
+		if err = ctx.Err(); err != nil {
+			f.Close()
+			return nil, err
+		}
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EINTR) {
+			f.Close()
+			return nil, err
+		}
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			f.Close()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (c *Client) exchange(ctx context.Context, method, path, token string, payload any) ([]byte, error) {
@@ -135,10 +182,15 @@ func (c *Client) LoginAccount(ctx context.Context, owner int64, raw string) (Pro
 	mu := c.lock(owner)
 	mu.Lock()
 	defer mu.Unlock()
+	fileLock, err := c.sessionFileLock(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer fileLock.Close()
 	var previous []byte
 	var upstream int64
 	var state, reason string
-	err := c.Store.DB.QueryRowContext(ctx, "SELECT encrypted,upstream_id,state,last_error FROM sessions WHERE owner_id=?", owner).Scan(&previous, &upstream, &state, &reason)
+	err = c.Store.DB.QueryRowContext(ctx, "SELECT encrypted,upstream_id,state,last_error FROM sessions WHERE owner_id=?", owner).Scan(&previous, &upstream, &state, &reason)
 	missing := errors.Is(err, sql.ErrNoRows)
 	if err != nil && !missing {
 		return nil, err
@@ -224,21 +276,56 @@ func decodeLoginResponse(b []byte) (Session, error) {
 }
 
 func (c *Client) refreshLocked(ctx context.Context, owner int64, s Session) (Session, error) {
+	var previous []byte
+	var upstream int64
+	var state, reason string
+	err := c.Store.DB.QueryRowContext(ctx, "SELECT encrypted,upstream_id,state,last_error FROM sessions WHERE owner_id=?", owner).Scan(&previous, &upstream, &state, &reason)
+	if err != nil {
+		return s, err
+	}
+	decoded, err := unseal(c.Store.cfg.SessionKey, previous, sessionPurpose(owner))
+	if err != nil {
+		return s, errors.New("session decryption failed")
+	}
+	var current Session
+	if json.Unmarshal(decoded, &current) != nil || state != "connected" || upstream != s.UserID || current.UserID != s.UserID || current.Generation != s.Generation || current.Token != s.Token || current.Refresh != s.Refresh {
+		return s, errors.New("сессия изменилась; старый запрос отменён")
+	}
+	// Other actors may pause or replace the session during HTTP; only this exact snapshot may change.
+	pause := func(failureReason string) {
+		_, _ = c.Store.DB.ExecContext(ctx, `UPDATE sessions SET state='reconnect_required',last_error=?,updated_at=CURRENT_TIMESTAMP WHERE owner_id=? AND encrypted=? AND upstream_id=? AND state='connected' AND last_error=?`, failureReason, owner, previous, upstream, reason)
+	}
 	b, err := c.exchange(ctx, "PUT", "/appuser/refresh", "", map[string]string{"token": s.Token, "refreshToken": s.Refresh})
 	if err != nil {
-		c.Store.SessionState(ctx, owner, "reconnect_required", "refresh_not_confirmed")
+		pause("refresh_not_confirmed")
 		return s, err
 	}
 	var r struct{ Token, RefreshToken string }
 	if json.Unmarshal(b, &r) != nil || r.Token == "" || r.RefreshToken == "" {
-		c.Store.SessionState(ctx, owner, "reconnect_required", "refresh_format_changed")
+		pause("refresh_format_changed")
 		return s, errors.New("invalid refresh response")
 	}
 	s.Token = r.Token
 	s.Refresh = r.RefreshToken
 	s.Expires = tokenExpiry(r.Token)
-	if err = c.Store.SaveSession(ctx, owner, s); err != nil {
+	encoded, err := json.Marshal(s)
+	if err != nil {
 		return s, err
+	}
+	encoded, err = seal(c.Store.cfg.SessionKey, encoded, sessionPurpose(owner))
+	if err != nil {
+		return s, err
+	}
+	result, err := c.Store.DB.ExecContext(ctx, `UPDATE sessions SET encrypted=?,expires_at=?,state='connected',last_error='',updated_at=CURRENT_TIMESTAMP WHERE owner_id=? AND encrypted=? AND upstream_id=? AND state='connected' AND last_error=?`, encoded, s.Expires, owner, previous, upstream, reason)
+	if err != nil {
+		return s, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return s, err
+	}
+	if changed != 1 {
+		return s, errors.New("сессия изменилась; старый запрос отменён")
 	}
 	return s, nil
 }
@@ -247,6 +334,11 @@ func (c *Client) token(ctx context.Context, owner int64, after401 string, genera
 	mu := c.lock(owner)
 	mu.Lock()
 	defer mu.Unlock()
+	fileLock, err := c.sessionFileLock(ctx, owner)
+	if err != nil {
+		return Session{}, err
+	}
+	defer fileLock.Close()
 	s, err := c.Store.Session(ctx, owner)
 	if err != nil {
 		return s, errors.New("сначала подключи свой Jardulik через /connect")

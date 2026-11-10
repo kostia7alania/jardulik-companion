@@ -22,7 +22,16 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 		At int64 `json:"at_ms"`
 	}
 	_ = json.Unmarshal([]byte(s.Store.Meta(ctx, "operations_heartbeat:all")), &allBeat)
-	for _, role := range []RuntimeRole{RuntimeBotParser, RuntimePoster, RuntimeCompatibility} {
+	roles := []RuntimeRole{RuntimeBotParser, RuntimePoster, RuntimeCompatibility}
+	var miniBeat string
+	miniErr := s.Store.DB.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='operations_heartbeat:miniapp'").Scan(&miniBeat)
+	if miniErr != nil && !errors.Is(miniErr, sql.ErrNoRows) {
+		return "", miniErr
+	}
+	if miniErr == nil {
+		roles = append(roles, RuntimeRole("miniapp"))
+	}
+	for _, role := range roles {
 		var beat struct {
 			At int64 `json:"at_ms"`
 		}
@@ -34,9 +43,16 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 			label = "Постер"
 		case RuntimeCompatibility:
 			label = "Планировщик GPT"
+		case RuntimeRole("miniapp"):
+			label = "Mini App"
 		}
-		_ = json.Unmarshal([]byte(s.Store.Meta(ctx, "operations_heartbeat:"+string(role))), &beat)
-		if allBeat.At > beat.At {
+		raw := miniBeat
+		if role != RuntimeRole("miniapp") {
+			raw = s.Store.Meta(ctx, "operations_heartbeat:"+string(role))
+		}
+		_ = json.Unmarshal([]byte(raw), &beat)
+		// The legacy combined runtime does not run the standalone Mini App gateway.
+		if role != RuntimeRole("miniapp") && allBeat.At > beat.At {
 			beat.At = allBeat.At
 		}
 		if beat.At > 0 {

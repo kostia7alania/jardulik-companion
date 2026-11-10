@@ -48,12 +48,24 @@ func (s *Service) collectOperationsLogs(ctx context.Context) error {
 		return err
 	}
 	remaining, records := 64<<10, 256
-	for _, role := range operationsRoles {
+	key := "operations_log_next_role:" + strconv.FormatInt(s.Config.OwnerID, 10) + ":" + strconv.FormatInt(s.Config.BackupChatID, 10)
+	start, _ := strconv.Atoi(s.Store.Meta(ctx, key))
+	if start < 0 || start >= len(operationsRoles) {
+		start = 0
+	}
+	// A valid maximum-sized record needs a full slot; rotate who gets the first
+	// slot when the total byte budget cannot fit every role in the same pass.
+	if err := s.Store.SetMeta(ctx, key, strconv.Itoa((start+1)%len(operationsRoles))); err != nil {
+		return err
+	}
+	perRole := (256 - 64) / len(operationsRoles)
+	for i := range operationsRoles {
+		role := operationsRoles[(start+i)%len(operationsRoles)]
 		if remaining == 0 || records == 0 {
 			break
 		}
 		// Reserve capacity for durable worker errors even during a log flood.
-		consumed, count, err := s.collectOperationsFile(ctx, role, min(remaining, operationsRecordLimit), min(records, 48))
+		consumed, count, err := s.collectOperationsFile(ctx, role, min(remaining, operationsRecordLimit), min(records, perRole))
 		if err != nil {
 			return err
 		}

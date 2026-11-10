@@ -1,0 +1,50 @@
+services:
+  miniapp:
+    # Reuse the already cached Linux image; the entrypoint is our static Go binary.
+    image: traefik:v3.7
+    pull_policy: never
+    container_name: jardulik-miniapp
+    entrypoint: ["/app/jardulik"]
+    command: ["serve-miniapp"]
+    user: "${JARDULIK_RUN_UID:?}:${JARDULIK_RUN_GID:?}"
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: "0.5"
+    pids_limit: 64
+    stop_grace_period: 10s
+    env_file: /etc/jardulik-companion.env
+    environment:
+      JARDULIK_MINIAPP_LISTEN: "0.0.0.0:8790"
+      JARDULIK_MINIAPP_PUBLIC_ORIGIN: "${JARDULIK_MINIAPP_ORIGIN:?}"
+      JARDULIK_DEBUG_LISTEN: ""
+      ALLOW_REACTIONS: "false"
+      COMPATIBILITY_ENABLED: "false"
+      SYNC_CYCLE_ENABLED: "false"
+      ARCHIVE_WORKER_PAUSED: "true"
+      DAILY_CRAWL_ENABLED: "false"
+      GOMEMLIMIT: "80MiB"
+      GOMAXPROCS: "1"
+    volumes:
+      - "/opt/jardulik-companion/releases/${JARDULIK_RELEASE_SHA:?}/jardulik:/app/jardulik:ro"
+      - "/var/lib/jardulik-companion:/var/lib/jardulik-companion:rw"
+    tmpfs:
+      - "/tmp:size=4m,noexec,nosuid,nodev"
+    networks: ["proxy"]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "proxy"
+      traefik.http.routers.jardulik-miniapp.rule: "Host(`${JARDULIK_MINIAPP_HOST:?}`)"
+      traefik.http.routers.jardulik-miniapp.entrypoints: "websecure"
+      traefik.http.routers.jardulik-miniapp.tls.certresolver: "le"
+      traefik.http.routers.jardulik-miniapp.service: "jardulik-miniapp"
+      traefik.http.services.jardulik-miniapp.loadbalancer.server.port: "8790"
+      traefik.http.services.jardulik-miniapp.loadbalancer.healthcheck.path: "/viewer"
+      traefik.http.services.jardulik-miniapp.loadbalancer.healthcheck.interval: "30s"
+      traefik.http.services.jardulik-miniapp.loadbalancer.healthcheck.timeout: "3s"
+
+networks:
+  proxy:
+    external: true
