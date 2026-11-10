@@ -314,9 +314,19 @@ func analysisPostRatingAt(content string, match []int, requireOverall bool) (int
 	if requireOverall && !analysisPostOverallSubject(words) {
 		return 0, false
 	}
-	for _, word := range words {
+	for i, word := range words {
 		switch word {
-		case "не", "нет", "нельзя", "отрицаю", "несовместимость", "например", "минус", "между", "до", "или":
+		case "между":
+			// "Between you" names the pair, not numeric range endpoints.
+			if i+1 >= len(words) || words[i+1] != "вами" {
+				return 0, false
+			}
+			for _, following := range words[i+2:] {
+				if following == "и" || strings.IndexFunc(following, unicode.IsDigit) >= 0 {
+					return 0, false
+				}
+			}
+		case "не", "нет", "нельзя", "отрицаю", "несовместимость", "например", "минус", "до", "или":
 			return 0, false
 		}
 	}

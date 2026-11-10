@@ -656,3 +656,32 @@ func TestAnalysisPostProviderPercentageFallback(t *testing.T) {
 		t.Fatal("display fallback changed captured response", err)
 	}
 }
+
+func TestAnalysisPostRatingBetweenPeopleIsNotNumericRange(t *testing.T) {
+	for _, tc := range []struct {
+		text  string
+		value int
+		known bool
+	}{
+		{"8. **Итог**. Совместимость между вами — около 80%.", 80, true},
+		{"8. **Итог**. Совместимость между вами — 80%.", 80, true},
+		{"8. **Итог**. Совместимость между вами на уровне 75%.", 75, true},
+		{"8. **Итог.** Совместимость между вами составляет 75%.", 75, true},
+		{"8. **Итог**. Совместимость между вами — примерно 70%.", 70, true},
+		{"Совместимость между\nвами — около 80%.", 80, true},
+		{"Между 70 и 80%", 0, false},
+		{"Между 70 и\n80%", 0, false},
+		{"Совместимость между вами: 70 и 80%", 0, false},
+		{"Совместимость между вами: 70 и\n80%", 0, false},
+		{"Совместимость между вами: 70–80%", 0, false},
+		{"Совместимость между вами: от 70 до 80%", 0, false},
+		{"Совместимость между вами: 70% или 80%", 0, false},
+		{"Совместимость между вами не 80%", 0, false},
+		{"Совместимость между вами −80%", 0, false},
+	} {
+		got, known := analysisPostRating(tc.text)
+		if known != tc.known || (known && got != tc.value) {
+			t.Fatalf("%q got=%d,%v want=%d,%v", tc.text, got, known, tc.value, tc.known)
+		}
+	}
+}
