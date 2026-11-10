@@ -258,7 +258,7 @@ func (s *Store) ImportReactionMessageDrafts(ctx context.Context, owner int64, ra
 	if err != nil || own.ID() != upstream {
 		return result, errors.New("invalid current greeting source")
 	}
-	policy, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	policy, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 	if err != nil {
 		return result, err
 	}

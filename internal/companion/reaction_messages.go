@@ -15,7 +15,7 @@ const reactionMessageSchema = `
 CREATE TABLE IF NOT EXISTS reaction_message_settings (
  owner_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
  mode TEXT NOT NULL DEFAULT 'off' CHECK(mode IN ('off','first','rotate','birthday')),
- templates_json TEXT NOT NULL DEFAULT '[]', telegram_username TEXT NOT NULL DEFAULT '', prefer_drafts INTEGER NOT NULL DEFAULT 0 CHECK(prefer_drafts IN (0,1)), next_cursor INTEGER NOT NULL DEFAULT 0 CHECK(next_cursor>=0),
+ templates_json TEXT NOT NULL DEFAULT '[]', telegram_username TEXT NOT NULL DEFAULT '', prefer_drafts INTEGER NOT NULL DEFAULT 0 CHECK(prefer_drafts IN (0,1)), iron_mix INTEGER NOT NULL DEFAULT 0 CHECK(iron_mix IN (0,1)), next_cursor INTEGER NOT NULL DEFAULT 0 CHECK(next_cursor>=0),
  revision INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS reaction_message_intents (
@@ -38,6 +38,7 @@ type ReactionMessagePolicy struct {
 	Templates        []string `json:"templates"`
 	TelegramUsername string   `json:"telegram_username"`
 	PreferDrafts     bool     `json:"prefer_drafts"`
+	IronMix          bool     `json:"iron_mix"`
 	Selection        string   `json:"selection"`
 	NextCursor       int64    `json:"next_cursor"`
 	Revision         int64    `json:"revision"`
@@ -83,13 +84,15 @@ func (s *Store) initReactionMessages(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, reactionMessageSchema+reactionMessageDraftTable); err != nil {
 		return err
 	}
-	var present int
-	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_settings') WHERE name='prefer_drafts'").Scan(&present); err != nil {
-		return err
-	}
-	if present == 0 {
-		if _, err = tx.ExecContext(ctx, "ALTER TABLE reaction_message_settings ADD COLUMN prefer_drafts INTEGER NOT NULL DEFAULT 0 CHECK(prefer_drafts IN (0,1))"); err != nil {
+	for _, column := range []string{"prefer_drafts", "iron_mix"} {
+		var present int
+		if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_settings') WHERE name=?", column).Scan(&present); err != nil {
 			return err
+		}
+		if present == 0 {
+			if _, err = tx.ExecContext(ctx, "ALTER TABLE reaction_message_settings ADD COLUMN "+column+" INTEGER NOT NULL DEFAULT 0 CHECK("+column+" IN (0,1))"); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -98,7 +101,7 @@ func (s *Store) initReactionMessages(ctx context.Context) error {
 func scanReactionMessagePolicy(row interface{ Scan(...any) error }, owner int64) (ReactionMessagePolicy, error) {
 	p := ReactionMessagePolicy{OwnerID: owner, Mode: "off", Templates: []string{}, Selection: "off"}
 	var raw string
-	err := row.Scan(&p.Mode, &raw, &p.TelegramUsername, &p.PreferDrafts, &p.NextCursor, &p.Revision)
+	err := row.Scan(&p.Mode, &raw, &p.TelegramUsername, &p.PreferDrafts, &p.IronMix, &p.NextCursor, &p.Revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, nil
 	}
@@ -134,7 +137,7 @@ func (s *Store) ReactionMessagePolicy(ctx context.Context, owner int64) (Reactio
 	if err := s.initReactionMessages(ctx); err != nil {
 		return ReactionMessagePolicy{}, err
 	}
-	return scanReactionMessagePolicy(s.DB.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	return scanReactionMessagePolicy(s.DB.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 }
 
 // Saving templates never starts a worker or sends a reaction.
@@ -157,6 +160,7 @@ type ReactionMessagePolicyConfig struct {
 	Templates        []string `json:"templates"`
 	TelegramUsername string   `json:"telegram_username"`
 	PreferDrafts     bool     `json:"prefer_drafts"`
+	IronMix          bool     `json:"iron_mix"`
 }
 
 func (s *Store) ConfigureReactionMessagePolicy(ctx context.Context, owner int64, config ReactionMessagePolicyConfig) (ReactionMessagePolicy, error) {
@@ -185,12 +189,12 @@ func (s *Store) ConfigureReactionMessagePolicy(ctx context.Context, owner int64,
 		return ReactionMessagePolicy{}, err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO reaction_message_settings(owner_id,mode,templates_json,telegram_username,prefer_drafts) VALUES(?,?,?,?,?)
- ON CONFLICT(owner_id) DO UPDATE SET mode=excluded.mode,templates_json=excluded.templates_json,telegram_username=excluded.telegram_username,prefer_drafts=excluded.prefer_drafts,next_cursor=0,revision=reaction_message_settings.revision+1,updated_at=CURRENT_TIMESTAMP`, owner, mode, string(raw), telegramUsername, config.PreferDrafts)
+	_, err = tx.ExecContext(ctx, `INSERT INTO reaction_message_settings(owner_id,mode,templates_json,telegram_username,prefer_drafts,iron_mix) VALUES(?,?,?,?,?,?)
+ ON CONFLICT(owner_id) DO UPDATE SET mode=excluded.mode,templates_json=excluded.templates_json,telegram_username=excluded.telegram_username,prefer_drafts=excluded.prefer_drafts,iron_mix=excluded.iron_mix,next_cursor=0,revision=reaction_message_settings.revision+1,updated_at=CURRENT_TIMESTAMP`, owner, mode, string(raw), telegramUsername, config.PreferDrafts, config.IronMix)
 	if err != nil {
 		return ReactionMessagePolicy{}, err
 	}
-	p, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	p, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 	if err != nil {
 		return p, err
 	}
@@ -254,7 +258,7 @@ func (s *Store) prepareLikeMessage(ctx context.Context, owner, action int64, tar
 	if explicit != nil {
 		message = *explicit
 	} else {
-		p, e := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+		p, e := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 		if e != nil {
 			return nil, e
 		}
@@ -288,6 +292,9 @@ func (s *Store) prepareLikeMessage(ctx context.Context, owner, action int64, tar
 				slot = p.NextCursor % int64(len(p.Templates))
 			}
 			message = p.Templates[slot]
+		}
+		if p.IronMix {
+			message = ironMixReactionMessage(message, birthdayGreetingName(currentTarget))
 		}
 		if mode == "rotate" || mode == "birthday" {
 			reservedCursor = p.NextCursor

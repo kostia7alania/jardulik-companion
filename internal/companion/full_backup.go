@@ -1224,13 +1224,17 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 			continue
 		}
 		if q.table == "reaction_message_settings" {
-			var preferColumn int
-			if err = db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_settings') WHERE name='prefer_drafts'").Scan(&preferColumn); err != nil {
-				return nil, err
+			q.query = "SELECT owner_id,mode,templates_json,telegram_username"
+			for _, column := range []string{"prefer_drafts", "iron_mix"} {
+				var present int
+				if err = db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_settings') WHERE name=?", column).Scan(&present); err != nil {
+					return nil, err
+				}
+				if present > 0 {
+					q.query += "," + column
+				}
 			}
-			if preferColumn > 0 {
-				q.query = "SELECT owner_id,mode,templates_json,telegram_username,prefer_drafts,revision FROM reaction_message_settings"
-			}
+			q.query += ",revision FROM reaction_message_settings"
 		}
 		rows, err := db.QueryContext(ctx, q.query)
 		if err != nil {

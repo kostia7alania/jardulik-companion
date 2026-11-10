@@ -13,7 +13,7 @@ import (
 func TestReactionMessageCLIStoresOffWithoutNetwork(t *testing.T) {
 	s, _, calls := contactImportFixture(t)
 	templates := []string{"  Привет 😀 @kostia7alania  \n", "second", "third"}
-	raw, _ := json.Marshal(map[string]any{"mode": "off", "templates": templates})
+	raw, _ := json.Marshal(map[string]any{"mode": "off", "templates": templates, "iron_mix": true})
 	var output bytes.Buffer
 	if err := setReactionMessagePolicy(context.Background(), s, 1, bytes.NewReader(raw), &output); err != nil {
 		t.Fatal(err)
@@ -22,11 +22,11 @@ func TestReactionMessageCLIStoresOffWithoutNetwork(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &policy); err != nil {
 		t.Fatal(err)
 	}
-	if policy.Mode != "off" || policy.NextCursor != 0 || policy.Templates[0] != templates[0] || *calls != 0 {
+	if policy.Mode != "off" || !policy.IronMix || policy.NextCursor != 0 || policy.Templates[0] != templates[0] || *calls != 0 {
 		t.Fatal("save-only changed content or used network", policy, *calls)
 	}
 	other, err := s.Store.ReactionMessagePolicy(context.Background(), 2)
-	if err != nil || other.Mode != "off" || len(other.Templates) != 0 {
+	if err != nil || other.Mode != "off" || other.IronMix || len(other.Templates) != 0 {
 		t.Fatal("another owner received templates", other, err)
 	}
 }
