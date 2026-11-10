@@ -231,7 +231,9 @@ func (a *miniAppAssets) source(r *http.Request, path, contentType string) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", contentType)
+	// Browser asset requests accept the provider's MIME aliases. Validate the
+	// returned type below instead of making its strict negotiation reject them.
+	req.Header.Set("Accept", "*/*")
 	// Never copy caller headers, cookies, auth, query strings or upstream response headers.
 	res, err := a.client.Do(req)
 	if err != nil {

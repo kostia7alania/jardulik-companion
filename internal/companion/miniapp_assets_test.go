@@ -97,6 +97,21 @@ func TestMiniAppAssetsOriginalShellAndLocalCSP(t *testing.T) {
 	}
 }
 
+func TestMiniAppAssetsAcceptsProviderJavaScriptNegotiation(t *testing.T) {
+	a := miniAppAssetsFixture(t)
+	a.client.Transport = miniAppRoundTripper(func(r *http.Request) (*http.Response, error) {
+		// The provider rejects the stricter text/javascript Accept value with 406.
+		if r.Header.Get("Accept") != "*/*" {
+			return miniAppSourceResponse(r, 406, "text/plain", []byte("Not acceptable")), nil
+		}
+		return miniAppSourceResponse(r, 200, "application/javascript", []byte("export default 1;")), nil
+	})
+	w := miniAppRequest(t, a, "GET", "/assets/chunk.js")
+	if w.Code != 200 || w.Body.String() != "export default 1;" || !strings.HasPrefix(w.Header().Get("Content-Type"), "text/javascript") {
+		t.Fatalf("public JS did not survive negotiation: status=%d", w.Code)
+	}
+}
+
 func TestMiniAppAssetsPathBoundaryAndHeaders(t *testing.T) {
 	a := miniAppAssetsFixture(t)
 	calls := 0

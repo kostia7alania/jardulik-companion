@@ -28,7 +28,7 @@ services:
       GOMEMLIMIT: "80MiB"
       GOMAXPROCS: "1"
     volumes:
-      - "/opt/jardulik-companion/releases/${JARDULIK_RELEASE_SHA:?}/jardulik:/app/jardulik:ro"
+      - "${JARDULIK_MINIAPP_BINARY:?}:/app/jardulik:ro"
       - "/var/lib/jardulik-companion:/var/lib/jardulik-companion:rw"
     tmpfs:
       - "/tmp:size=4m,noexec,nosuid,nodev"
