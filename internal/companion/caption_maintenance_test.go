@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -95,6 +97,7 @@ func TestCaptionMaintenanceDurableOnceOnlyEditsConfirmedCards(t *testing.T) {
 	}
 	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
 	w := captionMaintenanceWorker{s, func() time.Time { return now }}
+	s.Archiver.now = w.now
 	var messages []int64
 	maintenanceTelegram(t, s, func(_ *http.Request, input maintenanceInput) (string, error) {
 		if (input.Chat == s.Config.BackupChatID && input.Message != 101) || (input.Chat == 123 && input.Message != 201) || (input.Chat != s.Config.BackupChatID && input.Chat != 123) {
@@ -144,6 +147,7 @@ func TestCaptionMaintenanceRestartAndUnknownEditRetryAreIdempotent(t *testing.T)
 	}
 	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
 	w := captionMaintenanceWorker{s, func() time.Time { return now }}
+	s.Archiver.now = w.now
 	if job, err := w.claim(context.Background()); err != nil || job == nil {
 		t.Fatal("claim failed", err)
 	}
@@ -191,6 +195,7 @@ func TestCaptionMaintenanceIsolatesMissingAndForeignReceipts(t *testing.T) {
 			}
 			now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
 			w := captionMaintenanceWorker{s, func() time.Time { return now }}
+			s.Archiver.now = w.now
 			calls := 0
 			maintenanceTelegram(t, s, func(_ *http.Request, input maintenanceInput) (string, error) {
 				calls++
@@ -220,6 +225,7 @@ func TestCaptionMaintenancePersistsTelegramRetryAfterAcrossJobs(t *testing.T) {
 	}
 	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
 	w := captionMaintenanceWorker{s, func() time.Time { return now }}
+	s.Archiver.now = w.now
 	calls := 0
 	maintenanceTelegram(t, s, func(_ *http.Request, input maintenanceInput) (string, error) {
 		calls++
@@ -236,8 +242,14 @@ func TestCaptionMaintenancePersistsTelegramRetryAfterAcrossJobs(t *testing.T) {
 		t.Fatal("server retry_after was not preserved")
 	}
 	now = now.Add(10 * time.Second)
-	if did, err := w.step(context.Background()); err != nil || did || calls != 1 {
+	waiting, stop := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	did, err := w.step(waiting)
+	stop()
+	if err != nil || !did || calls != 1 || !errors.Is(waiting.Err(), context.DeadlineExceeded) {
 		t.Fatal("another edit bypassed shared flood wait", did, err, calls)
+	}
+	if raw := s.Store.Meta(context.Background(), "archive_next_send_ns"); raw != strconv.FormatInt(now.Add(18*time.Second).UnixNano(), 10) {
+		t.Fatal("canceled pacing wait changed the server checkpoint")
 	}
 	now = now.Add(19 * time.Second)
 	if did, err := w.step(context.Background()); err != nil || !did || calls != 2 {
@@ -274,6 +286,7 @@ func TestCaptionMaintenanceRichSingleMessageUsesConfirmedFileIDs(t *testing.T) {
 	}
 	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
 	w := captionMaintenanceWorker{s, func() time.Time { return now }}
+	s.Archiver.now = w.now
 	calls := 0
 	maintenanceTelegram(t, s, func(r *http.Request, input maintenanceInput) (string, error) {
 		calls++
@@ -318,6 +331,7 @@ func TestCaptionMaintenanceInvalidRichMarkerNeverFallsBackToAlbum(t *testing.T) 
 			}
 			now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
 			w := captionMaintenanceWorker{s, func() time.Time { return now }}
+			s.Archiver.now = w.now
 			maintenanceTelegram(t, s, func(_ *http.Request, _ maintenanceInput) (string, error) {
 				t.Fatal("invalid rich marker fell back to editing an album")
 				return "", nil
@@ -471,5 +485,257 @@ func TestCaptionNoticeScopeDoesNotCrossOwnerOrCurrentSource(t *testing.T) {
 				t.Fatal("scoped schedule retargeted stale or other-owner source")
 			}
 		})
+	}
+}
+
+func TestCaptionMaintenanceClaimsFutureSlotWithoutReservingAnother(t *testing.T) {
+	s, _, _, _ := captionRefreshFixture(t)
+	ctx := context.Background()
+	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	future := strconv.FormatInt(now.Add(2*time.Second).UnixNano(), 10)
+	if err := s.Store.SetMeta(ctx, "archive_next_send_ns", future); err != nil {
+		t.Fatal(err)
+	}
+	w := captionMaintenanceWorker{s, func() time.Time { return now }}
+	job, err := w.claim(ctx)
+	if err != nil || job == nil {
+		t.Fatalf("free sender mutex window still rejected a future slot: %v", err)
+	}
+	if s.Store.Meta(ctx, "archive_next_send_ns") != future {
+		t.Fatal("claim reserved another Telegram slot")
+	}
+	if state, _ := maintenanceState(t, s, "archive"); state != "processing" {
+		t.Fatal("claim lost its durable writer reservation")
+	}
+}
+
+func TestCaptionMaintenanceWaitsForExistingGroupSlotAndEditsOnce(t *testing.T) {
+	s, _, _, _ := captionRefreshFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w := captionMaintenanceWorker{s, time.Now}
+	s.Archiver.now = w.now
+	slot := time.Now().Add(40 * time.Millisecond)
+	if err := s.Store.SetMeta(ctx, "archive_next_send_ns", strconv.FormatInt(slot.UnixNano(), 10)); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	maintenanceTelegram(t, s, func(_ *http.Request, input maintenanceInput) (string, error) {
+		calls++
+		if time.Now().Before(slot) {
+			t.Fatal("edit bypassed the existing group slot")
+		}
+		return maintenanceSuccess(s, input), nil
+	})
+	if did, err := w.step(ctx); err != nil || !did || calls != 1 {
+		t.Fatalf("maintenance did not make progress through future slot: %v %v calls%d", did, err, calls)
+	}
+	if state, _ := maintenanceState(t, s, "archive"); state != "done" {
+		t.Fatal("paced known edit was not confirmed")
+	}
+	next, err := strconv.ParseInt(s.Store.Meta(ctx, "archive_next_send_ns"), 10, 64)
+	if err != nil || next < slot.Add(3*time.Second).UnixNano() {
+		t.Fatal("actual edit did not reserve the normal four-second slot")
+	}
+}
+
+func TestCaptionMaintenanceCanceledPacingKeepsKnownEditRetryable(t *testing.T) {
+	s, _, _, _ := captionRefreshFixture(t)
+	ctx := context.Background()
+	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.DB.Exec("UPDATE caption_maintenance_jobs SET attempts=7 WHERE kind='archive'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.DB.Exec("UPDATE caption_maintenance_jobs SET state='done' WHERE kind!='archive'"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	w := captionMaintenanceWorker{s, func() time.Time { return now }}
+	s.Archiver.now = w.now
+	future := strconv.FormatInt(now.Add(time.Hour).UnixNano(), 10)
+	if err := s.Store.SetMeta(ctx, "archive_next_send_ns", future); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	maintenanceTelegram(t, s, func(_ *http.Request, input maintenanceInput) (string, error) {
+		calls++
+		return maintenanceSuccess(s, input), nil
+	})
+	for attempt := 0; attempt < 2; attempt++ {
+		waiting, cancel := context.WithTimeout(ctx, 25*time.Millisecond)
+		did, err := w.step(waiting)
+		cancel()
+		if err != nil || !did || calls != 0 || !errors.Is(waiting.Err(), context.DeadlineExceeded) {
+			t.Fatalf("canceled wait attempted an HTTP edit: %v %v calls%d", did, err, calls)
+		}
+		var state, reason string
+		var attempts int
+		var next int64
+		if err := s.Store.DB.QueryRow("SELECT state,error,attempts,next_attempt FROM caption_maintenance_jobs WHERE kind='archive'").Scan(&state, &reason, &attempts, &next); err != nil {
+			t.Fatal(err)
+		}
+		if state != "retry" || reason != "pacing_wait" || attempts != 7 || next != now.Add(4*time.Second).UnixMilli() {
+			t.Fatalf("pacing consumed an edit attempt: state=%s reason=%s attempts=%d next=%d", state, reason, attempts, next)
+		}
+		now = now.Add(5 * time.Second)
+	}
+	if s.Store.Meta(ctx, "archive_next_send_ns") != future {
+		t.Fatal("canceled wait shortened the shared checkpoint")
+	}
+	if !s.Archiver.mu.TryLock() {
+		t.Fatal("canceled pacing retained sender mutex")
+	}
+	s.Archiver.mu.Unlock()
+}
+
+func TestCaptionMaintenanceRevalidatesSourceAfterPacingWait(t *testing.T) {
+	for _, kind := range []string{"archive", "analysis"} {
+		t.Run(kind, func(t *testing.T) {
+			var s *Service
+			if kind == "archive" {
+				s, _, _, _ = captionRefreshFixture(t)
+			} else {
+				f, _ := captionNoticeAnalysisReceipt(t)
+				s = f.service
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+				t.Fatal(err)
+			}
+			w := captionMaintenanceWorker{s, time.Now}
+			slot := time.Now().Add(40 * time.Millisecond)
+			if err := s.Store.SetMeta(ctx, "archive_next_send_ns", strconv.FormatInt(slot.UnixNano(), 10)); err != nil {
+				t.Fatal(err)
+			}
+			entered, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			s.Archiver.now = func() time.Time {
+				once.Do(func() {
+					close(entered)
+					select {
+					case <-release:
+					case <-ctx.Done():
+					}
+				})
+				return time.Now()
+			}
+			calls := 0
+			maintenanceTelegram(t, s, func(_ *http.Request, input maintenanceInput) (string, error) {
+				calls++
+				return maintenanceSuccess(s, input), nil
+			})
+			type result struct {
+				did bool
+				err error
+			}
+			done := make(chan result, 1)
+			go func() { did, err := w.step(ctx); done <- result{did, err} }()
+			select {
+			case <-entered:
+			case r := <-done:
+				t.Fatalf("step did not enter shared pacing: %+v", r)
+			case <-ctx.Done():
+				t.Fatal("pacing never started")
+			}
+			var err error
+			if kind == "archive" {
+				_, err = s.Store.DB.ExecContext(ctx, "DELETE FROM archive_receipts")
+			} else {
+				_, err = s.Store.DB.ExecContext(ctx, "UPDATE sessions SET upstream_id=upstream_id+1 WHERE owner_id=?", s.Config.OwnerID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			close(release)
+			select {
+			case r := <-done:
+				if r.err != nil || !r.did || calls != 0 {
+					t.Fatalf("stale receipt/session reached HTTP: %+v calls%d", r, calls)
+				}
+			case <-ctx.Done():
+				t.Fatal("paced edit did not finish")
+			}
+			if state, _ := maintenanceState(t, s, kind); state != "failed" {
+				t.Fatal("changed live source was not isolated after waiting")
+			}
+		})
+	}
+}
+
+func TestCaptionMaintenanceMalformedCheckpointAndAbsurdRetryAfterStayFailClosed(t *testing.T) {
+	for _, mode := range []string{"malformed", "absurd429"} {
+		t.Run(mode, func(t *testing.T) {
+			s, _, _, _ := captionRefreshFixture(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+				t.Fatal(err)
+			}
+			w := captionMaintenanceWorker{s, time.Now}
+			s.Archiver.now = w.now
+			if mode == "malformed" {
+				if err := s.Store.SetMeta(ctx, "archive_next_send_ns", "invalid"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			calls := 0
+			maintenanceTelegram(t, s, func(_ *http.Request, _ maintenanceInput) (string, error) {
+				calls++
+				return `{"ok":false,"error_code":429,"parameters":{"retry_after":31536001}}`, nil
+			})
+			did, err := w.step(ctx)
+			state, _ := maintenanceState(t, s, "archive")
+			if mode == "malformed" {
+				if did || err == nil || calls != 0 || state != "pending" || s.Store.Meta(context.Background(), "archive_next_send_ns") != "invalid" {
+					t.Fatal("malformed checkpoint was ignored")
+				}
+			} else if !did || err != nil || calls != 1 || state != "failed" || ctx.Err() != nil {
+				t.Fatal("absurd RetryAfter caused an inline retry or wait")
+			}
+		})
+	}
+}
+
+func TestCaptionMaintenanceRestartDuringPacingDoesNotConsumeAttempts(t *testing.T) {
+	s, _, _, _ := captionRefreshFixture(t)
+	ctx := context.Background()
+	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.DB.Exec("UPDATE caption_maintenance_jobs SET attempts=7 WHERE kind='archive'"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	future := strconv.FormatInt(now.Add(15*time.Minute).UnixNano(), 10)
+	if err := s.Store.SetMeta(ctx, "archive_next_send_ns", future); err != nil {
+		t.Fatal(err)
+	}
+	w := captionMaintenanceWorker{s, func() time.Time { return now }}
+	for i := 0; i < 8; i++ {
+		job, err := w.claim(ctx)
+		if err != nil || job == nil || job.kind != "archive" || job.attempts != 7 {
+			t.Fatalf("restart %d consumed an attempt before pacing: job=%+v err=%v", i, job, err)
+		}
+		if err := w.recover(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var attempts int
+		var state string
+		if err := s.Store.DB.QueryRow("SELECT attempts,state FROM caption_maintenance_jobs WHERE id=?", job.id).Scan(&attempts, &state); err != nil || attempts != 7 || state != "retry" {
+			t.Fatalf("restart %d lost retry budget: attempts=%d state=%s err=%v", i, attempts, state, err)
+		}
+		now = now.Add(5 * time.Second)
+	}
+	if s.Store.Meta(ctx, "archive_next_send_ns") != future {
+		t.Fatal("restart changed the existing Telegram cooldown")
 	}
 }

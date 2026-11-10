@@ -254,12 +254,8 @@ func (w *captionMaintenanceWorker) claim(ctx context.Context) (*captionMaintenan
 	if err = tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='archive_next_send_ns'").Scan(&raw); err != nil {
 		return nil, err
 	}
-	next, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
+	if _, err = strconv.ParseInt(raw, 10, 64); err != nil {
 		return nil, errors.New("invalid archive pacing checkpoint")
-	}
-	if next > w.now().UnixNano() {
-		return nil, nil
 	}
 	var j captionMaintenanceJob
 	err = tx.QueryRowContext(ctx, `SELECT id,kind,receipt_id,owner_id,version_id,inventory,source_sha,chat_id,thread_id,attempts FROM caption_maintenance_jobs
@@ -270,16 +266,12 @@ func (w *captionMaintenanceWorker) claim(ctx context.Context) (*captionMaintenan
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE caption_maintenance_jobs SET state='processing',attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND state IN ('pending','retry')", j.id); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='archive_next_send_ns'", strconv.FormatInt(w.now().Add(4*time.Second).UnixNano(), 10)); err != nil {
+	if _, err = tx.ExecContext(ctx, "UPDATE caption_maintenance_jobs SET state='processing',updated_at=CURRENT_TIMESTAMP WHERE id=? AND state IN ('pending','retry')", j.id); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
-	j.attempts++
 	return &j, nil
 }
 func (w *captionMaintenanceWorker) finish(ctx context.Context, j *captionMaintenanceJob, state, reason string, next time.Time) error {
@@ -287,6 +279,21 @@ func (w *captionMaintenanceWorker) finish(ctx context.Context, j *captionMainten
 	defer cancel()
 	_, err := w.service.Store.DB.ExecContext(finish, "UPDATE caption_maintenance_jobs SET state=?,error=?,next_attempt=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND state='processing'", state, reason, next.UnixMilli(), j.id)
 	return err
+}
+func (w *captionMaintenanceWorker) beginAttempt(ctx context.Context, j *captionMaintenanceJob) error {
+	r, err := w.service.Store.DB.ExecContext(ctx, "UPDATE caption_maintenance_jobs SET attempts=attempts+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND state='processing'", j.id)
+	if err != nil {
+		return err
+	}
+	n, err := r.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return errCaptionMaintenanceReceipt
+	}
+	j.attempts++
+	return nil
 }
 func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMaintenanceJob) (string, map[string]any, error) {
 	s := w.service
@@ -411,8 +418,11 @@ func (w *captionMaintenanceWorker) step(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
 	s := w.service
-	// TryLock avoids waiting behind the poster; no bot/user lock is ever held.
+	// Join the normal group slot after acquiring mu, including its future window.
+	// No bot/user lock or SQL transaction is held while waiting.
 	if s.Archiver == nil || !s.Archiver.mu.TryLock() {
 		return false, nil
 	}
@@ -421,6 +431,14 @@ func (w *captionMaintenanceWorker) step(ctx context.Context) (bool, error) {
 	if err != nil || j == nil {
 		return false, err
 	}
+	if err = s.Archiver.groupSlot(ctx); err != nil {
+		return true, w.finish(ctx, j, "retry", "pacing_wait", w.now().Add(4*time.Second))
+	}
+	// Waiting, including a restart during pacing, does not consume an attempt.
+	if err = w.beginAttempt(ctx, j); err != nil {
+		return true, errors.Join(err, w.retry(ctx, j, "attempt_checkpoint_failed", 4*time.Second))
+	}
+	// Receipts and sessions may change while the shared slot is pending.
 	method, payload, err := w.prepare(ctx, j)
 	if errors.Is(err, errCaptionMaintenanceReceipt) {
 		return true, w.finish(ctx, j, "failed", "receipt_missing_or_changed", time.Time{})
