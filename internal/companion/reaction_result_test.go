@@ -36,7 +36,7 @@ func newReactionFixture(t *testing.T) *reactionFixture {
 	if err := s.SaveSession(ctx, 1, Session{Token: "test-access", Refresh: "test-refresh", UserID: 101, Generation: "generation-1", Expires: f.now.Add(24 * time.Hour).Unix()}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Archive(ctx, 1, []Profile{{"userId": 7}, {"userId": 8}}, "test"); err != nil {
+	if _, err := s.Archive(ctx, 1, []Profile{{"userId": 7, "age": 23}, {"userId": 8, "age": 23}}, "test"); err != nil {
 		t.Fatal(err)
 	}
 	f.client = NewClient(s, cfg)

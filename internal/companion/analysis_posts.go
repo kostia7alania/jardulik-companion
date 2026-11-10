@@ -113,11 +113,11 @@ func analysisPostText(analysis ProfileAnalysis) (analysisPostPayload, error) {
 		return payload, errors.New("analysis post has no successful GPT content")
 	}
 	model := analysisPostModel(analysis.Model, response.Model)
-	title := "🧩 Совместимость · " + model
+	title := "🧩 Совместимость"
 	if percent, known := analysisPostRating(response.Content); known {
-		title = fmt.Sprintf("🧩 Совместимость: %d%% · %s", percent, model)
+		title = fmt.Sprintf("🧩 Совместимость: %d%%", percent)
 	}
-	prefix := fmt.Sprintf("%s\n%s\n\n", title, displayTime(time.UnixMilli(analysis.ObservedAtMillis).UTC().Format(time.RFC3339Nano)))
+	prefix := fmt.Sprintf("%s\n🤖 %s\n%s\n\n", title, model, displayTime(time.UnixMilli(analysis.ObservedAtMillis).UTC().Format(time.RFC3339Nano)))
 	content, bold := analysisPostBold(response.Content)
 	if textUnits(prefix+content) > 4096 {
 		const tail = "\n\nПродолжение: полный JSON по кнопке."
@@ -127,7 +127,7 @@ func analysisPostText(analysis ProfileAnalysis) (analysisPostPayload, error) {
 	} else {
 		payload.Text = prefix + content
 	}
-	payload.Entities = analysisPostQuoteEntities(prefix, content, bold)
+	payload.Entities = append([]MessageEntity{{Type: "bold", Offset: 0, Length: textUnits(title)}}, analysisPostQuoteEntities(prefix, content, bold)...)
 	return payload, validMessageEntities(payload.Text, payload.Entities)
 }
 

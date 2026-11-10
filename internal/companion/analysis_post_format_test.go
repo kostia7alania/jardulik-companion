@@ -49,17 +49,20 @@ func TestAnalysisPostHeaderUsesReportedModelWithoutSourceLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(payload.Text, "🧩 Совместимость: 75% · reported-model\n"+displayTime(f.now.UTC().Format(time.RFC3339Nano))+"\n\n") {
+	if !strings.HasPrefix(payload.Text, "🧩 Совместимость: 75%\n🤖 reported-model\n"+displayTime(f.now.UTC().Format(time.RFC3339Nano))+"\n\n") {
 		t.Fatal("wrong model/date header", payload.Text)
 	}
-	prefix, _ := telegramPrefix(payload.Text, payload.Entities[0].Offset)
+	prefix, _ := telegramPrefix(payload.Text, payload.Entities[1].Offset)
 	if strings.Contains(prefix, "От:") || strings.Contains(prefix, "Own") || strings.Contains(prefix, "101") {
 		t.Fatal("source identity remains in header", prefix)
+	}
+	if payload.Entities[0].Type != "bold" || payload.Entities[0].Offset != 0 || analysisFormatEntityText(payload.Text, payload.Entities[0]) != "🧩 Совместимость: 75%" {
+		t.Fatal("first-line compatibility is not bold", payload.Entities)
 	}
 	if analysisPostQuoted(payload) != "Итог: Оценка совместимости — 75%." {
 		t.Fatal("bold markers remained or content changed")
 	}
-	if len(payload.Entities) != 2 || analysisFormatEntityText(payload.Text, payload.Entities[1]) != "Итог" {
+	if len(payload.Entities) != 3 || analysisFormatEntityText(payload.Text, payload.Entities[2]) != "Итог" {
 		t.Fatal("missing nested bold entity", payload.Entities)
 	}
 	if !bytes.Equal(original, f.analysis.ResponseBody) {
@@ -93,14 +96,14 @@ func TestAnalysisPostClipsNestedBoldAtUTF16QuoteBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	formatted, _ := analysisPostBold(raw)
-	quote := payload.Entities[0]
+	quote := payload.Entities[1]
 	if textUnits(payload.Text) > 4096 || !strings.HasPrefix(formatted, analysisPostQuoted(payload)) || payload.Keyboard == nil {
 		t.Fatal("wrong long-format fallback")
 	}
-	if len(payload.Entities) != 2 {
+	if len(payload.Entities) != 3 {
 		t.Fatal("out-of-range bold entity was not excluded", payload.Entities)
 	}
-	bold := payload.Entities[1]
+	bold := payload.Entities[2]
 	if bold.Type != "bold" || bold.Offset < quote.Offset || bold.Offset+bold.Length != quote.Offset+quote.Length {
 		t.Fatalf("bold not clipped within quote: %+v %+v", quote, bold)
 	}
@@ -109,5 +112,18 @@ func TestAnalysisPostClipsNestedBoldAtUTF16QuoteBoundary(t *testing.T) {
 	}
 	if strings.Contains(analysisPostQuoted(payload), "**") {
 		t.Fatal("paired Markdown markers remained after clipping")
+	}
+}
+
+func TestAnalysisPostGenericHeaderDoesNotInventOverallPercent(t *testing.T) {
+	for _, content := range []string{"Проценты не указаны.", "Оценка совместимости: 75%. Оценка совместимости: 70%."} {
+		f := newAnalysisPostFixture(t, content)
+		payload, err := analysisPostText(f.analysis)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(payload.Text, "🧩 Совместимость\n🤖 reported-model\n") || analysisFormatEntityText(payload.Text, payload.Entities[0]) != "🧩 Совместимость" {
+			t.Fatal("generic header invented a score", payload.Text)
+		}
 	}
 }

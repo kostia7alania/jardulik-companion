@@ -559,6 +559,18 @@ func (s *Store) initReactionActions(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='reaction_actions_schema'"); err != nil {
 		return err
 	}
+	if _, err = tx.ExecContext(ctx, debugAuditSchema); err != nil {
+		return err
+	}
+	var auditLink int
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('debug_api_calls') WHERE name='action_id'").Scan(&auditLink); err != nil {
+		return err
+	}
+	if auditLink == 0 {
+		if _, err = tx.ExecContext(ctx, "ALTER TABLE debug_api_calls ADD COLUMN action_id INTEGER REFERENCES actions(id) ON DELETE SET NULL"); err != nil {
+			return err
+		}
+	}
 	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(actions)")
 	if err != nil {
 		return err
@@ -622,6 +634,9 @@ func (s *Store) checkReactionAction(ctx context.Context, q reactionQuerier, owne
 	if !known {
 		return errors.New("анкета недоступна этому аккаунту")
 	}
+	if err = s.checkDebugPositive(ctx, q, owner, profile); err != nil {
+		return err
+	}
 	var state string
 	var retry int64
 	// A service quota is account-wide, including clicks on another profile.
@@ -638,7 +653,7 @@ func (s *Store) checkReactionAction(ctx context.Context, q reactionQuerier, owne
 		return err
 	}
 	err = q.QueryRowContext(ctx, `SELECT state,retry_at FROM actions WHERE owner_id=? AND profile_id=? AND kind='Like'
- AND state NOT IN ('quota_waiting','quota_retried') ORDER BY id DESC LIMIT 1`, owner, profile).Scan(&state, &retry)
+ AND state NOT IN ('quota_waiting','quota_retried','fire_waiting') ORDER BY id DESC LIMIT 1`, owner, profile).Scan(&state, &retry)
 	if err == nil {
 		return &ActionBlockedError{State: state}
 	}
@@ -667,6 +682,9 @@ func (s *Store) ClaimOwnerAction(ctx context.Context, owner, profile int64, now 
 		return 0, err
 	}
 	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='reaction_actions_schema'"); err != nil {
+		return 0, err
+	}
 	if err = s.checkReactionAction(ctx, tx, owner, profile, now); err != nil {
 		return 0, err
 	}

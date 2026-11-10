@@ -20,7 +20,7 @@ const debugAuditSchema = `CREATE TABLE IF NOT EXISTS debug_api_calls (
  request_body BLOB NOT NULL, response_body BLOB NOT NULL DEFAULT X'', http_status INTEGER NOT NULL DEFAULT 0,
  state TEXT NOT NULL CHECK(state IN ('sending','received','rejected','cancelled','unknown')),
  error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
- updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(owner_id,request_id)
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, action_id INTEGER REFERENCES actions(id) ON DELETE SET NULL, UNIQUE(owner_id,request_id)
 );`
 
 type debugCall struct {
@@ -295,7 +295,7 @@ func (d *debugHTTP) write(w http.ResponseWriter, r *http.Request, ss Session, re
 		}
 		return
 	}
-	if reaction == 1 {
+	if reaction == 1 || reaction == 3 {
 		mu := s.Store.SessionMutex(owner)
 		mu.Lock()
 		archiveErr := s.Client.debugBinding(r.Context(), owner, ss)
@@ -319,7 +319,7 @@ func (d *debugHTTP) write(w http.ResponseWriter, r *http.Request, ss Session, re
 			return
 		}
 		// Keep the shared ledger and send the exact text logged for this explicit request.
-		result, err := s.Client.LikeWithMessageGuarded(r.Context(), owner, target, request.Message, func(ctx context.Context) error {
+		result, err := s.Client.PositiveReactionGuarded(context.WithValue(r.Context(), positiveAuditContextKey{}, call.ID), owner, target, PositiveReactionType(reaction), &request.Message, func(ctx context.Context) error {
 			if e := s.Client.debugBinding(ctx, owner, ss); e != nil {
 				return e
 			}
@@ -345,7 +345,7 @@ func (d *debugHTTP) write(w http.ResponseWriter, r *http.Request, ss Session, re
 			state = "rejected"
 			reason = upstream.Kind
 		}
-		if errors.Is(e, ErrActionBlocked) || errors.Is(e, ErrOwnLikeLimit) || errors.Is(e, ErrReactionPaused) || errors.Is(e, ErrReactionDisabled) || errors.Is(e, ErrReactionSessionChanged) || errors.Is(e, ErrAccountFrozen) {
+		if errors.Is(e, ErrActionBlocked) || errors.Is(e, ErrOwnLikeLimit) || errors.Is(e, ErrReactionPaused) || errors.Is(e, ErrReactionDisabled) || errors.Is(e, ErrReactionSessionChanged) || errors.Is(e, ErrAccountFrozen) || errors.Is(e, ErrReactionFireUnavailable) || errors.Is(e, ErrReactionFireUnknown) || errors.Is(e, ErrPositiveSpacing) || errors.Is(e, ErrReactionMessageTargetAge) || errors.Is(e, ErrReactionMessageReviewHold) || errors.Is(e, ErrInvalidReactionMessage) {
 			state = "cancelled"
 			reason = "action_preflight_rejected"
 		}

@@ -15,7 +15,7 @@ const reactionMessageSchema = `
 CREATE TABLE IF NOT EXISTS reaction_message_settings (
  owner_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
  mode TEXT NOT NULL DEFAULT 'off' CHECK(mode IN ('off','first','rotate','birthday')),
- templates_json TEXT NOT NULL DEFAULT '[]', telegram_username TEXT NOT NULL DEFAULT '', prefer_drafts INTEGER NOT NULL DEFAULT 0 CHECK(prefer_drafts IN (0,1)), iron_mix INTEGER NOT NULL DEFAULT 0 CHECK(iron_mix IN (0,1)), next_cursor INTEGER NOT NULL DEFAULT 0 CHECK(next_cursor>=0),
+ templates_json TEXT NOT NULL DEFAULT '[]', telegram_username TEXT NOT NULL DEFAULT '', prefer_drafts INTEGER NOT NULL DEFAULT 0 CHECK(prefer_drafts IN (0,1)), iron_mix INTEGER NOT NULL DEFAULT 0 CHECK(iron_mix IN (0,1)), super_before_age INTEGER NOT NULL DEFAULT 0 CHECK(super_before_age=0 OR super_before_age BETWEEN 18 AND 112), next_cursor INTEGER NOT NULL DEFAULT 0 CHECK(next_cursor>=0),
  revision INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS reaction_message_intents (
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS reaction_message_intents (
  owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  upstream_id INTEGER NOT NULL, profile_id INTEGER NOT NULL, generation TEXT NOT NULL,
  message TEXT NOT NULL, request_body BLOB NOT NULL, message_mode TEXT NOT NULL,
- policy_revision INTEGER NOT NULL, template_index INTEGER NOT NULL, reserved_cursor INTEGER NOT NULL DEFAULT -1,
+ policy_revision INTEGER NOT NULL, template_index INTEGER NOT NULL, reserved_cursor INTEGER NOT NULL DEFAULT -1, reaction_type INTEGER NOT NULL DEFAULT 1 CHECK(reaction_type IN (1,3)), attempted_at_ms INTEGER NOT NULL DEFAULT 0,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );`
 
@@ -39,6 +39,7 @@ type ReactionMessagePolicy struct {
 	TelegramUsername string   `json:"telegram_username"`
 	PreferDrafts     bool     `json:"prefer_drafts"`
 	IronMix          bool     `json:"iron_mix"`
+	SuperBeforeAge   int      `json:"super_before_age"`
 	Selection        string   `json:"selection"`
 	NextCursor       int64    `json:"next_cursor"`
 	Revision         int64    `json:"revision"`
@@ -95,13 +96,38 @@ func (s *Store) initReactionMessages(ctx context.Context) error {
 			}
 		}
 	}
+	var present int
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_settings') WHERE name='super_before_age'").Scan(&present); err != nil {
+		return err
+	}
+	if present == 0 {
+		if _, err = tx.ExecContext(ctx, "ALTER TABLE reaction_message_settings ADD COLUMN super_before_age INTEGER NOT NULL DEFAULT 0 CHECK(super_before_age=0 OR super_before_age BETWEEN 18 AND 112)"); err != nil {
+			return err
+		}
+	}
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_intents') WHERE name='reaction_type'").Scan(&present); err != nil {
+		return err
+	}
+	if present == 0 {
+		if _, err = tx.ExecContext(ctx, "ALTER TABLE reaction_message_intents ADD COLUMN reaction_type INTEGER NOT NULL DEFAULT 1 CHECK(reaction_type IN (1,3))"); err != nil {
+			return err
+		}
+	}
+	if err = tx.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_intents') WHERE name='attempted_at_ms'").Scan(&present); err != nil {
+		return err
+	}
+	if present == 0 {
+		if _, err = tx.ExecContext(ctx, "ALTER TABLE reaction_message_intents ADD COLUMN attempted_at_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
 func scanReactionMessagePolicy(row interface{ Scan(...any) error }, owner int64) (ReactionMessagePolicy, error) {
 	p := ReactionMessagePolicy{OwnerID: owner, Mode: "off", Templates: []string{}, Selection: "off"}
 	var raw string
-	err := row.Scan(&p.Mode, &raw, &p.TelegramUsername, &p.PreferDrafts, &p.IronMix, &p.NextCursor, &p.Revision)
+	err := row.Scan(&p.Mode, &raw, &p.TelegramUsername, &p.PreferDrafts, &p.IronMix, &p.SuperBeforeAge, &p.NextCursor, &p.Revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, nil
 	}
@@ -116,6 +142,12 @@ func scanReactionMessagePolicy(row interface{ Scan(...any) error }, owner int64)
 	}
 	if err = validateReactionMessagePolicy(p.Mode, p.Templates, p.TelegramUsername); err != nil {
 		return p, err
+	}
+	if !validSuperBeforeAge(p.SuperBeforeAge) {
+		return p, errors.New("неверное правило суперлайков")
+	}
+	if p.SuperBeforeAge != 0 && p.Mode == "off" {
+		return p, errors.New("для суперлайков включи сообщения")
 	}
 	if p.PreferDrafts && p.Mode != "birthday" {
 		return p, errors.New("reviewed drafts require birthday fallback mode")
@@ -137,7 +169,7 @@ func (s *Store) ReactionMessagePolicy(ctx context.Context, owner int64) (Reactio
 	if err := s.initReactionMessages(ctx); err != nil {
 		return ReactionMessagePolicy{}, err
 	}
-	return scanReactionMessagePolicy(s.DB.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	return scanReactionMessagePolicy(s.DB.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,super_before_age,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 }
 
 // Saving templates never starts a worker or sends a reaction.
@@ -161,6 +193,7 @@ type ReactionMessagePolicyConfig struct {
 	TelegramUsername string   `json:"telegram_username"`
 	PreferDrafts     bool     `json:"prefer_drafts"`
 	IronMix          bool     `json:"iron_mix"`
+	SuperBeforeAge   int      `json:"super_before_age"`
 }
 
 func (s *Store) ConfigureReactionMessagePolicy(ctx context.Context, owner int64, config ReactionMessagePolicyConfig) (ReactionMessagePolicy, error) {
@@ -168,6 +201,12 @@ func (s *Store) ConfigureReactionMessagePolicy(ctx context.Context, owner int64,
 		return ReactionMessagePolicy{}, errors.New("неверный владелец")
 	}
 	mode, templates, telegramUsername := config.Mode, config.Templates, config.TelegramUsername
+	if !validSuperBeforeAge(config.SuperBeforeAge) {
+		return ReactionMessagePolicy{}, errors.New("правило суперлайков: 0 или возраст от 18 до 112")
+	}
+	if config.SuperBeforeAge != 0 && mode == "off" {
+		return ReactionMessagePolicy{}, errors.New("для суперлайков включи сообщения")
+	}
 	if config.PreferDrafts && mode != "birthday" {
 		return ReactionMessagePolicy{}, errors.New("reviewed drafts require birthday fallback mode")
 	}
@@ -189,12 +228,12 @@ func (s *Store) ConfigureReactionMessagePolicy(ctx context.Context, owner int64,
 		return ReactionMessagePolicy{}, err
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx, `INSERT INTO reaction_message_settings(owner_id,mode,templates_json,telegram_username,prefer_drafts,iron_mix) VALUES(?,?,?,?,?,?)
- ON CONFLICT(owner_id) DO UPDATE SET mode=excluded.mode,templates_json=excluded.templates_json,telegram_username=excluded.telegram_username,prefer_drafts=excluded.prefer_drafts,iron_mix=excluded.iron_mix,next_cursor=0,revision=reaction_message_settings.revision+1,updated_at=CURRENT_TIMESTAMP`, owner, mode, string(raw), telegramUsername, config.PreferDrafts, config.IronMix)
+	_, err = tx.ExecContext(ctx, `INSERT INTO reaction_message_settings(owner_id,mode,templates_json,telegram_username,prefer_drafts,iron_mix,super_before_age) VALUES(?,?,?,?,?,?,?)
+ ON CONFLICT(owner_id) DO UPDATE SET mode=excluded.mode,templates_json=excluded.templates_json,telegram_username=excluded.telegram_username,prefer_drafts=excluded.prefer_drafts,iron_mix=excluded.iron_mix,super_before_age=excluded.super_before_age,next_cursor=0,revision=reaction_message_settings.revision+1,updated_at=CURRENT_TIMESTAMP`, owner, mode, string(raw), telegramUsername, config.PreferDrafts, config.IronMix, config.SuperBeforeAge)
 	if err != nil {
 		return ReactionMessagePolicy{}, err
 	}
-	p, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	p, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,super_before_age,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 	if err != nil {
 		return p, err
 	}
@@ -203,6 +242,10 @@ func (s *Store) ConfigureReactionMessagePolicy(ctx context.Context, owner int64,
 
 // Commit the exact outgoing intent and rotation together before the sole POST.
 func (s *Store) prepareLikeMessage(ctx context.Context, owner, action int64, target StoredProfile, expected Session, explicit *string) ([]byte, error) {
+	return s.preparePositiveMessage(ctx, owner, action, target, expected, explicit, PositiveLike, false)
+}
+
+func (s *Store) preparePositiveMessage(ctx context.Context, owner, action int64, target StoredProfile, expected Session, explicit *string, kind PositiveReactionType, automatic bool) ([]byte, error) {
 	if err := s.initReactionMessages(ctx); err != nil {
 		return nil, err
 	}
@@ -253,15 +296,42 @@ func (s *Store) prepareLikeMessage(ctx context.Context, owner, action int64, tar
 	if err = reactionDraftHoldTx(ctx, tx, owner, session.UserID, target.ID); err != nil {
 		return nil, err
 	}
+	age, knownAge := autoInteger(currentTarget["age"])
+	if !knownAge || age < 18 || age > 111 || birthdayGreetingMinorDOB(currentTarget, time.Now().UTC()) {
+		return nil, ErrReactionMessageTargetAge
+	}
+	policy, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,super_before_age,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	if err != nil {
+		return nil, err
+	}
+	if automatic {
+		kind = positiveReactionForAge(age, policy.SuperBeforeAge)
+		filters, e := s.currentPositiveFiltersTx(ctx, tx, owner, session.UserID)
+		if e != nil {
+			return nil, e
+		}
+		if age < filters.AgeMin || age > filters.AgeMax {
+			return nil, errors.New("анкета вне текущего возраста поиска")
+		}
+	}
+	if kind != PositiveLike && kind != PositiveSuperLike {
+		return nil, errors.New("invalid positive reaction")
+	}
+	if automatic && kind == PositiveLike {
+		var fireWait bool
+		if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM actions WHERE owner_id=? AND profile_id=? AND kind='Like' AND state='fire_waiting')", owner, target.ID).Scan(&fireWait); err != nil {
+			return nil, err
+		}
+		if fireWait {
+			return nil, ErrReactionFireUnavailable
+		}
+	}
 	mode, message, slot, revision := "explicit", "", int64(-1), int64(0)
 	reservedCursor := int64(-1)
 	if explicit != nil {
 		message = *explicit
 	} else {
-		p, e := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
-		if e != nil {
-			return nil, e
-		}
+		p := policy
 		mode, revision = p.Mode, p.Revision
 		if mode == "birthday" {
 			age, known := autoInteger(currentTarget["age"])
@@ -312,12 +382,42 @@ func (s *Store) prepareLikeMessage(ctx context.Context, owner, action int64, tar
 			return nil, ErrReactionMessageTargetAge
 		}
 	}
-	request, err := json.Marshal(map[string]any{"reactionType": 1, "isDeleted": false, "userId": target.ID, "fromUserId": session.UserID, "message": message})
+	if kind == PositiveSuperLike {
+		if strings.TrimSpace(message) == "" {
+			return nil, ErrInvalidReactionMessage
+		}
+		var ownRaw string
+		if err = tx.QueryRowContext(ctx, "SELECT account_json FROM sessions WHERE owner_id=?", owner).Scan(&ownRaw); err != nil {
+			return nil, err
+		}
+		own, e := decodeProfile([]byte(ownRaw))
+		if e != nil || own.ID() != session.UserID {
+			return nil, ErrReactionSessionChanged
+		}
+		fire, known := autoInteger(own["fire"])
+		if !known || fire < 0 {
+			return nil, ErrReactionFireUnknown
+		}
+		if fire == 0 {
+			return nil, ErrReactionFireUnavailable
+		}
+	}
+	request, err := json.Marshal(map[string]any{"reactionType": kind, "isDeleted": false, "userId": target.ID, "fromUserId": session.UserID, "message": message})
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO reaction_message_intents(action_id,owner_id,upstream_id,profile_id,generation,message,request_body,message_mode,policy_revision,template_index,reserved_cursor) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, action, owner, session.UserID, target.ID, session.Generation, message, request, mode, revision, slot, reservedCursor); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO reaction_message_intents(action_id,owner_id,upstream_id,profile_id,generation,message,request_body,message_mode,policy_revision,template_index,reserved_cursor,reaction_type) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, action, owner, session.UserID, target.ID, session.Generation, message, request, mode, revision, slot, reservedCursor, kind); err != nil {
 		return nil, err
+	}
+	if audit := claimedPositiveAuditID(ctx); audit > 0 {
+		r, e := tx.ExecContext(ctx, `UPDATE debug_api_calls SET action_id=? WHERE id=? AND owner_id=? AND upstream_id=? AND target_id=? AND reaction_type=? AND state='sending' AND action_id IS NULL AND request_body=?`, action, audit, owner, session.UserID, target.ID, kind, request)
+		if e != nil {
+			return nil, e
+		}
+		n, e := r.RowsAffected()
+		if e != nil || n != 1 {
+			return nil, errors.New("debug positive intent binding changed")
+		}
 	}
 	return request, tx.Commit()
 }

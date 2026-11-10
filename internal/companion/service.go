@@ -821,6 +821,12 @@ func (s *Service) manualLikeFailure(ctx context.Context, owner, id int64, err er
 		return "Сессия Jardulik изменилась. Лайк не отправлен. Проверь /status."
 	case errors.Is(err, ErrOwnLikeLimit):
 		return "Достигнут твой лимит отправок за 24 часа. Настройки: /settings."
+	case errors.Is(err, ErrPositiveSpacing):
+		return "Между отправками нужно подождать 60 секунд."
+	case errors.Is(err, ErrReactionFireUnavailable):
+		return "Огонь закончился. Суперлайк не отправлен."
+	case errors.Is(err, ErrReactionFireUnknown):
+		return "Не удалось подтвердить остаток Огня. Суперлайк не отправлен."
 	}
 	var blocked *ActionBlockedError
 	if errors.As(err, &blocked) {

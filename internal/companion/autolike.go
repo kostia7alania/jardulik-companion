@@ -199,7 +199,7 @@ func (s *Service) AutolikeStatus(ctx context.Context, owner int64) string {
 }
 func autoReason(reason string) string {
 	labels := map[string]string{"paused": "Пауза.", "stopped": "Остановлен.", "user_off": "Выключен вручную.", "series_done": "Серия завершена.", "quota": "Ожидание срока сервиса.", "own_cap": "Достигнут мой лимит /24ч.", "feed_empty": "Выдача закончилась.", "uncertain": "Результат неизвестен; повтор выключен.", "disconnected": "Нужно переподключение.", "reaction_failed": "Отправка остановлена.", "source_failed": "Источник недоступен.", "disk": "Недостаточно свободного места."}
-	more := map[string]string{"manual_off": "Выключен вручную.", "disabled": "Лайки сейчас выключены.", "filters_unavailable": "Не удалось прочитать фильтры.", "settings_changed": "Настройки или сессия изменились; включи режим заново.", "page_cap": "Достигнут предел страниц.", "invalid_profiles": "Формат выдачи изменился.", "archive_failed": "Не удалось сохранить выдачу.", "repeated_page": "Источник повторяет страницу.", "invalid_settings": "Настройки недоступны; открой /settings."}
+	more := map[string]string{"manual_off": "Выключен вручную.", "disabled": "Лайки сейчас выключены.", "filters_unavailable": "Не удалось прочитать фильтры.", "settings_changed": "Настройки или сессия изменились; включи режим заново.", "page_cap": "Достигнут предел страниц.", "invalid_profiles": "Формат выдачи изменился.", "archive_failed": "Не удалось сохранить выдачу.", "repeated_page": "Источник повторяет страницу.", "invalid_settings": "Настройки недоступны; открой /settings.", "fire_unavailable": "Огонь закончился. Отправка остановлена; обычным лайком не заменяю.", "fire_unknown": "Остаток Огня неизвестен. Отправка остановлена.", "spacing": "Пауза между отправками: минимум 60 с."}
 	if text := labels[reason]; text != "" {
 		return text
 	}
@@ -287,14 +287,15 @@ func (s *Service) ManualLikeBudgetGuard(ctx context.Context, owner int64) error 
 	if count >= j.DailyCap {
 		return &OwnLikeLimitError{Limit: j.DailyCap, RetryAt: next}
 	}
-	return nil
+	return s.Store.checkPositiveBudget(ctx, owner, a.now(), false)
 }
 
 func (a *Autoliker) budget(ctx context.Context, owner int64) (int, time.Time, error) {
-	var count int
-	var oldest sql.NullInt64
-	err := a.Service.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*),MIN(CAST(strftime('%s',created_at) AS INTEGER)) FROM actions WHERE owner_id=? AND kind='Like' AND state IN ('pending','processing','succeeded','unknown') AND datetime(created_at)>datetime(?,'-24 hours') AND id<>?`, owner, a.now().UTC().Format("2006-01-02 15:04:05"), ClaimedLikeActionID(ctx)).Scan(&count, &oldest)
-	return count, time.Unix(oldest.Int64, 0).Add(24*time.Hour + time.Second), err
+	if err := a.Service.Store.initReactionMessages(ctx); err != nil {
+		return 0, time.Time{}, err
+	}
+	budget, err := a.Service.Store.positiveBudget(ctx, owner, a.now())
+	return budget.Count, budget.RetryAt, err
 }
 func (a *Autoliker) wait(ctx context.Context, j *AutoSettings, reason string, next time.Time) error {
 	_, err := a.Service.Store.DB.ExecContext(ctx, "UPDATE autolike_settings SET state='waiting',reason=?,next_attempt=? WHERE owner_id=? AND run_id=? AND mode<>'off'", reason, next.UnixMilli(), j.Owner, j.RunID)
@@ -444,6 +445,17 @@ func (a *Autoliker) Step(ctx context.Context) (bool, error) {
 			return true, err
 		}
 	}
+	if e := s.Store.checkPositiveBudget(ctx, j.Owner, a.now(), false); e != nil {
+		var spacing *PositiveSpacingError
+		var cap *OwnLikeLimitError
+		if errors.As(e, &spacing) {
+			return true, a.wait(ctx, j, "spacing", spacing.RetryAt)
+		}
+		if errors.As(e, &cap) {
+			return true, a.wait(ctx, j, "own_cap", cap.RetryAt)
+		}
+		return stop("reaction_failed")
+	}
 	if count, next, e := a.budget(ctx, j.Owner); e != nil {
 		return true, e
 	} else if count >= j.DailyCap {
@@ -489,7 +501,15 @@ func (a *Autoliker) Step(ctx context.Context) (bool, error) {
 		return true, a.candidateState(ctx, j, c.id, "skipped")
 	}
 	if err = a.guard(ctx, j); err != nil {
-		return stop("settings_changed")
+		var spacing *PositiveSpacingError
+		var cap *OwnLikeLimitError
+		if errors.As(err, &spacing) {
+			return true, a.wait(ctx, j, "spacing", spacing.RetryAt)
+		}
+		if errors.As(err, &cap) {
+			return true, a.wait(ctx, j, "own_cap", cap.RetryAt)
+		}
+		return a.guardStopped(ctx, j, err, "settings_changed")
 	}
 	sessionMu := s.Store.SessionMutex(j.Owner)
 	sessionMu.Lock()
@@ -499,13 +519,39 @@ func (a *Autoliker) Step(ctx context.Context) (bool, error) {
 	}
 	sessionMu.Unlock()
 	if err != nil {
+		var spacing *PositiveSpacingError
+		var cap *OwnLikeLimitError
+		if errors.As(err, &spacing) {
+			return true, a.wait(ctx, j, "spacing", spacing.RetryAt)
+		}
+		if errors.As(err, &cap) {
+			return true, a.wait(ctx, j, "own_cap", cap.RetryAt)
+		}
 		return stop("source_failed")
 	}
 	if err = a.candidateState(ctx, j, c.id, "sending"); err != nil {
 		return true, err
 	}
-	result, err := s.Client.LikeGuarded(ctx, j.Owner, c.id, func(ctx context.Context) error { return a.guard(ctx, j) })
+	dispatchCtx := context.WithValue(ctx, automaticDispatchContextKey{}, automaticDispatchBinding{Owner: j.Owner, RunID: j.RunID, Generation: j.Generation, Upstream: j.UserID, FilterHash: j.FilterHash})
+	result, err := s.Client.AutomaticLikeGuarded(dispatchCtx, j.Owner, c.id, func(ctx context.Context) error { return a.guard(ctx, j) })
 	if err != nil {
+		var cap *OwnLikeLimitError
+		if errors.As(err, &cap) {
+			_ = a.candidateState(context.WithoutCancel(ctx), j, c.id, "pending")
+			return true, a.wait(ctx, j, "own_cap", cap.RetryAt)
+		}
+		var spacing *PositiveSpacingError
+		if errors.As(err, &spacing) {
+			_ = a.candidateState(context.WithoutCancel(ctx), j, c.id, "pending")
+			return true, a.wait(ctx, j, "spacing", spacing.RetryAt)
+		}
+		if errors.Is(err, ErrReactionFireUnavailable) || errors.Is(err, ErrReactionFireUnknown) {
+			_ = a.candidateState(context.WithoutCancel(ctx), j, c.id, "pending")
+			if errors.Is(err, ErrReactionFireUnavailable) {
+				return stop("fire_unavailable")
+			}
+			return stop("fire_unknown")
+		}
 		_ = a.candidateState(context.WithoutCancel(ctx), j, c.id, "blocked")
 		return stop("reaction_failed")
 	}
@@ -538,6 +584,10 @@ func (a *Autoliker) Step(ctx context.Context) (bool, error) {
 		}
 		return true, a.wait(ctx, j, "quota", result.RetryAt.Add(time.Second))
 	}
+	if result.Decision == ReactionFireUnavailable {
+		_ = a.candidateState(ctx, j, c.id, "blocked")
+		return stop("fire_unavailable")
+	}
 	if result.Decision == ReactionExhausted {
 		if err = a.candidateState(ctx, j, c.id, "blocked"); err != nil {
 			return true, err
@@ -566,13 +616,13 @@ func (a *Autoliker) loadPage(ctx context.Context, j *AutoSettings, session Sessi
 		return stop("source_failed")
 	}
 	if err = a.guard(ctx, j); err != nil {
-		return stop("settings_changed")
+		return a.guardStopped(ctx, j, err, "settings_changed")
 	}
 	sessionMu := s.Store.SessionMutex(j.Owner)
 	sessionMu.Lock()
 	defer sessionMu.Unlock()
 	if err = a.guard(ctx, j); err != nil {
-		return stop("settings_changed")
+		return a.guardStopped(ctx, j, err, "settings_changed")
 	}
 	if err = s.Media.CheckDisk(); err != nil {
 		return stop("disk")
@@ -622,4 +672,16 @@ func (a *Autoliker) loadPage(ctx context.Context, j *AutoSettings, session Sessi
 		return true, err
 	}
 	return true, tx.Commit()
+}
+
+func (a *Autoliker) guardStopped(ctx context.Context, j *AutoSettings, err error, fallback string) (bool, error) {
+	var spacing *PositiveSpacingError
+	var cap *OwnLikeLimitError
+	if errors.As(err, &spacing) {
+		return true, a.wait(ctx, j, "spacing", spacing.RetryAt)
+	}
+	if errors.As(err, &cap) {
+		return true, a.wait(ctx, j, "own_cap", cap.RetryAt)
+	}
+	return true, a.Service.DisableAutolike(context.WithoutCancel(ctx), j.Owner, fallback)
 }

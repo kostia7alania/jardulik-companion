@@ -1199,13 +1199,13 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		{"deletions", "deletion", "SELECT owner_id,deleted_at FROM deletions"},
 		{"sessions", "connection", "SELECT owner_id,upstream_id,state FROM sessions"},
 		{"favorites", "favorite", "SELECT owner_id,profile_id,created_at FROM favorites"},
-		{"actions", "reaction", `SELECT owner_id,profile_id,kind,state,response,created_at FROM actions WHERE state IN ('pending','succeeded','unknown','quota_waiting','quota_retried')`},
+		{"actions", "reaction", `SELECT owner_id,profile_id,kind,state,response,created_at FROM actions WHERE state IN ('pending','succeeded','unknown','quota_waiting','quota_retried','fire_waiting')`},
 		{"feed_filters", "filters", `SELECT owner_id,applied_json,include_others FROM feed_filters WHERE applied_json IS NOT NULL OR include_others<>0`},
 		{"autolike_settings", "autolike", "SELECT owner_id,mode,interval_seconds,series_count,daily_cap FROM autolike_settings"},
 		{"reaction_message_settings", "reaction-message-policy", "SELECT owner_id,mode,templates_json,telegram_username,revision FROM reaction_message_settings"},
 		{"reaction_message_hold_resolutions", "reaction-message-hold-resolution", "SELECT draft_id,owner_id,upstream_id,profile_id,evidence_json,evidence_sha FROM reaction_message_hold_resolutions"},
 		{"reaction_message_drafts", "reaction-message-draft", "SELECT owner_id,upstream_id,profile_id,telegram_username,content_hash,basis_hash,state,message,capture_json,capture_sha FROM reaction_message_drafts"},
-		{"reaction_message_intents", "reaction-message-intent", "SELECT action_id,owner_id,upstream_id,profile_id,generation,message,request_body,message_mode,policy_revision,template_index,reserved_cursor FROM reaction_message_intents"},
+		{"reaction_message_intents", "reaction-message-intent", "SELECT action_id,owner_id,upstream_id,profile_id,generation,message,request_body,message_mode,policy_revision,template_index,reserved_cursor,reaction_type,attempted_at_ms FROM reaction_message_intents"},
 		{"profile_contact_evidence", "contact", "SELECT owner_id,upstream_id,profile_id,source_bot_id,source_peer_id,source_locator_kind,source_message_locator,source_message_timestamp,contact_url,profile_url,evidence_kind FROM profile_contact_evidence"},
 		{"business_contact_connections", "business-connection", "SELECT owner_id,upstream_id,id,enabled FROM business_contact_connections"},
 		{"profile_business_contacts", "business-contact", "SELECT DISTINCT owner_id,upstream_id,profile_id,source_bot_id,connection_id,source_message_id,source_message_timestamp,contact_url,profile_url FROM profile_business_contacts"},
@@ -1213,7 +1213,7 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		{"profile_analyses", "analysis", "SELECT owner_id,upstream_id,profile_id,provider,model,observed_at_ms,http_status,state,generation,request_body,response_body,own_profile,target_profile,capture_sha FROM profile_analyses"},
 		{"compatibility_pairs", "compatibility-pair", "SELECT owner_id,from_user_id,target_user_id,latest_analysis_id FROM compatibility_pairs"},
 		{"compatibility_jobs", "compatibility-job", "SELECT pair_id,generation,version_id,own_hash,target_hash,input_hash,filter_hash,own_profile,target_profile,request_body,response_body,http_status,state,analysis_id,reason FROM compatibility_jobs"},
-		{"debug_api_calls", "debug-api-call", "SELECT owner_id,request_id,upstream_id,generation,path,target_id,reaction_type,request_body,response_body,http_status,state,error FROM debug_api_calls"},
+		{"debug_api_calls", "debug-api-call", "SELECT owner_id,request_id,upstream_id,generation,path,target_id,reaction_type,request_body,response_body,http_status,state,error,action_id FROM debug_api_calls"},
 		{"business_contact_inbox", "business-contact-inbox", "SELECT owner_id,upstream_id,source_bot_id,connection_id,source_message_id,source_message_timestamp,update_id,parse_state,CAST(raw_json AS BLOB) FROM business_contact_inbox"},
 	}
 	for _, q := range queries {
@@ -1226,7 +1226,7 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		}
 		if q.table == "reaction_message_settings" {
 			q.query = "SELECT owner_id,mode,templates_json,telegram_username"
-			for _, column := range []string{"prefer_drafts", "iron_mix"} {
+			for _, column := range []string{"prefer_drafts", "iron_mix", "super_before_age"} {
 				var present int
 				if err = db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_settings') WHERE name=?", column).Scan(&present); err != nil {
 					return nil, err
@@ -1236,6 +1236,35 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 				}
 			}
 			q.query += ",revision FROM reaction_message_settings"
+		}
+		if q.table == "reaction_message_intents" || q.table == "debug_api_calls" {
+			if q.table == "reaction_message_intents" {
+				var present int
+				if err = db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_intents') WHERE name='attempted_at_ms'").Scan(&present); err != nil {
+					return nil, err
+				}
+				if present == 0 {
+					q.query = strings.Replace(q.query, ",attempted_at_ms FROM", ",0 AS attempted_at_ms FROM", 1)
+				}
+			}
+			column := "reaction_type"
+			if q.table == "debug_api_calls" {
+				column = "action_id"
+			}
+			var present int
+			if err = db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('"+q.table+"') WHERE name=?", column).Scan(&present); err != nil {
+				return nil, err
+			}
+			if present == 0 {
+				fallback := "1 AS reaction_type"
+				if column == "action_id" {
+					fallback = "NULL AS action_id"
+				}
+				q.query = strings.Replace(q.query, ","+column+",", ","+fallback+",", 1)
+				if column == "action_id" {
+					q.query = strings.Replace(q.query, ",action_id FROM", ",NULL AS action_id FROM", 1)
+				}
+			}
 		}
 		rows, err := db.QueryContext(ctx, q.query)
 		if err != nil {

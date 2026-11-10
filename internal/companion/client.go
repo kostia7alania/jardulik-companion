@@ -614,16 +614,40 @@ func (c *Client) Like(ctx context.Context, owner, id int64) (ReactionResult, err
 }
 
 func (c *Client) LikeGuarded(ctx context.Context, owner, id int64, guard func(context.Context) error) (ReactionResult, error) {
-	return c.likeGuarded(ctx, owner, id, nil, guard)
+	return c.PositiveReactionGuarded(ctx, owner, id, PositiveLike, nil, guard)
 }
 
 // An explicit message, including an empty string, never consumes the owner's rotation.
 func (c *Client) LikeWithMessageGuarded(ctx context.Context, owner, id int64, message string, guard func(context.Context) error) (ReactionResult, error) {
-	return c.likeGuarded(ctx, owner, id, &message, guard)
+	return c.PositiveReactionGuarded(ctx, owner, id, PositiveLike, &message, guard)
 }
 
-func (c *Client) likeGuarded(ctx context.Context, owner, id int64, explicit *string, guard func(context.Context) error) (ReactionResult, error) {
+func (c *Client) PositiveReactionGuarded(ctx context.Context, owner, id int64, kind PositiveReactionType, explicit *string, guard func(context.Context) error) (ReactionResult, error) {
+	if kind != PositiveLike && kind != PositiveSuperLike {
+		return ReactionResult{Decision: ReactionUnknown}, errors.New("invalid positive reaction")
+	}
+	return c.positiveGuarded(ctx, owner, id, kind, false, explicit, guard)
+}
+
+func (c *Client) AutomaticLikeGuarded(ctx context.Context, owner, id int64, guard func(context.Context) error) (ReactionResult, error) {
+	return c.positiveGuarded(ctx, owner, id, PositiveLike, true, nil, guard)
+}
+
+func (c *Client) positiveGuarded(ctx context.Context, owner, id int64, kind PositiveReactionType, automatic bool, explicit *string, guard func(context.Context) error) (ReactionResult, error) {
 	out := ReactionResult{Decision: ReactionUnknown}
+	if kind == PositiveSuperLike {
+		ctx = context.WithValue(ctx, positiveSpacingContextKey{}, true)
+	}
+	extraGuard := guard
+	guard = func(checkCtx context.Context) error {
+		if e := c.Store.checkPositiveBudget(checkCtx, owner, c.Now(), false); e != nil {
+			return e
+		}
+		if extraGuard != nil {
+			return extraGuard(checkCtx)
+		}
+		return nil
+	}
 	if explicit != nil {
 		if err := validateReactionMessage(*explicit); err != nil {
 			return out, err
@@ -715,7 +739,7 @@ func (c *Client) likeGuarded(ctx context.Context, owner, id int64, explicit *str
 	if err = ctx.Err(); err != nil {
 		return release(err)
 	}
-	request, err := c.Store.prepareLikeMessage(ctx, owner, action, target, current, explicit)
+	request, err := c.Store.preparePositiveMessage(ctx, owner, action, target, current, explicit, kind, automatic)
 	if err != nil {
 		return release(err)
 	}
@@ -736,6 +760,9 @@ func (c *Client) likeGuarded(ctx context.Context, owner, id int64, explicit *str
 		return release(ErrReactionSessionChanged)
 	}
 	if err = ctx.Err(); err != nil {
+		return release(err)
+	}
+	if err = c.Store.markPositiveAttempt(ctx, owner, action, current, automatic, c.Now); err != nil {
 		return release(err)
 	}
 	body, err := c.exchange(ctx, http.MethodPost, "/reactions/addNew", current.Token, json.RawMessage(request))
@@ -762,6 +789,14 @@ func (c *Client) likeGuarded(ctx context.Context, owner, id int64, explicit *str
 		state = "succeeded"
 	} else if out.Decision == ReactionQuota {
 		state = "quota_waiting"
+	} else if out.Decision == ReactionFireUnavailable {
+		var wire struct {
+			Kind int64 `json:"reactionType"`
+		}
+		_ = json.Unmarshal(request, &wire)
+		if wire.Kind == 3 {
+			state = "fire_waiting"
+		}
 	}
 	if err = c.Store.finishReactionAction(writeCtx, action, state, body, out.RetryAt); err != nil {
 		c.Store.Pause(writeCtx, owner, true)
