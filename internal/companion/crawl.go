@@ -333,27 +333,47 @@ func (c *FeedCrawler) Run(ctx context.Context) {
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	for ctx.Err() == nil {
-		if _, err := c.ScheduleDaily(ctx); err != nil {
-			if ctx.Err() == nil {
-				slog.Warn("daily crawl scheduler stopped", "kind", safeError(err))
-			}
-			return
+		delay, stage := time.Second, "schedule"
+		_, err = c.ScheduleDaily(ctx)
+		if err == nil {
+			stage = "step"
+			_, err = c.Step(ctx)
 		}
-		if _, err := c.Step(ctx); err != nil {
-			if ctx.Err() == nil {
-				slog.Warn("feed crawl worker stopped", "kind", safeError(err))
+		if err != nil {
+			if ctx.Err() != nil {
+				return
 			}
-			return
+			code := 0
+			var coded interface{ Code() int }
+			if errors.As(err, &coded) {
+				code = coded.Code()
+			}
+			message := "feed crawl worker deferred"
+			stopFailed := errors.Is(err, errCrawlStopPersistence)
+			if stopFailed {
+				message = "feed crawl worker stopped"
+			}
+			slog.Warn(message, "kind", safeError(err), "stage", stage,
+				"sqlite_code", code, "error_type", fmt.Sprintf("%T", err))
+			if stopFailed {
+				return
+			}
+			delay = 5 * time.Second
 		}
-		if !sleep(ctx, time.Second) {
+		if !sleep(ctx, delay) {
 			return
 		}
 	}
 }
 
+var errCrawlStopPersistence = errors.New("crawl stop not committed")
+
 func (c *FeedCrawler) stop(ctx context.Context, j *CrawlJob, reason string) error {
 	_, err := c.Service.Store.DB.ExecContext(ctx, "UPDATE feed_crawls SET state='stopped',reason=?,updated_at=? WHERE owner_id=? AND run_id=? AND state IN ('queued','running')", reason, c.now().UnixMilli(), j.Owner, j.RunID)
-	return err
+	if err != nil {
+		return errors.Join(errCrawlStopPersistence, err)
+	}
+	return nil
 }
 
 func (c *FeedCrawler) invalid(ctx context.Context, j *CrawlJob) (string, error) {
@@ -615,6 +635,10 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	defer tx.Rollback()
+	// Reserve the WAL writer before reading a budget shared with other processes.
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='feed_crawl_next'"); err != nil {
+		return false, err
+	}
 	err = tx.QueryRowContext(ctx, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='feed_crawl_next'").Scan(&budget)
 	if err != nil {
 		return false, err

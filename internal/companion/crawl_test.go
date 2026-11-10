@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
@@ -103,6 +104,79 @@ func crawlStep(t *testing.T, c *FeedCrawler, now *time.Time) {
 		t.Fatalf("crawl page failed: handled=%v err=%v", ok, err)
 	}
 	*now = now.Add(crawlGap)
+}
+
+type crawlRunErrorWriter struct{ seen chan struct{} }
+
+func (w crawlRunErrorWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "feed crawl worker") {
+		select {
+		case w.seen <- struct{}{}:
+		default:
+		}
+	}
+	return len(p), nil
+}
+
+func TestCrawlRunRecoversDatabaseFailureWithoutResettingCursor(t *testing.T) {
+	c, _, calls, httpCalls := crawlFixture(t, func(mode, page int) ([]Profile, int) {
+		if mode != 0 || page != 7 {
+			t.Errorf("recovery changed the request: mode=%d page=%d", mode, page)
+		}
+		return nil, 200
+	})
+	c.Service.Config.DailyCrawl = false
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	job, err := c.Request(ctx, 1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.Service.Store.DB.ExecContext(ctx, "UPDATE feed_crawls SET page=7 WHERE owner_id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.Service.Store.DB.ExecContext(ctx, `CREATE TRIGGER fail_crawl_reservation BEFORE UPDATE OF state ON feed_crawls
+ WHEN NEW.state='running' BEGIN SELECT RAISE(ABORT,'temporary database fixture'); END`); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan struct{}, 1)
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(crawlRunErrorWriter{seen}, nil)))
+	done := make(chan struct{})
+	go func() { defer close(done); c.Run(ctx) }()
+	defer func() { cancel(); <-done; slog.SetDefault(previous) }()
+	select {
+	case <-seen:
+	case <-done:
+		t.Fatal("worker exited without reporting the database failure")
+	case <-ctx.Done():
+		t.Fatal("worker never reached the failing reservation")
+	}
+	select {
+	case <-done:
+		t.Fatal("one database error permanently stopped the crawler")
+	default:
+	}
+	if current := crawlJob(t, c); current.RunID != job.RunID || current.Page != 7 || current.State != "queued" {
+		t.Fatal("failed reservation changed the saved run", current)
+	}
+	if _, err = c.Service.Store.DB.ExecContext(ctx, "DROP TRIGGER fail_crawl_reservation"); err != nil {
+		t.Fatal(err)
+	}
+	for crawlJob(t, c).State != "done" {
+		select {
+		case <-done:
+			t.Fatal("worker did not resume after database recovery")
+		case <-ctx.Done():
+			t.Fatal("worker did not finish the saved page after recovery")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	if current := crawlJob(t, c); current.RunID != job.RunID || current.Page != 7 || current.Reason != "empty_page" || len(*calls) != 1 || (*calls)[0].Page != 7 || *httpCalls == 0 {
+		t.Fatal("recovery replayed/reset discovery", current, *calls)
+	}
 }
 
 func TestCrawlRequestIsLocalAtomicAndRespectsPause(t *testing.T) {
