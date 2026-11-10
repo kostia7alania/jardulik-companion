@@ -11,6 +11,8 @@
 - Отдельные факты отправки из `reaction_message_intents` и `actions`: подтверждённый API успех или явно неизвестный исход. Текст буквально берётся из frozen `request_body` и сверяется с `message`, type и identity; текущий Iron или новый handle его не переписывают.
 - Старые unlinked debug SuperLike учитываются только при настоящем `received`, HTTP 200 и успешном JSON-результате. Target 19587 не зашит в код и не считается отправленным без сохранённого подтверждения. Linked debug rows не дублируют intent.
 
+Ссылка получателя явно задаёт forum thread: `https://t.me/c/<chat>/<thread>/<thread>`. При обновлении старого URL меняется только отображаемый payload. Worker исправляет уже опубликованный пост по прежнему message ID; текст открывалки, исходные bytes и source hash не меняются.
+
 Предпросмотр использует те же read-only helpers, что выбор сообщения: `reactionDraftMessageTx`, `birthdayReactionMessage` и `ironMixReactionMessage`. `preparePositiveMessage` не вызывается. Cursor, actions, intents, оригинальные drafts, review и frozen requests не меняются. Предпросмотр не обещает прохождения всех текущих фильтров и разрешений авто; они проверяются обычным dispatch независимо.
 
 Evidence проверяется через `parseReactionDraft`, `capture_sha`, strict8 и owner/account/handle binding. Целиком provenance, сведения об устройствах и имена неподтверждённых моделей не публикуются. Исходные bytes остаются в исходных таблицах; source snapshot предпросмотра сохраняет точные capture bytes, текущую strict8-базу, DOB для локальной проверки и использованный policy. Для fallback архивная заготовка подписывается отдельно от фактического текущего выбора. Подтверждение API Jardulik не означает, что получатель прочитал сообщение или получил его в Telegram.

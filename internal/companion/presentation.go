@@ -36,6 +36,15 @@ func forumTopicURL(chatID, threadID int64) string {
 	return fmt.Sprintf("https://t.me/c/%s/%d", channel, threadID)
 }
 
+// Explicit thread routing avoids opening the chat when a client cannot infer a topic from its service message.
+func forumThreadURL(chatID, threadID int64) string {
+	link := forumTopicURL(chatID, threadID)
+	if link == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/%d", link, threadID)
+}
+
 func profileHeading(v Profile) string {
 	name:=strings.Join(strings.Fields(v.String("name")+" "+v.String("surName"))," ")
 	age,height:=v.String("age"),v.String("height")

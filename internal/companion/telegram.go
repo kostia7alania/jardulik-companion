@@ -63,7 +63,7 @@ func validPostURL(raw string) bool {
 		return false
 	}
 	parts := strings.Split(u.Path, "/")
-	if len(parts) != 4 || parts[0] != "" || parts[1] != "c" {
+	if (len(parts) != 4 && len(parts) != 5) || parts[0] != "" || parts[1] != "c" {
 		return false
 	}
 	for _, part := range parts[2:] {

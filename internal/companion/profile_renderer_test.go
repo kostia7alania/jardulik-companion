@@ -109,6 +109,11 @@ func TestSharedRendererRejectsMissingInvalidRawJSON(t *testing.T) {
 
 func TestPostLinkEntitiesSecureAndSurviveJSONInsertionAndChunks(t *testing.T) {
 	link := "https://t.me/c/123/55"
+	for _, threaded := range []string{"https://t.me/c/123/55/55", "https://t.me/c/123/55/99"} {
+		if err := validMessageEntities("пост", []MessageEntity{{Type: "text_link", Length: 4, URL: threaded}}); err != nil {
+			t.Fatalf("explicit forum thread rejected: %v", err)
+		}
+	}
 	card := photoJSONCardText("Ира🙂\n\nJardulik: 99\n📍 "+link, nil, "", 1024, `{"large":9007199254740993}`)
 	if !card.SourceJSONInline || len(card.Entities) != 2 || !strings.Contains(photoQuoteText(t, card), "9007199254740993") {
 		t.Fatal("JSON insertion assumed only one entity")
@@ -116,7 +121,7 @@ func TestPostLinkEntitiesSecureAndSurviveJSONInsertionAndChunks(t *testing.T) {
 	if err := validMessageEntities(card.Text, card.Entities); err != nil {
 		t.Fatal(err)
 	}
-	for _, bad := range []string{"http://t.me/c/1/2", "https://example.com/c/1/2", "https://t.me/c/1/2?secret=1", "https://t.me/c/1/2#x", "https://t.me/c/0/2", "https://t.me/c/1/2/extra", "https://user@t.me/c/1/2", "https://t.me:443/c/1/2"} {
+	for _, bad := range []string{"http://t.me/c/1/2", "https://example.com/c/1/2", "https://t.me/c/1/2?secret=1", "https://t.me/c/1/2#x", "https://t.me/c/0/2", "https://t.me/c/1/2/extra", "https://t.me/c/1/0/3", "https://t.me/c/1/2/0", "https://t.me/c/1/2/3/4", "https://t.me/c/1/2/3?secret=1", "https://user@t.me/c/1/2", "https://t.me:443/c/1/2"} {
 		if validMessageEntities("пост", []MessageEntity{{Type: "text_link", Length: 4, URL: bad}}) == nil {
 			t.Fatalf("unsafe post URL accepted: %s", bad)
 		}

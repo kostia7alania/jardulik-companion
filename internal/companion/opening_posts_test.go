@@ -152,7 +152,7 @@ func TestOpeningPostsPreviewUsesCurrentRulesWithoutSendingOrMutating(t *testing.
 	}
 	var linked, folded bool
 	for _, e := range last.Entities {
-		linked = linked || e.Type == "text_link" && e.URL == "https://t.me/c/123/110"
+		linked = linked || e.Type == "text_link" && e.URL == "https://t.me/c/123/110/110"
 		folded = folded || e.Type == "expandable_blockquote"
 	}
 	if !linked || !folded {
@@ -381,5 +381,64 @@ func TestOpeningPostsStaleDraftShowsActualFallbackAndRecipe(t *testing.T) {
 	}
 	if err = json.Unmarshal(item.Source, &recipe); err != nil || string(recipe.Capture) != string(original) || recipe.Basis.String("description") != "новое описание" || !recipe.Policy.IronMix {
 		t.Fatal("incomplete preview recipe", err)
+	}
+}
+
+func TestOpeningPostsRefreshRepairsThreadURLWithoutReposting(t *testing.T) {
+	f := newOpeningPostsFixture(t)
+	original := f.addDraft(t, 10, "Ира", "Ира, привет! Какая музыка? @fixture_user")
+	f.step(t)
+	f.step(t)
+	f.step(t)
+	var messageID int64
+	var stored, source []byte
+	var sourceSHA string
+	if err := f.s.Store.DB.QueryRow("SELECT message_id,payload_json,source_json,source_sha FROM opening_audit_posts WHERE item_key='draft:10'").Scan(&messageID, &stored, &source, &sourceSHA); err != nil {
+		t.Fatal(err)
+	}
+	var old openingPostPayload
+	if err := json.Unmarshal(stored, &old); err != nil {
+		t.Fatal(err)
+	}
+	for i := range old.Entities {
+		if old.Entities[i].Type == "text_link" {
+			old.Entities[i].URL = "https://t.me/c/123/110"
+		}
+	}
+	legacy, err := openingPostBytes(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.Store.DB.Exec("UPDATE opening_audit_posts SET payload_json=?,desired_sha=?,sent_sha=?,state='sent' WHERE item_key='draft:10'", legacy, digest(legacy), digest(legacy)); err != nil {
+		t.Fatal(err)
+	}
+	before := len(f.methods)
+	f.refresh(t)
+	f.step(t)
+	if len(f.methods) != before+1 || f.methods[len(f.methods)-1] != "editMessageText" {
+		t.Fatal("URL repair reposted a message", f.methods)
+	}
+	var afterID int64
+	var afterPayload, afterSource, afterCapture []byte
+	var afterSourceSHA, sentSHA string
+	if err = f.s.Store.DB.QueryRow("SELECT message_id,payload_json,source_json,source_sha,sent_sha FROM opening_audit_posts WHERE item_key='draft:10'").Scan(&afterID, &afterPayload, &afterSource, &afterSourceSHA, &sentSHA); err != nil {
+		t.Fatal(err)
+	}
+	var current openingPostPayload
+	if err = json.Unmarshal(afterPayload, &current); err != nil {
+		t.Fatal(err)
+	}
+	linked := false
+	for _, entity := range current.Entities {
+		linked = linked || entity.Type == "text_link" && entity.URL == "https://t.me/c/123/110/110"
+	}
+	if !linked || afterID != messageID || current.Text != old.Text || sentSHA != digest(afterPayload) || sentSHA == digest(legacy) {
+		t.Fatal("URL repair did not preserve the known post and text")
+	}
+	if string(afterSource) != string(source) || afterSourceSHA != sourceSHA {
+		t.Fatal("URL repair changed source snapshot/hash")
+	}
+	if err = f.s.Store.DB.QueryRow("SELECT capture_json FROM reaction_message_drafts WHERE owner_id=123").Scan(&afterCapture); err != nil || string(afterCapture) != string(original) {
+		t.Fatal("URL repair changed raw draft", err)
 	}
 }

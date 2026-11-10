@@ -72,6 +72,17 @@ func TestPrivateArchiveLinkOnlyForOwner(t *testing.T) {
 	}
 }
 
+func TestForumThreadURLPinsExplicitTopic(t *testing.T) {
+	if got := forumThreadURL(-1004401653948, 897); got != "https://t.me/c/4401653948/897/897" {
+		t.Fatal(got)
+	}
+	for _, ids := range [][2]int64{{0, 1}, {-100, 1}, {-1000, 1}, {-123, 1}, {-100123, 0}, {-100123, -1}} {
+		if got := forumThreadURL(ids[0], ids[1]); got != "" {
+			t.Fatalf("invalid destination %v accepted: %s", ids, got)
+		}
+	}
+}
+
 func cardFixture(t *testing.T, n int) (*Service, StoredProfile) {
 	t.Helper()
 	store, c := testStore(t)

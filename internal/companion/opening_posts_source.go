@@ -213,7 +213,7 @@ func (s *Service) openingPostItemTx(ctx context.Context, tx *sql.Tx, expected Se
 	if err = tx.QueryRowContext(ctx, "SELECT thread_id FROM mirror_topics WHERE profile_id=? AND thread_id>0 AND thread_id<>?", item.Profile, s.Config.BackupThreadID).Scan(&thread); err != nil {
 		return item, err
 	}
-	link := forumTopicURL(s.Config.BackupChatID, thread)
+	link := forumThreadURL(s.Config.BackupChatID, thread)
 	if link == "" {
 		return item, sql.ErrNoRows
 	}
