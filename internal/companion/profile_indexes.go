@@ -115,12 +115,15 @@ func (s *Service) seedProfileIndexTopics(ctx context.Context, expected Session) 
 	if err = s.profileIndexBindingTx(ctx, tx, expected); err != nil {
 		return err
 	}
-	for _, kind := range []string{profileIndexCompatibility, profileIndexAge} {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO profile_index_topics(owner_id,upstream_id,generation,kind,chat_id) VALUES(?,?,?,?,?)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO profile_index_topics(owner_id,upstream_id,generation,kind,chat_id) VALUES(?,?,?,?,?)
  ON CONFLICT(owner_id,upstream_id,kind,chat_id) DO UPDATE SET generation=excluded.generation,next_refresh=0,updated_at=CURRENT_TIMESTAMP
- WHERE profile_index_topics.generation<>excluded.generation`, s.Config.OwnerID, expected.UserID, expected.Generation, kind, s.Config.BackupChatID); err != nil {
-			return err
-		}
+	WHERE profile_index_topics.generation<>excluded.generation`, s.Config.OwnerID, expected.UserID, expected.Generation, profileIndexCompatibility, s.Config.BackupChatID); err != nil {
+		return err
+	}
+	// Existing Age topics remain an archive; new accounts need only the Catalog.
+	if _, err = tx.ExecContext(ctx, `UPDATE profile_index_topics SET generation=?,next_refresh=0,updated_at=CURRENT_TIMESTAMP
+ WHERE owner_id=? AND upstream_id=? AND kind=? AND chat_id=? AND generation<>?`, expected.Generation, s.Config.OwnerID, expected.UserID, profileIndexAge, s.Config.BackupChatID, expected.Generation); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -157,7 +160,7 @@ func (s *Service) refreshProfileIndexPlan(ctx context.Context, expected Session)
 	}
 	plans := map[string][]profileIndexPayload{}
 	for _, kind := range []string{profileIndexCompatibility, profileIndexAge} {
-		plans[kind], err = renderProfileIndexPages(kind, entries, s.Config.BackupChatID)
+		plans[kind], err = renderProfileIndexPagesMode(kind, entries, s.Config.BackupChatID, s.Config.RichCards)
 		if err != nil {
 			return err
 		}
@@ -173,55 +176,37 @@ func (s *Service) refreshProfileIndexPlan(ctx context.Context, expected Session)
 	if err = s.profileIndexBindingTx(ctx, tx, expected); err != nil {
 		return err
 	}
+	primary, err := scanProfileIndexTopic(tx.QueryRowContext(ctx, "SELECT "+profileIndexTopicColumns+" FROM profile_index_topics WHERE owner_id=? AND upstream_id=? AND generation=? AND kind=? AND chat_id=?", s.Config.OwnerID, expected.UserID, expected.Generation, profileIndexCompatibility, s.Config.BackupChatID))
+	if err != nil {
+		return err
+	}
+	active := map[int]bool{}
 	for _, kind := range []string{profileIndexCompatibility, profileIndexAge} {
-		t, err := scanProfileIndexTopic(tx.QueryRowContext(ctx, "SELECT "+profileIndexTopicColumns+" FROM profile_index_topics WHERE owner_id=? AND upstream_id=? AND generation=? AND kind=? AND chat_id=?", s.Config.OwnerID, expected.UserID, expected.Generation, kind, s.Config.BackupChatID))
-		if err != nil {
-			return err
-		}
-		pages := plans[kind]
-		for i, payload := range pages {
-			if err = s.stageProfileIndexPageTx(ctx, tx, t.ID, i+1, payload); err != nil {
+		for i, payload := range plans[kind] {
+			slot := cataloguePhysicalPage(kind, i+1)
+			active[slot] = true
+			if err = s.stageProfileIndexPageTx(ctx, tx, primary.ID, slot, payload); err != nil {
 				return err
 			}
 		}
-		// Retain known message IDs when the index shrinks; never remove posts.
-		rows, e := tx.QueryContext(ctx, "SELECT page_no,message_id,state FROM profile_index_pages WHERE topic_id=? AND page_no>?", t.ID, len(pages))
-		if e != nil {
-			return e
-		}
-		type oldPage struct {
-			number  int
-			message int64
-			state   string
-		}
-		var old []oldPage
-		for rows.Next() {
-			var p oldPage
-			if e = rows.Scan(&p.number, &p.message, &p.state); e != nil {
-				rows.Close()
-				return e
-			}
-			old = append(old, p)
-		}
-		e = rows.Err()
-		rows.Close()
-		if e != nil {
-			return e
-		}
-		for _, p := range old {
-			if p.message > 0 {
-				if err = s.stageProfileIndexPageTx(ctx, tx, t.ID, p.number, profileIndexPayload{Text: profileIndexTitle(kind) + "\n\nСписок сократился.", Entities: []MessageEntity{}}); err != nil {
-					return err
-				}
-			} else if p.state != "uncertain" {
-				if _, err = tx.ExecContext(ctx, "UPDATE profile_index_pages SET state='error',error='unpublished_page_superseded',updated_at=CURRENT_TIMESTAMP WHERE topic_id=? AND page_no=? AND message_id=0 AND state<>'uncertain'", t.ID, p.number); err != nil {
-					return err
-				}
-			}
-		}
-		if _, err = tx.ExecContext(ctx, "UPDATE profile_index_topics SET next_refresh=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", now.Add(5*time.Minute).UnixMilli(), t.ID); err != nil {
+	}
+	if primary.Thread > 0 {
+		link := forumThreadURL(primary.Chat, primary.Thread)
+		if err = s.retireCataloguePagesTx(ctx, tx, primary, active, link); err != nil {
 			return err
 		}
+		legacy, e := scanProfileIndexTopic(tx.QueryRowContext(ctx, "SELECT "+profileIndexTopicColumns+" FROM profile_index_topics WHERE owner_id=? AND upstream_id=? AND generation=? AND kind=? AND chat_id=?", s.Config.OwnerID, expected.UserID, expected.Generation, profileIndexAge, s.Config.BackupChatID))
+		if e != nil && !errors.Is(e, sql.ErrNoRows) {
+			return e
+		}
+		if e == nil {
+			if err = s.retireCataloguePagesTx(ctx, tx, legacy, nil, link); err != nil {
+				return err
+			}
+		}
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE profile_index_topics SET next_refresh=?,updated_at=CURRENT_TIMESTAMP WHERE owner_id=? AND upstream_id=? AND generation=? AND chat_id=?", now.Add(5*time.Minute).UnixMilli(), s.Config.OwnerID, expected.UserID, expected.Generation, s.Config.BackupChatID); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -234,11 +219,15 @@ func (s *Service) stageProfileIndexPageTx(ctx context.Context, tx *sql.Tx, topic
 	_, err = tx.ExecContext(ctx, `INSERT INTO profile_index_pages(topic_id,page_no,payload_json,desired_sha) VALUES(?,?,?,?)
  ON CONFLICT(topic_id,page_no) DO UPDATE SET payload_json=excluded.payload_json,desired_sha=excluded.desired_sha,
  state=CASE WHEN profile_index_pages.sent_sha=excluded.desired_sha THEN 'sent' ELSE 'pending' END,next_attempt=0,error='',updated_at=CURRENT_TIMESTAMP
- WHERE (profile_index_pages.desired_sha<>excluded.desired_sha OR (profile_index_pages.message_id=0 AND profile_index_pages.state='error' AND profile_index_pages.error='unpublished_page_superseded')) AND NOT(profile_index_pages.state='uncertain' AND profile_index_pages.message_id=0)`, topic, page, raw, sha)
+ WHERE (profile_index_pages.desired_sha<>excluded.desired_sha OR (profile_index_pages.message_id=0 AND profile_index_pages.state='error' AND profile_index_pages.error='unpublished_page_superseded')) AND NOT(profile_index_pages.state IN ('uncertain','sending') AND profile_index_pages.message_id=0)`, topic, page, raw, sha)
 	return err
 }
 
 func (s *Service) claimProfileIndexOperation(ctx context.Context, expected Session) (profileIndexOperation, bool, error) {
+	return s.claimProfileIndexOperationMode(ctx, expected, false)
+}
+
+func (s *Service) claimProfileIndexOperationMode(ctx context.Context, expected Session, knownOnly bool) (profileIndexOperation, bool, error) {
 	var op profileIndexOperation
 	tx, err := s.Store.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -251,7 +240,33 @@ func (s *Service) claimProfileIndexOperation(ctx context.Context, expected Sessi
 	if err = s.profileIndexBindingTx(ctx, tx, expected); err != nil {
 		return op, false, err
 	}
-	op.Topic, err = scanProfileIndexTopic(tx.QueryRowContext(ctx, "SELECT "+profileIndexTopicColumns+` FROM profile_index_topics WHERE owner_id=? AND upstream_id=? AND generation=? AND chat_id=? AND state='pending' AND thread_id=0 AND next_attempt<=? ORDER BY id LIMIT 1`, s.Config.OwnerID, expected.UserID, expected.Generation, s.Config.BackupChatID, s.Archiver.now().UnixMilli()))
+	primary, e := scanProfileIndexTopic(tx.QueryRowContext(ctx, "SELECT "+profileIndexTopicColumns+" FROM profile_index_topics WHERE owner_id=? AND upstream_id=? AND generation=? AND chat_id=? AND kind=? AND state='sent' AND thread_id>0", s.Config.OwnerID, expected.UserID, expected.Generation, s.Config.BackupChatID, profileIndexCompatibility))
+	if e != nil && !errors.Is(e, sql.ErrNoRows) {
+		return op, false, e
+	}
+	if e == nil {
+		state, e := readCatalogueTitle(ctx, tx, primary)
+		if e != nil {
+			return op, false, e
+		}
+		if state.State != "sent" && state.State != "error" && state.Next <= s.Archiver.now().UnixMilli() {
+			if e = writeCatalogueTitle(ctx, tx, primary, catalogueTitleState{State: "preparing"}); e != nil {
+				return op, false, e
+			}
+			return profileIndexOperation{Topic: primary, Page: -1}, true, tx.Commit()
+		}
+	}
+	createKind := "t.kind='compatibility'"
+	if s.Store.cfg.SyncCycleEnabled {
+		// Finish an already frozen old-layout frontier without creating new Age
+		// topics for subsequent cycles or changing that frontier's payload hashes.
+		createKind += ` OR EXISTS(SELECT 1 FROM sync_publication_indexes i
+ JOIN sync_publication_manifests pm ON pm.cycle_id=i.cycle_id
+ JOIN sync_cycles sc ON sc.id=i.cycle_id
+ WHERE i.topic_id=t.id AND pm.indexes_frozen=1 AND sc.stage='publishing'
+ AND sc.owner_id=t.owner_id AND sc.upstream_id=t.upstream_id AND sc.generation=t.generation)`
+	}
+	op.Topic, err = scanProfileIndexTopic(tx.QueryRowContext(ctx, "SELECT "+profileIndexTopicColumns+` FROM profile_index_topics t WHERE owner_id=? AND upstream_id=? AND generation=? AND chat_id=? AND (`+createKind+`) AND state='pending' AND thread_id=0 AND next_attempt<=? AND ?=0 ORDER BY id LIMIT 1`, s.Config.OwnerID, expected.UserID, expected.Generation, s.Config.BackupChatID, s.Archiver.now().UnixMilli(), knownOnly))
 	if err == nil {
 		if _, err = tx.ExecContext(ctx, "UPDATE profile_index_topics SET state='preparing',error='',updated_at=CURRENT_TIMESTAMP WHERE id=? AND state='pending'", op.Topic.ID); err != nil {
 			return op, false, err
@@ -263,8 +278,8 @@ func (s *Service) claimProfileIndexOperation(ctx context.Context, expected Sessi
 	}
 	var topic int64
 	err = tx.QueryRowContext(ctx, `SELECT p.topic_id,p.page_no,p.message_id,p.payload_json,p.desired_sha FROM profile_index_pages p JOIN profile_index_topics t ON t.id=p.topic_id
- WHERE t.owner_id=? AND t.upstream_id=? AND t.generation=? AND t.chat_id=? AND t.state='sent' AND t.thread_id>0 AND p.state='pending' AND p.next_attempt<=?
- ORDER BY p.page_no,t.id LIMIT 1`, s.Config.OwnerID, expected.UserID, expected.Generation, s.Config.BackupChatID, s.Archiver.now().UnixMilli()).Scan(&topic, &op.Page, &op.Message, &op.Raw, &op.SHA)
+ WHERE t.owner_id=? AND t.upstream_id=? AND t.generation=? AND t.chat_id=? AND t.state='sent' AND t.thread_id>0 AND p.state='pending' AND p.next_attempt<=? AND (?=0 OR p.message_id>0)
+ ORDER BY p.page_no,t.id LIMIT 1`, s.Config.OwnerID, expected.UserID, expected.Generation, s.Config.BackupChatID, s.Archiver.now().UnixMilli(), knownOnly).Scan(&topic, &op.Page, &op.Message, &op.Raw, &op.SHA)
 	if errors.Is(err, sql.ErrNoRows) {
 		return op, false, tx.Commit()
 	}
@@ -275,10 +290,10 @@ func (s *Service) claimProfileIndexOperation(ctx context.Context, expected Sessi
 	if err != nil {
 		return op, false, err
 	}
-	if json.Unmarshal(op.Raw, &op.Payload) != nil || digest(op.Raw) != op.SHA || textUnits(op.Payload.Text) > 4096 {
+	if json.Unmarshal(op.Raw, &op.Payload) != nil || digest(op.Raw) != op.SHA {
 		return op, false, errors.New("invalid saved profile index payload")
 	}
-	if err = validMessageEntities(op.Payload.Text, op.Payload.Entities); err != nil {
+	if err = validProfileIndexPayload(op.Payload); err != nil {
 		return op, false, err
 	}
 	if _, err = tx.ExecContext(ctx, "UPDATE profile_index_pages SET state='preparing',error='',updated_at=CURRENT_TIMESTAMP WHERE topic_id=? AND page_no=? AND state='pending'", topic, op.Page); err != nil {
@@ -300,7 +315,9 @@ func (s *Service) markProfileIndexSending(ctx context.Context, op profileIndexOp
 		return err
 	}
 	var allowed bool
-	if op.Page == 0 {
+	if op.Page < 0 {
+		err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM profile_index_topics WHERE id=? AND owner_id=? AND upstream_id=? AND generation=? AND chat_id=? AND thread_id=? AND kind='compatibility' AND state='sent')`, op.Topic.ID, op.Topic.Owner, op.Topic.Upstream, op.Topic.Generation, op.Topic.Chat, op.Topic.Thread).Scan(&allowed)
+	} else if op.Page == 0 {
 		err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM profile_index_topics WHERE id=? AND owner_id=? AND upstream_id=? AND generation=? AND chat_id=? AND thread_id=0 AND state IN ('preparing','sending'))`, op.Topic.ID, op.Topic.Owner, op.Topic.Upstream, op.Topic.Generation, op.Topic.Chat).Scan(&allowed)
 	} else {
 		err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM profile_index_pages p JOIN profile_index_topics t ON t.id=p.topic_id
@@ -313,7 +330,9 @@ func (s *Service) markProfileIndexSending(ctx context.Context, op profileIndexOp
 	if !allowed {
 		return errProfileIndexBinding
 	}
-	if op.Page == 0 {
+	if op.Page < 0 {
+		err = writeCatalogueTitle(ctx, tx, op.Topic, catalogueTitleState{State: "sending"})
+	} else if op.Page == 0 {
 		_, err = tx.ExecContext(ctx, "UPDATE profile_index_topics SET state='sending',updated_at=CURRENT_TIMESTAMP WHERE id=?", op.Topic.ID)
 	} else {
 		_, err = tx.ExecContext(ctx, "UPDATE profile_index_pages SET state='sending',updated_at=CURRENT_TIMESTAMP WHERE topic_id=? AND page_no=?", op.Topic.ID, op.Page)
@@ -360,6 +379,9 @@ func (s *Service) finishProfileIndexOperation(ctx context.Context, op profileInd
 	if receipt == nil {
 		receipt = []byte{}
 	}
+	if op.Page < 0 {
+		return writeCatalogueTitle(write, s.Store.DB, op.Topic, catalogueTitleState{State: state, Next: next, Error: detail})
+	}
 	var r sql.Result
 	var err error
 	if op.Page == 0 {
@@ -380,18 +402,17 @@ func (s *Service) finishProfileIndexOperation(ctx context.Context, op profileInd
 	if n != 1 {
 		return errors.New("profile index receipt not committed")
 	}
+	if op.Page == 0 && state == "sent" && thread > 0 && op.Topic.Kind == profileIndexCompatibility {
+		topic := op.Topic
+		topic.Thread = thread
+		return writeCatalogueTitle(write, s.Store.DB, topic, catalogueTitleState{State: "sent"})
+	}
 	return nil
 }
 
 func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 	if !s.profileIndexesAllowed() {
 		return false, nil
-	}
-	if err := s.Store.requireSyncPublication(ctx, s.Config.OwnerID); err != nil {
-		if errors.Is(err, errSyncPublicationDeferred) {
-			return false, nil
-		}
-		return false, err
 	}
 	a := s.Archiver
 	send, cancel := context.WithTimeout(ctx, 90*time.Second)
@@ -411,12 +432,6 @@ func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	defer unlock()
-	if err := s.Store.requireSyncPublication(send, s.Config.OwnerID); err != nil {
-		if errors.Is(err, errSyncPublicationDeferred) {
-			return false, nil
-		}
-		return false, err
-	}
 	if err := s.initProfileIndexes(send); err != nil {
 		return false, err
 	}
@@ -430,13 +445,26 @@ func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 	if expected.UserID <= 0 || expected.Generation == "" {
 		return false, nil
 	}
+	if _, err = s.savedMessageEditSession(send, s.Config.OwnerID); err != nil {
+		if errors.Is(err, errSyncPublicationDeferred) {
+			return false, nil
+		}
+		return false, err
+	}
+	// The owner requested in-place layout edits during collection. Creating a
+	// topic or sending a new message still waits for the complete-cycle barrier.
+	publicationErr := s.Store.requireSyncPublication(send, s.Config.OwnerID)
+	knownOnly := errors.Is(publicationErr, errSyncPublicationDeferred)
+	if publicationErr != nil && !knownOnly {
+		return false, publicationErr
+	}
 	if err = s.seedProfileIndexTopics(send, expected); err != nil {
 		return false, err
 	}
 	if err = s.refreshProfileIndexPlan(send, expected); err != nil {
 		return false, err
 	}
-	op, claimed, err := s.claimProfileIndexOperation(send, expected)
+	op, claimed, err := s.claimProfileIndexOperationMode(send, expected, knownOnly)
 	if err != nil || !claimed {
 		return false, err
 	}
@@ -445,18 +473,42 @@ func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 	var receipt []byte
 	var thread, message int64
 	err = a.groupCall(send, func() error {
-		if err := s.Store.requireSyncPublication(send, s.Config.OwnerID); err != nil {
+		if op.Message > 0 || op.Page < 0 {
+			current, err := s.savedMessageEditSession(send, s.Config.OwnerID)
+			if err != nil {
+				return err
+			}
+			if s.Config.SyncCycleEnabled && (current.UserID != expected.UserID || current.Generation != expected.Generation) {
+				return errProfileIndexBinding
+			}
+		} else if err := s.Store.requireSyncPublication(send, s.Config.OwnerID); err != nil {
 			return err
 		}
 		if e := s.markProfileIndexSending(send, op, expected); e != nil {
 			return e
 		}
 		attempted = true
+		if op.Page < 0 {
+			var renamed bool
+			last = a.TG.Call(send, "editForumTopic", map[string]any{"chat_id": op.Topic.Chat, "message_thread_id": op.Topic.Thread, "name": profileCatalogueTitle}, &renamed)
+			var te *TelegramError
+			if errors.As(last, &te) && te.Code == 400 && (strings.Contains(strings.ToLower(te.Description), "not modified") || strings.Contains(strings.ToLower(te.Description), "not_modified")) {
+				last, renamed = nil, true
+			}
+			if last == nil && !renamed {
+				return errProfileIndexReceipt
+			}
+			return last
+		}
 		if op.Page == 0 {
+			title := profileCatalogueTitle
+			if op.Topic.Kind != profileIndexCompatibility {
+				title = profileIndexTitle(op.Topic.Kind)
+			}
 			var result struct {
 				Thread int64 `json:"message_thread_id"`
 			}
-			last = a.TG.Call(send, "createForumTopic", map[string]any{"chat_id": op.Topic.Chat, "name": profileIndexTitle(op.Topic.Kind)}, &result)
+			last = a.TG.Call(send, "createForumTopic", map[string]any{"chat_id": op.Topic.Chat, "name": title}, &result)
 			if last == nil {
 				thread = result.Thread
 				receipt, _ = json.Marshal(result)
@@ -465,9 +517,20 @@ func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 		}
 		var result SentMessage
 		if op.Message == 0 {
-			result, last = a.TG.SendText(send, op.Topic.Chat, op.Topic.Thread, op.Payload.Text, nil, op.Payload.Entities)
+			if op.Payload.Rich != nil {
+				last = a.TG.Call(send, "sendRichMessage", map[string]any{"chat_id": op.Topic.Chat, "message_thread_id": op.Topic.Thread, "rich_message": op.Payload.Rich, "disable_notification": true}, &result)
+			} else {
+				result, last = a.TG.SendText(send, op.Topic.Chat, op.Topic.Thread, op.Payload.Text, nil, op.Payload.Entities)
+			}
 		} else {
-			last = a.TG.Call(send, "editMessageText", map[string]any{"chat_id": op.Topic.Chat, "message_id": op.Message, "text": op.Payload.Text, "entities": op.Payload.Entities, "link_preview_options": map[string]bool{"is_disabled": true}}, &result)
+			payload := map[string]any{"chat_id": op.Topic.Chat, "message_id": op.Message}
+			if op.Payload.Rich != nil {
+				payload["rich_message"] = op.Payload.Rich
+			} else {
+				payload["text"], payload["entities"] = op.Payload.Text, op.Payload.Entities
+				payload["link_preview_options"] = map[string]bool{"is_disabled": true}
+			}
+			last = a.TG.Call(send, "editMessageText", payload, &result)
 			var te *TelegramError
 			if errors.As(last, &te) && te.Code == 400 && strings.Contains(strings.ToLower(te.Description), "message is not modified") {
 				message = op.Message
@@ -500,7 +563,7 @@ func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 	}
 	state, detail, next := "sent", "", int64(0)
 	if err != nil {
-		state, detail, next = profileIndexFailure(err, last, attempted, op.Message > 0, a.now())
+		state, detail, next = profileIndexFailure(err, last, attempted, op.Message > 0 || op.Page < 0, a.now())
 		if op.Page == 0 {
 			thread = 0
 		}

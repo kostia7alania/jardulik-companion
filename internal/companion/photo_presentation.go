@@ -216,6 +216,8 @@ func splitPhotoFooter(text string) (body, details, footer, link string) {
 			inside = append(inside, line)
 		case strings.HasPrefix(line, "Не указано: "):
 			inside = append(inside, line)
+		case strings.HasPrefix(line, "❔ "):
+			inside = append(inside, line)
 		case strings.HasPrefix(line, "📍 https://t.me/c/"):
 			link = strings.TrimPrefix(line, "📍 ")
 		default:
@@ -232,11 +234,8 @@ func splitPhotoFooter(text string) (body, details, footer, link string) {
 // budget and cannot be displaced by a long biography or photo metadata.
 func photoCardText(text string, rows []string, tail string, limit int) photoText {
 	body, details, footer, link := splitPhotoFooter(text)
-	if validPostURL(link) {
-		tail += "\n🔗 пост"
-	}
 	if len(rows) == 0 && details == "" {
-		return withPostLinkEntity(photoText{Text: captionWithTail(body+footer, tail, limit)}, link)
+		return withProfileHeadingLink(photoText{Text: captionWithTail(body+footer, tail, limit)}, link)
 	}
 	quoteBudget := 420
 	available := limit - textUnits(footer+tail) - 12
@@ -250,14 +249,7 @@ func photoCardText(text string, rows []string, tail string, limit int) photoText
 	if len(rows) > 0 && details != "" {
 		rowBudget--
 	}
-	quote := compactPhotoRows(rows, rowBudget)
-	if details != "" {
-		if quote != "" {
-			quote += "\n"
-		}
-		quote += details
-	}
-	quote = photoQuoteLanguagesFirst(quote)
+	quote := profileQuoteText(compactPhotoRows(rows, rowBudget), details)
 	bodyBudget := limit - textUnits("\n\n"+quote+footer+tail)
 	prefix, rest := telegramPrefix(body, bodyBudget)
 	if rest != "" {
@@ -269,40 +261,41 @@ func photoCardText(text string, rows []string, tail string, limit int) photoText
 	if quote != "" {
 		result.Entities = []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(quote)}}
 	}
-	return withPostLinkEntity(result, link)
+	return withProfileHeadingLink(result, link)
 }
 
-func photoQuoteLanguagesFirst(quote string) string {
-	const target = "Не указано: языки"
-	lines := strings.Split(quote, "\n")
-	if lines[0] == target {
-		return quote
-	}
-	for i := 1; i < len(lines); i++ {
-		if lines[i] == target {
-			copy(lines[1:i+1], lines[:i])
-			lines[0] = target
-			return strings.Join(lines, "\n")
+func profileQuoteText(rows, details string) string {
+	var ids, missing, other []string
+	for _, line := range strings.Split(details, "\n") {
+		switch {
+		case strings.HasPrefix(line, "Jardulik: "):
+			ids = append(ids, line)
+		case strings.HasPrefix(line, "Не указано: "):
+			missing = append(missing, "❔ "+strings.TrimPrefix(line, "Не указано: "))
+		case strings.HasPrefix(line, "❔ "):
+			missing = append(missing, line)
+		case line != "":
+			other = append(other, line)
 		}
 	}
-	return quote
+	parts := append([]string{}, ids...)
+	if rows != "" {
+		parts = append(parts, rows)
+	}
+	parts = append(parts, missing...)
+	parts = append(parts, other...)
+	return strings.Join(parts, "\n")
 }
 
 func fullPhotoText(text string, rows []string) photoText {
 	body, details, footer, link := splitPhotoFooter(text)
-	quote := strings.Join(rows, "\n")
-	if details != "" {
-		if quote != "" {
-			quote += "\n"
-		}
-		quote += details
-	}
+	quote := profileQuoteText(strings.Join(rows, "\n"), details)
 	if quote == "" {
 		return photoText{Text: text}
 	}
 	prefix := body + "\n\n"
 	result := photoText{Text: prefix + quote + footer, Entities: []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(quote)}}}
-	return appendPostLink(result, link)
+	return withProfileHeadingLink(result, link)
 }
 
 func photoTextPart(value photoText, limit int) (photoText, photoText) {
@@ -343,16 +336,12 @@ func photoQuote(entities []MessageEntity) (MessageEntity, bool) {
 	}
 	return MessageEntity{}, false
 }
-func withPostLinkEntity(value photoText, link string) photoText {
-	if validPostURL(link) && strings.HasSuffix(value.Text, "🔗 пост") {
-		value.Entities = append(value.Entities, MessageEntity{Type: "text_link", Offset: textUnits(value.Text) - textUnits("🔗 пост"), Length: textUnits("🔗 пост"), URL: link})
-	}
-	return value
-}
-func appendPostLink(value photoText, link string) photoText {
+func withProfileHeadingLink(value photoText, link string) photoText {
 	if validPostURL(link) {
-		value.Text += "\n🔗 пост"
-		return withPostLinkEntity(value, link)
+		heading, _, _ := strings.Cut(value.Text, "\n")
+		if heading != "" {
+			value.Entities = append(value.Entities, MessageEntity{Type: "text_link", Offset: 0, Length: textUnits(heading), URL: link})
+		}
 	}
 	return value
 }
@@ -379,6 +368,6 @@ func renderProfileCard(p StoredProfile, photos []MediaJob, missing int, noPhotos
 	if noPhotos {
 		text += "\nФотографии пока недоступны."
 	}
-	card := photoJSONCardText(text, photos, "", limit-textUnits("\n🔗 пост"), pretty)
-	return appendPostLink(card, link), nil
+	card := photoJSONCardText(text, photos, "", limit, pretty)
+	return withProfileHeadingLink(card, link), nil
 }

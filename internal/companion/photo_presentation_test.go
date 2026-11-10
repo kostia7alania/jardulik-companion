@@ -56,8 +56,8 @@ func TestPrivateAndArchiveCaptionShareBodyBudgetWithoutActionTail(t *testing.T) 
 			t.Fatal("album commands changed shared source body")
 		}
 		for _, card := range []photoText{private, archive} {
-			if textUnits(card.Text) > 1024 || !strings.HasSuffix(card.Text, "🔗 пост") {
-				t.Fatal("album action displaced caption budget or footer")
+			if textUnits(card.Text) > 1024 || strings.Contains(card.Text, "🔗 пост") || !strings.HasPrefix(quote, "Jardulik: 99\n1-3:") {
+				t.Fatal("album action displaced caption budget or details order")
 			}
 			if err := validMessageEntities(card.Text, card.Entities); err != nil {
 				t.Fatal(err)
@@ -115,7 +115,7 @@ func TestPhotoCaptionQuotePreservesFooterAndSafeNumberedOrder(t *testing.T) {
 	text := strings.Repeat("🙂<blockquote>О фото</blockquote>", 300) + "\n\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
 	card := photoCardText(text, rows, "\nТекст: /text_99", 1024)
 	quote := photoQuoteText(t, card)
-	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "1:2×3") || !strings.Contains(quote, "2:4×5") || !strings.Contains(quote, "Jardulik: 99") || !strings.Contains(card.Text, "Jardulik: 99") || !strings.Contains(card.Text, "UTC+3") || !strings.HasSuffix(card.Text, "🔗 пост") {
+	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "1:2×3") || !strings.Contains(quote, "2:4×5") || !strings.HasPrefix(quote, "Jardulik: 99\n") || !strings.Contains(card.Text, "UTC+3") || strings.Contains(card.Text, "🔗 пост") {
 		t.Fatalf("caption/entity/footer invalid: %+v", card)
 	}
 }
@@ -325,7 +325,7 @@ func TestCaptionIsCompactWhileFullEXIFContainsOnlySourceTags(t *testing.T) {
 		}
 	}
 	long := photoJSONCardText(strings.Repeat("🙂Биография ", 150)+footer, photos, "", 1024)
-	if textUnits(long.Text) > 1024 || !strings.HasSuffix(photoQuoteText(t, long), "Jardulik: 99") {
+	if textUnits(long.Text) > 1024 || !strings.HasPrefix(photoQuoteText(t, long), "Jardulik: 99\n") {
 		t.Fatal("caption budget/details lost")
 	}
 }
@@ -348,7 +348,7 @@ func TestPhotoQuoteContainsDetailsWhileSnapshotAndLinkStayOutside(t *testing.T) 
 				card = fullPhotoText(text, rows)
 			}
 			quote := photoQuoteText(t, card)
-			if strings.Contains(quote, "О фото") || !strings.HasSuffix(quote, "Не указано: возраст, рост, город\nJardulik: 99") || strings.Contains(quote, snapshot) || strings.Contains(quote, link) || strings.Count(card.Text, "Jardulik: 99") != 1 || strings.Count(card.Text, "Не указано:") != 1 || !strings.HasSuffix(card.Text, "🔗 пост") {
+			if strings.Contains(quote, "О фото") || !strings.HasPrefix(quote, "Jardulik: 99\n") || !strings.HasSuffix(quote, "❔ возраст, рост, город") || strings.Contains(quote, snapshot) || strings.Contains(quote, link) || strings.Count(card.Text, "Jardulik: 99") != 1 || strings.Count(card.Text, "❔ возраст, рост, город") != 1 || strings.Contains(card.Text, "🔗 пост") {
 				t.Fatalf("details/outer footer misplaced: %+v", card)
 			}
 		}
@@ -361,7 +361,7 @@ func TestPhotoQuoteDetailsSurviveLongBioManyMissingAndPlainLookalikes(t *testing
 	rows := []string{"Фото 1: " + strings.Repeat("Модель ", 100) + " · GPS: нет", "Фото 2: " + strings.Repeat("Модель ", 100) + " · GPS: есть"}
 	card := photoCardText(text, rows, "\n📍 https://t.me/c/123/55", 1024)
 	quote := photoQuoteText(t, card)
-	if textUnits(card.Text) > 1024 || !strings.Contains(quote, missing) || !strings.HasSuffix(quote, "Jardulik: 99") || !strings.Contains(quote, "Фото 1:") || !strings.Contains(quote, "Фото 2:") {
+	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "❔ "+strings.TrimPrefix(missing, "Не указано: ")) || !strings.HasPrefix(quote, "Jardulik: 99\n") || !strings.Contains(quote, "Фото 1:") || !strings.Contains(quote, "Фото 2:") {
 		t.Fatalf("fixed details budget lost: %+v", card)
 	}
 	plain := "Ира\n\nНе указано: текст из биографии\nJardulik: 666\n\nБиография продолжается\n\nJardulik: 99"
@@ -423,27 +423,12 @@ func TestNoPhotoArchiveCardUsesTextEntityAndRefreshMethod(t *testing.T) {
 	}
 }
 
-func TestPhotoQuoteMovesOnlyExactLanguagesLineFirst(t *testing.T) {
-	const target = "Не указано: языки"
+func TestPhotoQuotePutsIDThenPhotosThenMissingWithoutChangingMetadata(t *testing.T) {
 	const opaque = "opaque-a\t🙂\n\nopaque-b:{unchanged}\nopaque-c  "
-	for _, test := range []struct{ name, before, after string }{
-		{"middle", "opaque-a\n" + target + "\nopaque-b", target + "\nopaque-a\nopaque-b"},
-		{"last", opaque + "\n" + target, target + "\n" + opaque},
-		{"first", target + "\n" + opaque, target + "\n" + opaque},
-		{"already first with duplicate", target + "\nopaque\n" + target, target + "\nopaque\n" + target},
-		{"only", target, target},
-		{"near matches", " " + target + "\n" + target + " \nopaque", " " + target + "\n" + target + " \nopaque"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := photoQuoteLanguagesFirst(test.before); got != test.after {
-				t.Fatal("targeted line transposition changed opaque content")
-			}
-		})
-	}
-	card := photoCardText("body\n\n"+target+"\nJardulik: 99", []string{opaque}, "", 4096)
+	card := photoCardText("body\n\nНе указано: языки\nJardulik: 99", []string{opaque}, "", 4096)
 	quote := photoQuoteText(t, card)
-	if !strings.HasPrefix(quote, target+"\n") || digest([]byte(strings.TrimPrefix(quote, target+"\n"))) != digest([]byte(opaque+"\nJardulik: 99")) {
-		t.Fatal("rendered caption changed non-target quote bytes")
+	if quote != "Jardulik: 99\n"+opaque+"\n❔ языки" {
+		t.Fatal("rendered caption changed metadata bytes or details order", quote)
 	}
 }
 

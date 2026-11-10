@@ -44,10 +44,18 @@ func fullExifTextParts(text string, photos []MediaJob) ([]photoText, error) {
 	type span struct{ start, end int }
 	var protected []span
 	if quote, ok := photoQuote(value.Entities); len(blocks) > 0 && ok {
+		_, tail := telegramPrefix(value.Text, quote.Offset)
+		remaining, _ := telegramPrefix(tail, quote.Length)
 		offset := quote.Offset
 		for _, block := range blocks {
-			protected = append(protected, span{offset, offset + textUnits(block)})
-			offset += textUnits(block) + 1
+			at := strings.Index(remaining, block)
+			if at < 0 {
+				return nil, errors.New("technical JSON lost its quoted source span")
+			}
+			start := offset + textUnits(remaining[:at])
+			protected = append(protected, span{start, start + textUnits(block)})
+			offset = start + textUnits(block)
+			remaining = remaining[at+len(block):]
 		}
 	}
 	var parts []photoText

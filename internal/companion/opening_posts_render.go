@@ -12,22 +12,13 @@ func openingFormulaPayload(policy ReactionMessagePolicy) openingPostPayload {
 	return openingPostPayload{Text: prefix + body, Entities: []MessageEntity{{Type: "bold", Offset: 0, Length: textUnits(header)}, {Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(body)}}}
 }
 
-func openingRecipientPayload(profile Profile, id int64, link, status, message, rule string, evidence []reactionDraftEvidence) openingPostPayload {
-	name := birthdayGreetingName(profile)
-	if name == "" {
-		name = fmt.Sprintf("Анкета #%d", id)
-	}
-	heading := name
-	if age, known := autoInteger(profile["age"]); known && age > 0 && age <= 111 {
-		heading += fmt.Sprintf(", %d", age)
-	}
-	prefix := "💌 " + heading + "\n" + status + "\n\n"
-	payload := openingPostPayload{Text: prefix, Entities: []MessageEntity{{Type: "bold", Offset: 0, Length: textUnits("💌 " + heading)}, {Type: "text_link", Offset: textUnits("💌 "), Length: textUnits(heading), URL: link}}}
+func openingRecipientPayload(heading, link, status, message, rule string, evidence []reactionDraftEvidence) openingPostPayload {
+	prefix := heading + "\n\n"
+	body := status
 	if message != "" {
-		payload.Text += message + "\n\n"
-		payload.Entities = append(payload.Entities, MessageEntity{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(message)})
+		body += "\n\n" + message
 	}
-	payload.Text += "Правило: " + rule
+	body += "\n\nПравило: " + rule
 	for i, source := range evidence {
 		if i == 2 {
 			break
@@ -37,7 +28,11 @@ func openingRecipientPayload(profile Profile, id int64, link, status, message, r
 		if rest != "" {
 			quote += "…"
 		}
-		payload.Text += "\nОснование: " + source.Field + ": " + quote
+		body += "\nОснование: " + source.Field + ": " + quote
 	}
-	return payload
+	return openingPostPayload{Text: prefix + body, Entities: []MessageEntity{
+		{Type: "bold", Offset: 0, Length: textUnits(heading)},
+		{Type: "text_link", Offset: 0, Length: textUnits(heading), URL: link},
+		{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(body)},
+	}}
 }

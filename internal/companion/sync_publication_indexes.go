@@ -39,7 +39,8 @@ func (s *Service) syncPublicationIndexesComplete(ctx context.Context, cycle Sync
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO sync_publication_indexes(cycle_id,topic_id,page_no,payload_sha)
  SELECT ?,p.topic_id,p.page_no,p.desired_sha FROM profile_index_pages p JOIN profile_index_topics t ON t.id=p.topic_id
- WHERE t.owner_id=? AND t.upstream_id=? AND t.generation=? AND t.chat_id=?`, cycle.ID, cycle.OwnerID, cycle.UserID, cycle.Generation, s.Config.BackupChatID); err != nil {
+ WHERE t.owner_id=? AND t.upstream_id=? AND t.generation=? AND t.chat_id=?
+ AND NOT(p.message_id=0 AND p.state='error' AND p.error='unpublished_page_superseded')`, cycle.ID, cycle.OwnerID, cycle.UserID, cycle.Generation, s.Config.BackupChatID); err != nil {
 			return false, err
 		}
 		if _, err = tx.ExecContext(ctx, "UPDATE sync_publication_manifests SET indexes_frozen=1 WHERE cycle_id=?", cycle.ID); err != nil {
@@ -97,5 +98,6 @@ func (s *Service) syncPublicationIndexesComplete(ctx context.Context, cycle Sync
 	if count == 0 {
 		return false, errors.New("frozen index manifest has no pages")
 	}
-	return true, nil
+	rows.Close()
+	return s.catalogueTitleConfirmed(ctx, cycle.OwnerID, cycle.UserID, cycle.Generation)
 }

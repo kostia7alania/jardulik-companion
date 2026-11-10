@@ -38,7 +38,11 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 		return card, fmt.Errorf("%w: media count", ErrRichCardTooLarge)
 	}
 	body, details, footer, link := splitPhotoFooter(profileText(p))
-	caption := map[string]any{"text": body}
+	if validPostURL(postLink) {
+		link = postLink
+	}
+	richBody := richProfileBody(body, link)
+	caption := map[string]any{"text": richBody}
 	var media []any
 	for i, photo := range photos {
 		if photo.ProfileID != p.ID || photo.VersionID != p.VersionID {
@@ -54,17 +58,7 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 		card.Photos = append(card.Photos, photo.Path)
 		media = append(media, map[string]any{"type": "photo", "photo": map[string]any{"type": "photo", "media": fmt.Sprintf("attach://p%d", i)}, "caption": caption})
 	}
-	if validPostURL(postLink) {
-		link = postLink
-	}
-	fold := strings.Join(photoMetadataRows(photos), "\n")
-	if details != "" {
-		if fold != "" {
-			fold += "\n"
-		}
-		fold += details
-	}
-	fold = photoQuoteLanguagesFirst(fold)
+	fold := profileQuoteText(strings.Join(photoMetadataRows(photos), "\n"), details)
 	if fold != "" {
 		fold += "\n"
 	}
@@ -75,22 +69,24 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 		// PhotoViewer reads each photo caption; the collage caption shows the body once in chat.
 		blocks = append(blocks, map[string]any{"type": "collage", "blocks": media, "caption": caption})
 	} else {
-		blocks = append(blocks, map[string]any{"type": "paragraph", "text": body})
+		blocks = append(blocks, map[string]any{"type": "paragraph", "text": richBody})
 	}
-	blocks = append(blocks, map[string]any{"type": "expandable_blockquote", "text": []any{fold, map[string]any{"type": "code", "text": pretty.String()}}})
+	idLine := fmt.Sprintf("Jardulik: %d", p.ID)
+	idText := strconv.FormatInt(p.ID, 10)
+	remaining := strings.TrimPrefix(fold, idLine)
+	if remaining == fold {
+		return card, errors.New("rich profile ID details mismatch")
+	}
+	blocks = append(blocks, map[string]any{"type": "expandable_blockquote", "text": []any{
+		"Jardulik: ",
+		map[string]any{"type": "button", "button": map[string]any{"text": idText, "copy_text": map[string]any{"text": idText}}},
+		remaining,
+		map[string]any{"type": "code", "text": pretty.String()},
+	}})
 	footer = strings.TrimSpace(footer)
-	footerParts := []any{footer}
 	footerText := footer
-	if validPostURL(link) {
-		separator := ""
-		if footer != "" {
-			separator = "\n"
-		}
-		footerParts = append(footerParts, separator, map[string]any{"type": "url", "text": "🔗 пост", "url": link})
-		footerText += separator + "🔗 пост"
-	}
 	if footerText != "" {
-		blocks = append(blocks, map[string]any{"type": "footer", "text": footerParts})
+		blocks = append(blocks, map[string]any{"type": "footer", "text": footerText})
 	}
 	bodyCopies := 1
 	if len(media) > 1 {
@@ -104,6 +100,18 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 	}
 	card.Content = map[string]any{"skip_entity_detection": true, "blocks": blocks}
 	return card, nil
+}
+
+func richProfileBody(body, link string) any {
+	if !validPostURL(link) {
+		return body
+	}
+	heading, rest, hasRest := strings.Cut(body, "\n")
+	parts := []any{map[string]any{"type": "url", "text": heading, "url": link}}
+	if hasRest {
+		parts = append(parts, "\n"+rest)
+	}
+	return parts
 }
 
 func validRichPhotoFileID(value string) bool {

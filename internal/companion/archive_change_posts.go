@@ -35,18 +35,22 @@ func (s *Service) recoverArchiveChangePosts(ctx context.Context) error {
 	return err
 }
 
-// The source ZIP receipt orders actual publications, including historical backfill.
-func (s *Service) enqueueArchiveChangePosts(ctx context.Context) error {
-	_, err := s.Store.DB.ExecContext(ctx, `WITH published AS (
- SELECT av.version_id,av.owner_id,av.profile_id,av.thread_id,COALESCE(original.sent_at,r.sent_at) AS sent_at
+// These trusted SQL expressions share the exact publication evidence used by enqueue and GPT readiness.
+func archiveChangePublishedSQL(owner, chat, backupThread string) string {
+	return ` SELECT av.version_id,av.owner_id,av.profile_id,av.thread_id,COALESCE(source_original.sent_at,r.sent_at) AS sent_at
  FROM archive_versions av JOIN versions v ON v.id=av.version_id AND v.owner_id=av.owner_id AND v.profile_id=av.profile_id
  JOIN archive_profile_repairs layout ON layout.version_id=av.version_id AND layout.state='sent'
- JOIN archive_receipts r ON r.source_sha=av.source_sha AND r.kind='profile_version' AND r.chat_id=? AND r.thread_id=av.thread_id AND r.message_id>0 AND r.file_id<>''
+ JOIN archive_receipts r ON r.source_sha=av.source_sha AND r.kind='profile_version' AND r.chat_id=` + chat + ` AND r.thread_id=av.thread_id AND r.message_id>0 AND r.file_id<>''
  JOIN mirror_topics t ON t.profile_id=av.profile_id AND t.thread_id=av.thread_id
  LEFT JOIN archive_zip_repairs replacement ON replacement.version_id=av.version_id AND replacement.old_message_id=r.message_id
- LEFT JOIN archive_receipts original ON original.source_sha=replacement.old_source_sha AND original.kind='profile_version' AND original.chat_id=r.chat_id AND original.thread_id=r.thread_id AND original.message_id=r.message_id AND original.file_id<>''
- WHERE av.owner_id=? AND av.state IN ('sent','partial') AND av.thread_id>0 AND av.thread_id<>? AND julianday(COALESCE(original.sent_at,r.sent_at)) IS NOT NULL
- AND CASE WHEN json_valid(av.message_ids) THEN json_type(av.message_ids)='array' AND json_type(av.message_ids,'$[0]')='integer' AND json_extract(av.message_ids,'$[0]')>0 AND json_extract(av.message_ids,'$[0]')<>r.message_id ELSE 0 END
+ LEFT JOIN archive_receipts source_original ON source_original.source_sha=replacement.old_source_sha AND source_original.kind='profile_version' AND source_original.chat_id=r.chat_id AND source_original.thread_id=r.thread_id AND source_original.message_id=r.message_id AND source_original.file_id<>''
+ WHERE av.owner_id=` + owner + ` AND av.state IN ('sent','partial') AND av.thread_id>0 AND av.thread_id<>` + backupThread + ` AND julianday(COALESCE(source_original.sent_at,r.sent_at)) IS NOT NULL
+ AND CASE WHEN json_valid(av.message_ids) THEN json_type(av.message_ids)='array' AND json_type(av.message_ids,'$[0]')='integer' AND json_extract(av.message_ids,'$[0]')>0 AND json_extract(av.message_ids,'$[0]')<>r.message_id ELSE 0 END`
+}
+
+// The source ZIP receipt orders actual publications, including historical backfill.
+func (s *Service) enqueueArchiveChangePosts(ctx context.Context) error {
+	_, err := s.Store.DB.ExecContext(ctx, `WITH published AS (`+archiveChangePublishedSQL("?", "?", "?")+`
  ), ordered AS (
  SELECT *,LAG(version_id) OVER(PARTITION BY owner_id,profile_id,thread_id ORDER BY julianday(sent_at),version_id) AS previous
  FROM published)

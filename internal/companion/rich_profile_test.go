@@ -39,6 +39,29 @@ func richAck(n int) json.RawMessage {
 	raw, _ := json.Marshal(map[string]any{"blocks": []any{map[string]any{"type": "collage", "blocks": photos}}})
 	return raw
 }
+
+func richProfileTextValue(t *testing.T, value any) string {
+	t.Helper()
+	switch value := value.(type) {
+	case string:
+		return value
+	case []any:
+		var text strings.Builder
+		for _, part := range value {
+			text.WriteString(richProfileTextValue(t, part))
+		}
+		return text.String()
+	case map[string]any:
+		if value["type"] == "button" {
+			return richProfileTextValue(t, value["button"].(map[string]any)["text"])
+		}
+		return richProfileTextValue(t, value["text"])
+	default:
+		t.Fatalf("unexpected rich text: %T", value)
+		return ""
+	}
+}
+
 func assertRichProfileCaptions(t *testing.T, content map[string]any, photos int, body string) {
 	t.Helper()
 	blocks := content["blocks"].([]any)
@@ -47,7 +70,7 @@ func assertRichProfileCaptions(t *testing.T, content map[string]any, photos int,
 	}
 	head := blocks[0].(map[string]any)
 	if photos == 0 {
-		if head["type"] != "paragraph" || head["text"] != body {
+		if head["type"] != "paragraph" || richProfileTextValue(t, head["text"]) != body {
 			t.Fatal("human body differs from shared renderer")
 		}
 		return
@@ -56,7 +79,7 @@ func assertRichProfileCaptions(t *testing.T, content map[string]any, photos int,
 	if photos > 1 {
 		want = "collage"
 	}
-	if head["type"] != want || head["caption"].(map[string]any)["text"] != body {
+	if head["type"] != want || richProfileTextValue(t, head["caption"].(map[string]any)["text"]) != body {
 		t.Fatal("missing visible media caption", head["type"])
 	}
 	media := []any{head}
@@ -68,7 +91,7 @@ func assertRichProfileCaptions(t *testing.T, content map[string]any, photos int,
 	}
 	for _, item := range media {
 		photo := item.(map[string]any)
-		if photo["type"] != "photo" || photo["caption"].(map[string]any)["text"] != body {
+		if photo["type"] != "photo" || richProfileTextValue(t, photo["caption"].(map[string]any)["text"]) != body {
 			t.Fatal("photo viewer lost its caption")
 		}
 		if _, nested := photo["photo"].(map[string]any)["caption"]; nested {
@@ -90,10 +113,14 @@ func TestRichProfileSourceBodyAndAllMediaShapes(t *testing.T) {
 			assertRichProfileCaptions(t, card.Content, n, body)
 			quote := blocks[1].(map[string]any)
 			parts := quote["text"].([]any)
-			if quote["type"] != "expandable_blockquote" || !strings.HasPrefix(parts[0].(string), "Не указано: языки\n") {
+			if quote["type"] != "expandable_blockquote" || !strings.HasPrefix(richProfileTextValue(t, parts), "Jardulik: 77\n") || !strings.Contains(richProfileTextValue(t, parts), "❔ языки\n") {
 				t.Fatal("fold order/shape changed")
 			}
-			code := parts[1].(map[string]any)
+			button := parts[1].(map[string]any)["button"].(map[string]any)
+			if button["text"] != "77" || button["copy_text"].(map[string]any)["text"] != "77" {
+				t.Fatal("source ID lost inline copy action")
+			}
+			code := parts[len(parts)-1].(map[string]any)
 			var pretty bytes.Buffer
 			_ = json.Indent(&pretty, []byte(p.RawJSON), "", "  ")
 			if code["type"] != "code" || code["text"] != pretty.String() {
@@ -103,9 +130,11 @@ func TestRichProfileSourceBodyAndAllMediaShapes(t *testing.T) {
 			if n > 1 {
 				bodyCopies += n
 			}
-			footer := blocks[2].(map[string]any)["text"].([]any)
-			footerText := footer[0].(string) + footer[1].(string) + footer[2].(map[string]any)["text"].(string)
-			otherText := parts[0].(string) + pretty.String() + footerText
+			footerText := richProfileTextValue(t, blocks[2].(map[string]any)["text"])
+			if strings.Contains(footerText, "пост") {
+				t.Fatal("redundant post footer returned")
+			}
+			otherText := richProfileTextValue(t, parts) + footerText
 			if card.JSONBytes != pretty.Len() || card.JSONCharacters != utf8.RuneCount(pretty.Bytes()) ||
 				card.TextBytes != bodyCopies*len(body)+len(otherText) ||
 				card.TextCharacters != bodyCopies*utf8.RuneCountInString(body)+utf8.RuneCountInString(otherText) {
@@ -133,6 +162,51 @@ func TestRichProfileSourceBodyAndAllMediaShapes(t *testing.T) {
 		})
 	}
 }
+
+func TestRichProfileHeadingLinksAndSourceIDCopiesInsideDetails(t *testing.T) {
+	p, jobs := richFixture(t, 2)
+	p.Profile["gender"], p.Profile["age"], p.Profile["height"] = 2, 28, 167
+	p.Profile["birthday"], p.Profile["type"] = "1998-07-04T00:00:00", 1
+	raw, _ := json.Marshal(p.Profile)
+	p.RawJSON = string(raw)
+	const link = "https://t.me/c/1234/77/77"
+	card, err := BuildRichProfileCard(p, jobs, link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks := card.Content["blocks"].([]any)
+	collage := blocks[0].(map[string]any)
+	media := append([]any{collage}, collage["blocks"].([]any)...)
+	for _, item := range media {
+		parts := item.(map[string]any)["caption"].(map[string]any)["text"].([]any)
+		heading := parts[0].(map[string]any)
+		if heading["type"] != "url" || heading["url"] != link || heading["text"] != "💁‍♀️Имя, 28/167, ♋️ ⭐️" {
+			t.Fatal("photo caption did not keep its linked neutral heading", heading)
+		}
+	}
+	quote := blocks[1].(map[string]any)
+	parts := quote["text"].([]any)
+	if parts[0] != "Jardulik: " || parts[1].(map[string]any)["type"] != "button" {
+		t.Fatal("source ID must be the first quoted detail")
+	}
+	button := parts[1].(map[string]any)["button"].(map[string]any)
+	if button["text"] != "77" || button["copy_text"].(map[string]any)["text"] != "77" {
+		t.Fatal("inline ID copy changed the source ID")
+	}
+	quoteText := richProfileTextValue(t, parts)
+	if !strings.HasPrefix(quoteText, "Jardulik: 77\n1-2:") || !strings.Contains(quoteText, "\n❔ языки\n") {
+		t.Fatal("ID/photo/missing order changed", quoteText)
+	}
+	var pretty bytes.Buffer
+	_ = json.Indent(&pretty, raw, "", "  ")
+	if parts[len(parts)-1].(map[string]any)["text"] != pretty.String() || p.RawJSON != string(raw) {
+		t.Fatal("display changed source JSON")
+	}
+	if strings.Contains(richProfileTextValue(t, blocks[2].(map[string]any)["text"]), "пост") {
+		t.Fatal("redundant footer link returned")
+	}
+}
+
 func TestRichProfileLimitsAreTypedBeforeHTTP(t *testing.T) {
 	p, jobs := richFixture(t, 0)
 	p.Profile["description"] = strings.Repeat("я", 17000)

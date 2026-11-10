@@ -120,15 +120,37 @@ func (s *Store) syncPublicationPhaseCandidates(owner string) string {
 
 // Readiness must use the frozen snapshot, not a later foreground queue pointer.
 func (s *Store) syncAnalysisPostReady() string {
+	return s.syncAnalysisPostReadyAt("t.thread_id")
+}
+
+// thread is a trusted SQL column, selected before claim or pinned on the outbox after pacing.
+func (s *Store) syncAnalysisPostReadyAt(thread string) string {
 	if !s.cfg.SyncCycleEnabled {
-		return analysisPostReady
+		return strings.ReplaceAll(analysisPostReady, "t.thread_id", thread)
 	}
 	version := `CASE WHEN EXISTS(SELECT 1 FROM sync_cycles sc WHERE sc.owner_id=q.owner_id AND sc.stage='publishing') THEN
  (SELECT MAX(pi.item_id) FROM sync_publication_items pi JOIN sync_cycles sc ON sc.id=pi.cycle_id
  WHERE sc.owner_id=q.owner_id AND sc.stage='publishing' AND pi.kind='version' AND pi.profile_id=q.profile_id)
  ELSE q.version_id END`
-	ready := strings.Replace(analysisPostReady, "av.version_id=q.version_id", "av.version_id=("+version+")", 1)
-	return strings.Replace(ready, "WHERE v.owner_id=p.owner_id AND v.profile_id=p.profile_id AND (", "WHERE v.owner_id=p.owner_id AND v.profile_id=p.profile_id "+s.syncPublicationCandidates("v.owner_id", "v.id", "version")+" AND (", 1)
+	chat, backupThread := fmt.Sprint(s.cfg.BackupChatID), fmt.Sprint(s.cfg.BackupThreadID)
+	published := archiveChangePublishedSQL("p.owner_id", chat, backupThread)
+	original := archiveChangePublishedSQL("original.owner_id", chat, backupThread)
+	layout := `av.thread_id=` + thread + ` AND (
+ (av.state IN ('sent','partial') AND EXISTS(SELECT 1 FROM (` + published + `) confirmed WHERE confirmed.version_id=av.version_id))
+ OR (av.state='duplicate' AND av.fingerprint<>'' AND EXISTS(SELECT 1 FROM archive_versions original
+ WHERE original.fingerprint=av.fingerprint AND original.profile_id=av.profile_id AND original.thread_id=` + thread + `
+ AND EXISTS(SELECT 1 FROM (` + original + `) confirmed WHERE confirmed.version_id=original.version_id))))`
+	return `EXISTS(SELECT 1 FROM queue q JOIN archive_versions av ON av.version_id=(` + version + `) AND av.owner_id=q.owner_id AND av.profile_id=q.profile_id
+ WHERE q.owner_id=p.owner_id AND q.profile_id=p.profile_id AND ` + layout + `)
+ AND NOT EXISTS(SELECT 1 FROM versions v LEFT JOIN archive_versions av ON av.version_id=v.id
+ WHERE v.owner_id=p.owner_id AND v.profile_id=p.profile_id ` + s.syncPublicationCandidates("v.owner_id", "v.id", "version") + ` AND NOT COALESCE((av.owner_id=v.owner_id AND av.profile_id=v.profile_id AND ` + layout + `),0))
+ AND NOT EXISTS(SELECT 1 FROM sync_publication_items pi JOIN sync_cycles sc ON sc.id=pi.cycle_id
+ JOIN sync_publication_manifests pm ON pm.cycle_id=sc.id AND pm.owner_id=sc.owner_id AND pm.upstream_id=sc.upstream_id AND pm.generation=sc.generation
+ JOIN archive_change_posts n ON n.version_id=pi.item_id
+ WHERE sc.owner_id=p.owner_id AND sc.upstream_id=p.upstream_id AND sc.stage='publishing'
+ AND pi.kind='change' AND pi.disposition='required' AND pi.profile_id=p.profile_id
+ AND (n.owner_id<>p.owner_id OR n.profile_id<>p.profile_id OR n.thread_id<>` + thread + `
+ OR NOT ((n.state='sent' AND n.message_id>0) OR (n.state='skipped' AND n.message_id=0 AND n.error IN ('initial_published_version','no_profile_changes')))))`
 }
 
 // FreezeSyncPublication commits an immutable finite frontier, including an empty one.

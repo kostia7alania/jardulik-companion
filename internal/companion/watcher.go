@@ -221,7 +221,7 @@ func (w *ProfileWatcher) CheckOne(ctx context.Context) (bool, error) {
 		}
 		return true, ctx.Err()
 	}
-	p, observed, requestErr := w.Client.fullProfileObserved(ctx, owner, profile)
+	p, _, observed, requestErr := w.Client.checkedProfileObserved(ctx, owner, session, profile)
 	finished := w.now()
 	if err = ctx.Err(); err != nil {
 		return true, err

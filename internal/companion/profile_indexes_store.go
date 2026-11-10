@@ -107,6 +107,43 @@ func (s *Service) profileIndexEntries(ctx context.Context, owner, upstream int64
 
 func (s *Service) profileIndexScores(ctx context.Context, owner, upstream int64) (map[int64]int, error) {
 	scores := map[int64]int{}
+	unavailable := map[int64]bool{}
+	hasPresence, err := snapshotHasTable(ctx, s.Store.DB, "profile_presence")
+	if err != nil {
+		return nil, err
+	}
+	hasRefresh, err := snapshotHasTable(ctx, s.Store.DB, "sync_refresh_items")
+	if err != nil {
+		return nil, err
+	}
+	if hasPresence && hasRefresh {
+		session, err := s.Store.Session(ctx, owner)
+		if err != nil {
+			return nil, err
+		}
+		// Legacy presence has no source identity; require a current-source direct-check receipt.
+		rows, err := s.Store.DB.QueryContext(ctx, `SELECT r.profile_id FROM sync_refresh_items r
+ JOIN sync_cycles sc ON sc.id=r.cycle_id
+ JOIN profile_presence p ON p.owner_id=sc.owner_id AND p.profile_id=r.profile_id AND p.availability='unavailable'
+ WHERE sc.owner_id=? AND sc.upstream_id=? AND sc.upstream_id=? AND sc.generation=? AND r.state='unavailable' AND r.observed_at_ms>0 AND r.observed_at_ms>=sc.started_at_ms
+ AND sc.id=(SELECT latest.id FROM sync_cycles latest WHERE latest.owner_id=sc.owner_id AND latest.upstream_id=sc.upstream_id AND latest.generation=sc.generation ORDER BY latest.started_at_ms DESC,latest.id DESC LIMIT 1)`, owner, upstream, session.UserID, session.Generation)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			if err = rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			unavailable[id] = true
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
 	rows, err := s.Store.DB.QueryContext(ctx, `SELECT a.profile_id,a.response_body,a.own_profile,a.target_profile FROM profile_analyses a
  WHERE a.owner_id=? AND a.upstream_id=? AND `+analysisPostSuccessSQL("a")+` ORDER BY a.observed_at_ms DESC,a.id DESC`, owner, upstream)
 	if err != nil {
@@ -123,7 +160,9 @@ func (s *Service) profileIndexScores(ctx context.Context, owner, upstream int64)
 		if seen[id] {
 			continue
 		}
-		seen[id] = true
+		if !unavailable[id] {
+			seen[id] = true
+		}
 		own, e := debugProfile(ownRaw)
 		if e != nil || own.ID() != upstream {
 			continue
@@ -145,6 +184,7 @@ func (s *Service) profileIndexScores(ctx context.Context, owner, upstream int64)
 		}
 		if value, known := analysisPostRating(body.Content); known {
 			scores[id] = value
+			seen[id] = true
 		}
 	}
 	return scores, rows.Err()

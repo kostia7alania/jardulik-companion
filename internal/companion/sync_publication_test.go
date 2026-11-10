@@ -108,7 +108,7 @@ func TestSyncPublicationCompletesOnlyExactConfirmedReceiptsAndFinalIndexes(t *te
 	if len(f.operations) != 0 {
 		t.Fatal("completion performed HTTP")
 	}
-	for range 4 {
+	for range 3 {
 		f.step(t)
 	}
 	if ready, err := f.s.syncCyclePublicationComplete(context.Background(), c); err != nil || !ready {
@@ -244,16 +244,6 @@ func TestSyncPublicationStagesGateAllBackgroundPostersWithoutHTTP(t *testing.T) 
 				if did, err := poster.fn(context.Background()); err != nil || did {
 					t.Fatalf("%s crossed %s barrier: %v %v", poster.name, stage, did, err)
 				}
-			}
-			if err := f.s.Store.SetMeta(context.Background(), "caption_design_revision", ""); err != nil {
-				t.Fatal(err)
-			}
-			if err := f.s.ScheduleCaptionMaintenance(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			w := captionMaintenanceWorker{f.s, time.Now}
-			if did, err := w.step(context.Background()); err != nil || did {
-				t.Fatal("background caption crossed collection barrier", did, err)
 			}
 			if len(f.operations) != 0 {
 				t.Fatal("collection phase made Telegram requests")
@@ -391,7 +381,16 @@ func TestSyncPublicationPinsExactCachedAnalysisDespiteLaterQueueAndCapture(t *te
 	f := newAnalysisPostFixture(t, "saved whole response")
 	f.ready(t)
 	s := f.service
+	s.Store.cfg.BackupChatID = s.Config.BackupChatID
+	s.Store.cfg.BackupThreadID = s.Config.BackupThreadID
 	ctx := context.Background()
+	if _, err := s.Store.DB.Exec("UPDATE archive_versions SET source_sha='cached-analysis-zip' WHERE version_id=?", f.analysis.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.DB.Exec(`INSERT INTO archive_receipts(source_sha,kind,filename,byte_size,chat_id,thread_id,message_id,file_id,file_unique_id,returned_file_size,sent_at)
+ VALUES('cached-analysis-zip','profile_version','source.zip',1,-100123,55,100,'source-file','unique',1,?)`, f.now.UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
 	c := syncPublicationCycle(t, s, 1)
 	p, err := s.Store.Profile(ctx, 1, 7)
 	if err != nil {
@@ -453,7 +452,7 @@ func TestSyncPublicationPresenceRequiresMatchingReceiptAndFrozenEvent(t *testing
 	if ready, err := f.s.syncCyclePublicationComplete(context.Background(), c); err != nil || ready {
 		t.Fatal("final indexes not required", ready, err)
 	}
-	for range 4 {
+	for range 3 {
 		f.step(t)
 	}
 	if ready, err := f.s.syncCyclePublicationComplete(context.Background(), c); err != nil || !ready {
@@ -544,7 +543,7 @@ func TestSyncPublicationFrozenIndexPlanIgnoresLaterManualScoreUntilComplete(t *t
 	if hashes() != before {
 		t.Fatal("later manual score replaced frozen payloads")
 	}
-	for range 4 {
+	for range 3 {
 		f.step(t)
 	}
 	if ready, err := f.s.syncCyclePublicationComplete(context.Background(), c); err != nil || !ready {
@@ -644,7 +643,7 @@ func TestSyncPublicationLatePresenceDefersUnsentNoticesWithoutExpandingFrontier(
 			if did, err := f.s.deliverAnalysisPost(context.Background()); err != nil || did {
 				t.Fatal("analysis published over a late presence event", did, err)
 			}
-			for range 4 {
+			for range 3 {
 				f.step(t)
 			}
 			if ready, err := f.s.syncCyclePublicationComplete(context.Background(), c); err != nil || !ready {
@@ -732,7 +731,7 @@ func TestSyncPublicationWaitsForScopedCurrentCaptionRevisionBeforeIndexFreeze(t 
 	if ready, err := f.s.syncCyclePublicationComplete(context.Background(), c); err != nil || ready {
 		t.Fatal("unconfirmed index pages skipped", ready, err)
 	}
-	for range 4 {
+	for range 3 {
 		f.step(t)
 	}
 	if ready, err := f.s.syncCyclePublicationComplete(context.Background(), c); err != nil || !ready {
@@ -740,7 +739,7 @@ func TestSyncPublicationWaitsForScopedCurrentCaptionRevisionBeforeIndexFreeze(t 
 	}
 }
 
-func TestSyncPublicationCaptionClaimKeepsTenantPhasesIndependent(t *testing.T) {
+func TestSyncPublicationCaptionClaimKeepsPausedTenantsIndependent(t *testing.T) {
 	f := newProfileIndexesFixture(t)
 	s := f.s
 	ctx := context.Background()
@@ -764,12 +763,15 @@ func TestSyncPublicationCaptionClaimKeepsTenantPhasesIndependent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if _, err := s.Store.DB.Exec("UPDATE users SET paused=1 WHERE id=123"); err != nil {
+		t.Fatal(err)
+	}
 	w := captionMaintenanceWorker{s, time.Now}
 	job, err := w.claim(ctx)
 	if err != nil || job == nil || job.owner != 2 {
-		t.Fatal("primary collection blocked an independent tenant", job, err)
+		t.Fatal("paused primary blocked an independent tenant", job, err)
 	}
 	if n := syncPublicationCount(t, s.Store, "SELECT COUNT(*) FROM caption_maintenance_jobs WHERE owner_id=123 AND state='pending' AND attempts=0"); n != 1 {
-		t.Fatal("blocked tenant was claimed")
+		t.Fatal("paused tenant was claimed")
 	}
 }

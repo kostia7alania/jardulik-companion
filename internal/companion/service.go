@@ -682,21 +682,7 @@ func (s *Service) next(ctx context.Context, owner int64) {
 func profileText(p StoredProfile) string {
 	v := p.Profile
 	var b strings.Builder
-	name := strings.Join(strings.Fields(v.String("name")+" "+v.String("surName")), " ")
-	b.WriteString(name)
-	age, height := v.String("age"), v.String("height")
-	if age == "0" {
-		age = ""
-	}
-	if height == "0" {
-		height = ""
-	}
-	if age != "" || height != "" {
-		b.WriteString(", " + strings.Trim(age+"/"+height, "/"))
-	}
-	if number(v["type"]) == 1 {
-		b.WriteString(" ⭐ Premium")
-	}
+	b.WriteString(profileCardHeading(v, time.Now()))
 	var location []string
 	for _, key := range []string{"country", "city"} {
 		if val := profileValue(v, key); val != "" {
@@ -728,7 +714,7 @@ func profileText(p StoredProfile) string {
 	}
 	var footer []string
 	if fields := missingProfileFields(v); len(fields) > 0 {
-		footer = append(footer, "Не указано: "+strings.Join(fields, ", "))
+		footer = append(footer, "❔ "+strings.Join(fields, ", "))
 	}
 	capturedAt := p.FirstSeen
 	if capturedAt == "" {

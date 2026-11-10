@@ -14,10 +14,15 @@ func profileIndexRenderedRows(t *testing.T, pages []profileIndexPayload, chat in
 	t.Helper()
 	var result []string
 	for _, page := range pages {
-		if textUnits(page.Text) > 4096 || validMessageEntities(page.Text, page.Entities) != nil {
+		if validProfileIndexPayload(page) != nil {
 			t.Fatal("index page exceeds Telegram UTF-16/entity bounds")
 		}
+		quotes := 0
 		for _, entity := range page.Entities {
+			if entity.Type == "expandable_blockquote" {
+				quotes++
+				continue
+			}
 			before, rest := telegramPrefix(page.Text, entity.Offset)
 			label, after := telegramPrefix(rest, entity.Length)
 			tail := strings.SplitN(after, "\n", 2)[0]
@@ -28,6 +33,9 @@ func profileIndexRenderedRows(t *testing.T, pages []profileIndexPayload, chat in
 				t.Fatalf("unexpected index target: %s", entity.URL)
 			}
 			result = append(result, label)
+		}
+		if quotes != 1 {
+			t.Fatal("index rows must have one expandable quote")
 		}
 	}
 	return result
@@ -120,14 +128,14 @@ func TestProfileIndexPagesLinkWholeUTF16RowsAndKeepGlobalNumbers(t *testing.T) {
 	}
 	original := append([]profileIndexEntry(nil), entries...)
 	pages, err := renderProfileIndexPages(profileIndexAge, entries, chat)
-	if err != nil || len(pages) != 2 || len(pages[0].Entities) != 50 || len(pages[1].Entities) != 1 {
-		t.Fatalf("row-limit pagination: pages=%d err=%v", len(pages), err)
+	if err != nil || len(pages) != 1 || len(pages[0].Entities) != 52 || pages[0].Rich == nil {
+		t.Fatalf("unexpected arbitrary row pagination: pages=%d err=%v", len(pages), err)
 	}
 	rows := profileIndexRenderedRows(t, pages, chat)
 	if len(rows) != 51 || rows[0] != "1 ❔ 23, Name000🙂, 75%" || rows[50] != "51 ❔ 23, Name050🙂, 75%" {
 		t.Fatalf("global numbering or compact labels changed: %v", rows)
 	}
-	if pages[0].Entities[0].URL != forumTopicURL(chat, 1000) || pages[1].Entities[0].URL != forumTopicURL(chat, 1050) {
+	if pages[0].Entities[0].URL != profileIndexCardURL(chat, 100, 1000) || pages[0].Entities[50].URL != profileIndexCardURL(chat, 150, 1050) {
 		t.Fatal("row points to an unconfirmed or unrelated card ID")
 	}
 	if !reflect.DeepEqual(entries, original) {
@@ -136,9 +144,9 @@ func TestProfileIndexPagesLinkWholeUTF16RowsAndKeepGlobalNumbers(t *testing.T) {
 	for i := range entries {
 		entries[i].Name = strings.Repeat("🙂", 40) + fmt.Sprintf("%03d", i)
 	}
-	longPages, err := renderProfileIndexPages(profileIndexCompatibility, entries, chat)
-	if err != nil || len(longPages) < 2 || len(longPages[0].Entities) >= 50 {
-		t.Fatalf("UTF-16 budget did not split before row cap: %v", err)
+	longPages, err := renderProfileIndexPagesMode(profileIndexCompatibility, entries, chat, false)
+	if err != nil || len(longPages) < 2 || len(longPages[0].Entities) >= 50 || longPages[0].Rich != nil {
+		t.Fatalf("plain UTF-16 budget did not split: %v", err)
 	}
 	longRows := profileIndexRenderedRows(t, longPages, chat)
 	if len(longRows) != len(entries) || !strings.HasPrefix(longRows[len(longRows)-1], "51 ") {
@@ -148,7 +156,7 @@ func TestProfileIndexPagesLinkWholeUTF16RowsAndKeepGlobalNumbers(t *testing.T) {
 
 func TestProfileIndexEmptyAndInvalidDestinations(t *testing.T) {
 	pages, err := renderProfileIndexPages(profileIndexAge, nil, -1004401653948)
-	if err != nil || len(pages) != 1 || len(pages[0].Entities) != 0 || pages[0].Text != "🎂 По возрасту\n\nАнкет пока нет." {
+	if err != nil || len(pages) != 1 || len(pages[0].Entities) != 1 || pages[0].Text != "🎂 Возраст\nАнкет пока нет." || pages[0].Rich == nil {
 		t.Fatalf("empty index: %+v %v", pages, err)
 	}
 	for _, tc := range []struct {
@@ -163,6 +171,37 @@ func TestProfileIndexEmptyAndInvalidDestinations(t *testing.T) {
 		if _, err := renderProfileIndexPages(tc.kind, []profileIndexEntry{tc.entry}, tc.chat); err == nil {
 			t.Fatalf("invalid destination accepted: %+v", tc)
 		}
+	}
+}
+
+func TestProfileIndexRichBudgetKeeps834CompactRowsInOneFoldedView(t *testing.T) {
+	const chat int64 = -1004401653948
+	entries := make([]profileIndexEntry, 834)
+	for i := range entries {
+		entries[i] = profileIndexEntry{ID: int64(i + 1), ThreadID: int64(i + 100), CardID: int64(i + 1000), Name: "Сабина", Age: 19, AgeKnown: true, Percent: 70, PercentKnown: true, Zodiac: "♑️", PremiumKnown: true, Premium: true}
+	}
+	pages, err := renderProfileIndexPages(profileIndexCompatibility, entries, chat)
+	if err != nil || len(pages) != 1 {
+		t.Fatalf("compact catalogue unnecessarily split: pages=%d err=%v", len(pages), err)
+	}
+	rows := profileIndexRenderedRows(t, pages, chat)
+	if len(rows) != len(entries) || !strings.HasPrefix(rows[833], "834 ") || textUnits(pages[0].Text) <= 4096 {
+		t.Fatal("rich catalogue lost rows or still used the classic limit")
+	}
+	blocks := pages[0].Rich["blocks"].([]any)
+	if len(blocks) != 2 || blocks[1].(map[string]any)["type"] != "expandable_blockquote" {
+		t.Fatal("rich catalogue is not one folded block")
+	}
+	for i := range entries {
+		entries[i].Name = strings.Repeat("🙂", 40)
+	}
+	unicodePages, err := renderProfileIndexPages(profileIndexAge, entries[:400], chat)
+	if err != nil || len(unicodePages) != 1 || textUnits(unicodePages[0].Text) <= profileIndexRichLimit {
+		t.Fatal("rich budget incorrectly counted emoji as two characters", err)
+	}
+	pages, err = renderProfileIndexPages(profileIndexAge, entries, chat)
+	if err != nil || len(pages) < 2 || len(profileIndexRenderedRows(t, pages, chat)) != len(entries) {
+		t.Fatal("actual rich text budget did not paginate all rows", err)
 	}
 }
 
@@ -221,7 +260,7 @@ func TestProfileIndexPremiumStrictSourceAndOutsideLink(t *testing.T) {
 		}
 		for _, kind := range []string{profileIndexAge, profileIndexCompatibility} {
 			pages, err := renderProfileIndexPages(kind, []profileIndexEntry{e}, -1004401653948)
-			if err != nil || len(pages) != 1 || len(pages[0].Entities) != 1 {
+			if err != nil || len(pages) != 1 || len(pages[0].Entities) != 2 {
 				t.Fatalf("bad status page: %+v %v", pages, err)
 			}
 			entity := pages[0].Entities[0]

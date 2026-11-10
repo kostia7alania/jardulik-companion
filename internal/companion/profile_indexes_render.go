@@ -1,6 +1,7 @@
 package companion
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,11 +9,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const profileIndexCompatibility = "compatibility"
 const profileIndexAge = "age"
-const profileIndexRowsPerPage = 50
+const profileIndexRichLimit = 32768
 
 type profileIndexEntry struct {
 	ID, ThreadID, CardID   int64
@@ -27,40 +29,22 @@ type profileIndexEntry struct {
 type profileIndexPayload struct {
 	Text     string          `json:"text"`
 	Entities []MessageEntity `json:"entities"`
+	Rich     map[string]any  `json:"rich_message,omitempty"`
+	Legacy   bool            `json:"legacy,omitempty"`
 }
 
 func profileIndexTitle(kind string) string {
 	switch kind {
 	case profileIndexCompatibility:
-		return "🧩 По совместимости"
+		return "🧩 Совместимость"
 	case profileIndexAge:
-		return "🎂 По возрасту"
+		return "🎂 Возраст"
 	}
 	return ""
 }
 
 func profileIndexZodiac(p Profile, now time.Time) string {
-	date, known := birthdayGreetingDate(p)
-	if !known || date.After(time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)) {
-		return "❔"
-	}
-	// The same calendar cutoffs as birthdayGreetingSign, without its editorial guard.
-	boundaries := [...]struct {
-		start int
-		icon  string
-	}{
-		{120, "♒️"}, {219, "♓️"}, {321, "♈️"}, {420, "♉️"},
-		{521, "♊️"}, {621, "♋️"}, {723, "♌️"}, {823, "♍️"},
-		{923, "♎️"}, {1023, "♏️"}, {1122, "♐️"}, {1222, "♑️"},
-	}
-	day := int(date.Month())*100 + date.Day()
-	icon := "♑️"
-	for _, boundary := range boundaries {
-		if day >= boundary.start {
-			icon = boundary.icon
-		}
-	}
-	return icon
+	return profileZodiac(p, now)
 }
 
 func profileIndexPremium(p Profile) (premium, known bool) {
@@ -143,13 +127,18 @@ func profileIndexRow(n int, e profileIndexEntry) string {
 }
 
 func renderProfileIndexPages(kind string, entries []profileIndexEntry, chat int64) ([]profileIndexPayload, error) {
+	return renderProfileIndexPagesMode(kind, entries, chat, true)
+}
+
+func renderProfileIndexPagesMode(kind string, entries []profileIndexEntry, chat int64, rich bool) ([]profileIndexPayload, error) {
 	title := profileIndexTitle(kind)
 	if title == "" || forumTopicURL(chat, 1) == "" {
 		return nil, errors.New("invalid profile index destination or kind")
 	}
 	ordered := sortProfileIndex(kind, entries)
-	if len(ordered) == 0 {
-		return []profileIndexPayload{{Text: title + "\n\nАнкет пока нет.", Entities: []MessageEntity{}}}, nil
+	limit := 4096
+	if rich {
+		limit = profileIndexRichLimit
 	}
 	type row struct{ label, tail, link string }
 	var chunks [][]row
@@ -158,35 +147,46 @@ func renderProfileIndexPages(kind string, entries []profileIndexEntry, chat int6
 	for i, entry := range ordered {
 		label := profileIndexRow(i+1, entry)
 		tail := " " + profileIndexPremiumIcon(entry)
-		link := forumTopicURL(chat, entry.CardID)
+		link := profileIndexCardURL(chat, entry.ThreadID, entry.CardID)
 		if entry.ID <= 0 || entry.ThreadID <= 0 || entry.CardID <= 0 || link == "" {
 			return nil, errors.New("profile index has no confirmed card link")
 		}
-		// Leave room for the compact heading and page count as the archive grows.
-		if len(current) >= profileIndexRowsPerPage || units+1+textUnits(label+tail) > 4096-80 {
+		// Reserve room for the heading and an archival pointer if this slot is later retired.
+		if len(current) > 0 && units+1+profileIndexBudgetUnits(label+tail, rich) > limit-100 {
 			chunks = append(chunks, current)
 			current = nil
 			units = 0
 		}
 		current = append(current, row{label, tail, link})
-		units += 1 + textUnits(label+tail)
+		units += 1 + profileIndexBudgetUnits(label+tail, rich)
 	}
 	if len(current) > 0 {
 		chunks = append(chunks, current)
 	}
+	if len(chunks) == 0 {
+		chunks = append(chunks, nil)
+	}
 	pages := make([]profileIndexPayload, 0, len(chunks))
 	for i, chunk := range chunks {
-		payload := profileIndexPayload{Text: fmt.Sprintf("%s · %d/%d", title, i+1, len(chunks)), Entities: []MessageEntity{}}
+		heading := title
+		if len(chunks) > 1 {
+			heading = fmt.Sprintf("%s · %d/%d", title, i+1, len(chunks))
+		}
+		payload := profileIndexPayload{Text: heading, Entities: []MessageEntity{}}
 		for _, r := range chunk {
 			payload.Text += "\n"
 			offset := textUnits(payload.Text)
 			payload.Text += r.label + r.tail
 			payload.Entities = append(payload.Entities, MessageEntity{Type: "text_link", Offset: offset, Length: textUnits(r.label), URL: r.link})
 		}
-		if textUnits(payload.Text) > 4096 {
-			return nil, errors.New("profile index exceeds Telegram message limit")
+		if len(chunk) == 0 {
+			payload.Text += "\nАнкет пока нет."
 		}
-		if err := validMessageEntities(payload.Text, payload.Entities); err != nil {
+		payload.Entities = append(payload.Entities, MessageEntity{Type: "expandable_blockquote", Offset: textUnits(heading) + 1, Length: textUnits(payload.Text) - textUnits(heading) - 1})
+		if rich {
+			payload.Rich = profileIndexRichContent(payload)
+		}
+		if err := validProfileIndexPayload(payload); err != nil {
 			return nil, err
 		}
 		pages = append(pages, payload)
@@ -194,7 +194,83 @@ func renderProfileIndexPages(kind string, entries []profileIndexEntry, chat int6
 	return pages, nil
 }
 
+func profileIndexBudgetUnits(text string, rich bool) int {
+	if rich {
+		return utf8.RuneCountInString(text)
+	}
+	return textUnits(text)
+}
+
+func profileIndexCardURL(chat, thread, message int64) string {
+	base := forumTopicURL(chat, thread)
+	if base == "" || message <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s/%d", base, message)
+}
+
+func profileIndexRichContent(payload profileIndexPayload) map[string]any {
+	parts := strings.SplitN(payload.Text, "\n", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	headingUnits := textUnits(parts[0])
+	text := func(value string, start int) any {
+		var links []MessageEntity
+		for _, entity := range payload.Entities {
+			if entity.Type == "text_link" && entity.Offset >= start && entity.Offset+entity.Length <= start+textUnits(value) {
+				entity.Offset -= start
+				links = append(links, entity)
+			}
+		}
+		sort.Slice(links, func(i, j int) bool { return links[i].Offset < links[j].Offset })
+		var result []any
+		cursor := 0
+		for _, link := range links {
+			_, remaining := telegramPrefix(value, cursor)
+			prefix, rest := telegramPrefix(remaining, link.Offset-cursor)
+			label, _ := telegramPrefix(rest, link.Length)
+			if prefix != "" {
+				result = append(result, prefix)
+			}
+			result = append(result, map[string]any{"type": "url", "text": label, "url": link.URL})
+			cursor = link.Offset + link.Length
+		}
+		_, tail := telegramPrefix(value, cursor)
+		if tail != "" || len(result) == 0 {
+			result = append(result, tail)
+		}
+		return result
+	}
+	return map[string]any{"skip_entity_detection": true, "blocks": []any{
+		map[string]any{"type": "paragraph", "text": text(parts[0], 0)},
+		map[string]any{"type": "expandable_blockquote", "text": text(parts[1], headingUnits+1)},
+	}}
+}
+
+func validProfileIndexPayload(payload profileIndexPayload) error {
+	limit := 4096
+	if payload.Rich != nil {
+		limit = profileIndexRichLimit
+		want, err := json.Marshal(profileIndexRichContent(payload))
+		if err != nil {
+			return err
+		}
+		got, err := json.Marshal(payload.Rich)
+		if err != nil || !bytes.Equal(want, got) {
+			return errors.New("invalid rich profile index structure")
+		}
+	}
+	if strings.TrimSpace(payload.Text) == "" || profileIndexBudgetUnits(payload.Text, payload.Rich != nil) > limit {
+		return errors.New("profile index exceeds Telegram message limit")
+	}
+	return validMessageEntities(payload.Text, payload.Entities)
+}
+
 func profileIndexPayloadBytes(payload profileIndexPayload) ([]byte, string, error) {
+	if err := validProfileIndexPayload(payload); err != nil {
+		return nil, "", err
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", err

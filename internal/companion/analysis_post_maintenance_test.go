@@ -34,6 +34,10 @@ func TestAnalysisPostMaintenanceEditsKnownMessageAndKeepsRaw(t *testing.T) {
 	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// This contract exercises the saved GPT receipt after profile formatting.
+	if _, err := s.Store.DB.Exec("UPDATE caption_maintenance_jobs SET state='done' WHERE kind<>'analysis'"); err != nil {
+		t.Fatal(err)
+	}
 	var count int
 	if err := s.Store.DB.QueryRow("SELECT COUNT(*) FROM caption_maintenance_jobs WHERE revision=? AND kind='analysis'", captionDesignRevision).Scan(&count); err != nil || count != 1 {
 		t.Fatal("maintenance duplicated", count, err)

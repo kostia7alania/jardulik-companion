@@ -39,7 +39,7 @@ func (a *Archiver) sendCurrentProfileCard(ctx context.Context, p StoredProfile, 
 	if !a.Config.RichCards {
 		return a.sendProfileCard(ctx, p, jobs, thread, save)
 	}
-	card, err := BuildRichProfileCard(p, jobs, forumTopicURL(a.Config.BackupChatID, thread))
+	card, err := BuildRichProfileCard(p, jobs, forumThreadURL(a.Config.BackupChatID, thread))
 	if errors.Is(err, ErrRichCardTooLarge) {
 		return a.sendProfileCard(ctx, p, jobs, thread, save)
 	}

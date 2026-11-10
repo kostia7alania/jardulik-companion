@@ -1687,18 +1687,32 @@ func TestNewManifestsOmitDeviceAndOldExtendedZIPIsRewrittenPrivately(t *testing.
 	}
 }
 
-func TestArchiveCaptionKeepsTopicLinkAtEndWithinUTF16Budget(t *testing.T) {
+func TestArchiveCaptionLinksHeadingWithinUTF16Budget(t *testing.T) {
 	_, _, a, p, _ := archivePresentationFixture(t)
 	p.Profile["description"] = strings.Repeat("🙂", 3000)
-	link := forumTopicURL(a.Config.BackupChatID, 55)
+	originalRaw := p.RawJSON
+	link := forumThreadURL(a.Config.BackupChatID, 55)
 	for _, limit := range []int{1024, 4096} {
 		card, err := a.profileCardContent(p, 0, 55, limit, limit == 4096, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		caption := card.Text
-		if textUnits(caption) > limit || !strings.HasSuffix(caption, "🔗 пост") || len(card.Entities) < 2 || card.Entities[len(card.Entities)-1].URL != link {
-			t.Fatalf("caption lost final topic link or exceeded budget: units=%d limit=%d", textUnits(caption), limit)
+		if textUnits(caption) > limit || strings.Contains(caption, "🔗 пост") {
+			t.Fatalf("caption has a footer link or exceeded budget: units=%d limit=%d", textUnits(caption), limit)
+		}
+		heading, _, _ := strings.Cut(caption, "\n")
+		headingLinks := 0
+		for _, entity := range card.Entities {
+			if entity.Type == "text_link" && entity.URL == link && entity.Offset == 0 && entity.Length == textUnits(heading) {
+				headingLinks++
+			}
+		}
+		if headingLinks != 1 {
+			t.Fatalf("caption lost its single linked heading: %+v", card.Entities)
+		}
+		if p.RawJSON != originalRaw {
+			t.Fatal("caption presentation modified source JSON")
 		}
 	}
 }
@@ -1718,8 +1732,27 @@ func TestZIPRepairRefreshesConfirmedCaptionWithoutReupload(t *testing.T) {
 		case "editMessageMedia":
 			return fmt.Sprintf(`{"ok":true,"result":{"message_id":11,"chat":{"id":-100123},"document":{"file_id":"new-zip","file_unique_id":"new-unique","file_size":%d}}}`, len(call.fields["archive"])), nil
 		case "editMessageCaption":
-			if call.json["message_id"] != float64(101) || !strings.HasSuffix(call.json["caption"].(string), "🔗 пост") {
-				t.Fatal("confirmed card caption/link was not refreshed in place")
+			caption := call.json["caption"].(string)
+			if call.json["message_id"] != float64(101) || textUnits(caption) > 1024 || strings.Contains(caption, "🔗 пост") {
+				t.Fatal("confirmed card caption was not refreshed in place within its budget")
+			}
+			encoded, err := json.Marshal(call.json["caption_entities"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entities []MessageEntity
+			if err = json.Unmarshal(encoded, &entities); err != nil {
+				t.Fatal(err)
+			}
+			heading, _, _ := strings.Cut(caption, "\n")
+			headingLinks := 0
+			for _, entity := range entities {
+				if entity.Type == "text_link" && entity.URL == forumThreadURL(c.BackupChatID, 55) && entity.Offset == 0 && entity.Length == textUnits(heading) {
+					headingLinks++
+				}
+			}
+			if headingLinks != 1 {
+				t.Fatal("confirmed caption lost its single linked heading")
 			}
 			return `{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}`, nil
 		default:

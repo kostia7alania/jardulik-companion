@@ -245,11 +245,11 @@ func (s *Store) enqueueCompatibility(ctx context.Context, j CompatibilityJob, no
 	state = "queued"
 	var analysis any
 	if analysisID > 0 {
-		state = "succeeded"
+		state, reason = "succeeded", "cached_analysis"
 		analysis = analysisID
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO compatibility_jobs(pair_id,generation,version_id,own_hash,target_hash,input_hash,filter_hash,own_profile,target_profile,state,analysis_id,created_at_ms,updated_at_ms)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, j.PairID, j.Generation, j.VersionID, j.OwnHash, j.TargetHash, j.InputHash, j.FilterHash, j.OwnProfile, j.TargetProfile, state, analysis, now.UnixMilli(), now.UnixMilli())
+	_, err = tx.ExecContext(ctx, `INSERT INTO compatibility_jobs(pair_id,generation,version_id,own_hash,target_hash,input_hash,filter_hash,own_profile,target_profile,state,analysis_id,reason,created_at_ms,updated_at_ms)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, j.PairID, j.Generation, j.VersionID, j.OwnHash, j.TargetHash, j.InputHash, j.FilterHash, j.OwnProfile, j.TargetProfile, state, analysis, reason, now.UnixMilli(), now.UnixMilli())
 	if err != nil {
 		return err
 	}

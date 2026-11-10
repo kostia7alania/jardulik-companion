@@ -720,7 +720,7 @@ func moderationText(p StoredProfile, _ string, missing int) string {
 }
 
 func (a *Archiver) profileCardContent(p StoredProfile, missing int, thread int64, limit int, noPhotos bool, photos []MediaJob) (photoText, error) {
-	return renderProfileCard(p, photos, missing, noPhotos, forumTopicURL(a.Config.BackupChatID, thread), limit, false)
+	return renderProfileCard(p, photos, missing, noPhotos, forumThreadURL(a.Config.BackupChatID, thread), limit, false)
 }
 
 func archiveProfileKeyboard(version int64) any {
@@ -1706,7 +1706,7 @@ func (a *Archiver) refreshConfirmedProfileCaption(ctx context.Context, version, 
 			return errors.New("rich card inventory is invalid")
 		}
 		return a.groupCall(ctx, func() error {
-			_, err := richProfileEdit(ctx, a.Store, a.TG, owner, a.Config.BackupChatID, thread, ids[0], p, jobs, forumTopicURL(a.Config.BackupChatID, thread))
+			_, err := richProfileEdit(ctx, a.Store, a.TG, owner, a.Config.BackupChatID, thread, ids[0], p, jobs, forumThreadURL(a.Config.BackupChatID, thread))
 			return err
 		})
 	}

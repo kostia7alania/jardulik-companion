@@ -531,6 +531,15 @@ func (s *Service) deliverAnalysisPost(ctx context.Context) (bool, error) {
 	if err := s.seedAnalysisPosts(sendCtx); err != nil {
 		return false, err
 	}
+	if s.Store.cfg.SyncCycleEnabled {
+		if err := s.initArchiveChangePosts(sendCtx); err != nil {
+			return false, err
+		}
+		// Materialize eligible changes before absence can mean an initial/no-op version.
+		if err := s.enqueueArchiveChangePosts(sendCtx); err != nil {
+			return false, err
+		}
+	}
 	presenceGuard, err := analysisPostPresenceGuard(sendCtx, s.Store)
 	if err != nil {
 		return false, err
@@ -594,7 +603,7 @@ func (s *Service) deliverAnalysisPost(ctx context.Context) (bool, error) {
 		// Repeat the binding check after a confirmed 429, without another state transition.
 		binding := ` AND p.owner_id=? AND p.upstream_id=?
  AND EXISTS(SELECT 1 FROM sessions se WHERE se.owner_id=p.owner_id AND se.upstream_id=p.upstream_id)
- AND EXISTS(SELECT 1 FROM mirror_topics t WHERE t.profile_id=p.profile_id AND t.thread_id=p.thread_id)` + presenceGuard
+ AND EXISTS(SELECT 1 FROM mirror_topics t WHERE t.profile_id=p.profile_id AND t.thread_id=p.thread_id) AND ` + s.Store.syncAnalysisPostReadyAt("p.thread_id") + presenceGuard
 		if !attempted {
 			result, markErr := s.Store.DB.ExecContext(sendCtx, `UPDATE analysis_posts AS p SET state='sending',updated_at=CURRENT_TIMESTAMP WHERE analysis_id=? AND state='preparing'`+binding, id, s.Config.OwnerID, analysis.UpstreamID)
 			if markErr != nil {

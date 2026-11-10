@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const captionDesignRevision = "2026-11-10-gallery-captions-v4"
+const captionDesignRevision = "2026-11-10-linked-profile-cards-v6"
 const captionNoticeRevision = "2026-11-10-rating-short-photo-v1"
 const captionMaintenanceSchema = `
 CREATE TABLE IF NOT EXISTS caption_maintenance_jobs (
@@ -259,7 +259,13 @@ func (w *captionMaintenanceWorker) claim(ctx context.Context) (*captionMaintenan
 	}
 	var j captionMaintenanceJob
 	err = tx.QueryRowContext(ctx, `SELECT id,kind,receipt_id,owner_id,version_id,inventory,source_sha,chat_id,thread_id,attempts FROM caption_maintenance_jobs
- WHERE revision=? AND state IN ('pending','retry') AND next_attempt<=? `+w.service.Store.syncPublicationPhaseCandidates("caption_maintenance_jobs.owner_id")+` ORDER BY CASE WHEN kind='analysis' THEN 0 WHEN kind IN ('change','presence') THEN 1 WHEN EXISTS(SELECT 1 FROM versions v WHERE v.id=caption_maintenance_jobs.version_id AND CASE WHEN json_valid(v.raw_json) THEN json_extract(v.raw_json,'$.type')=1 ELSE 0 END) THEN 2 ELSE 3 END,CASE WHEN kind='analysis' THEN -receipt_id ELSE id END LIMIT 1`, captionDesignRevision, w.now().UnixMilli()).Scan(&j.id, &j.kind, &j.receipt, &j.owner, &j.version, &j.inventory, &j.source, &j.chat, &j.thread, &j.attempts)
+ WHERE revision=? AND state IN ('pending','retry') AND next_attempt<=?
+ AND EXISTS(SELECT 1 FROM users u WHERE u.id=caption_maintenance_jobs.owner_id AND u.paused=0)
+ ORDER BY CASE WHEN kind='archive' AND NOT EXISTS(
+ SELECT 1 FROM archive_versions newer JOIN versions current ON current.id=caption_maintenance_jobs.version_id
+ WHERE newer.owner_id=caption_maintenance_jobs.owner_id AND newer.profile_id=current.profile_id
+ AND newer.state IN ('sent','partial') AND newer.version_id>caption_maintenance_jobs.version_id) THEN 0
+ WHEN kind='analysis' THEN 1 WHEN kind IN ('change','presence') THEN 2 WHEN EXISTS(SELECT 1 FROM versions v WHERE v.id=caption_maintenance_jobs.version_id AND CASE WHEN json_valid(v.raw_json) THEN json_extract(v.raw_json,'$.type')=1 ELSE 0 END) THEN 3 ELSE 4 END,CASE WHEN kind='analysis' THEN -receipt_id ELSE id END LIMIT 1`, captionDesignRevision, w.now().UnixMilli()).Scan(&j.id, &j.kind, &j.receipt, &j.owner, &j.version, &j.inventory, &j.source, &j.chat, &j.thread, &j.attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -368,7 +374,7 @@ func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMainte
 		}
 		link := s.profilePostURL(ctx, j.owner, p)
 		if j.kind == "archive" {
-			link = forumTopicURL(s.Config.BackupChatID, j.thread)
+			link = forumThreadURL(s.Config.BackupChatID, j.thread)
 		}
 		card, err := BuildRichProfileCard(p, jobs, link)
 		if err != nil {
@@ -440,11 +446,16 @@ func (w *captionMaintenanceWorker) step(ctx context.Context) (bool, error) {
 	if err != nil || j == nil {
 		return false, err
 	}
+	expected, err := s.savedMessageEditSession(ctx, j.owner)
+	if err != nil {
+		return true, w.finish(ctx, j, "retry", "source_binding_deferred", w.now().Add(4*time.Second))
+	}
 	if err = s.Archiver.groupSlot(ctx); err != nil {
 		return true, w.finish(ctx, j, "retry", "pacing_wait", w.now().Add(4*time.Second))
 	}
-	if err = s.Store.requireSyncPublication(ctx, j.owner); err != nil {
-		return true, w.finish(ctx, j, "retry", "sync_cycle_collecting", w.now().Add(4*time.Second))
+	current, err := s.savedMessageEditSession(ctx, j.owner)
+	if err != nil || current.UserID != expected.UserID || current.Generation != expected.Generation {
+		return true, w.finish(ctx, j, "retry", "source_binding_deferred", w.now().Add(4*time.Second))
 	}
 	// Waiting, including a restart during pacing, does not consume an attempt.
 	if err = w.beginAttempt(ctx, j); err != nil {
@@ -510,4 +521,36 @@ func (w *captionMaintenanceWorker) retry(ctx context.Context, j *captionMaintena
 		return w.finish(ctx, j, "failed", reason, time.Time{})
 	}
 	return w.finish(ctx, j, "retry", reason, w.now().Add(delay))
+}
+
+// Formatting edits use an existing receipt and immutable snapshot, so collection
+// can continue. A pause, blocked source or changed session still defers the edit.
+func (s *Service) savedMessageEditSession(ctx context.Context, owner int64) (Session, error) {
+	var paused bool
+	if err := s.Store.DB.QueryRowContext(ctx, "SELECT paused FROM users WHERE id=?", owner).Scan(&paused); err != nil {
+		return Session{}, err
+	}
+	// ArchivePaused stops new archival publication; this separately scheduled
+	// formatter edits only already confirmed message IDs and source snapshots.
+	if paused {
+		return Session{}, errSyncPublicationDeferred
+	}
+	if !s.Config.SyncCycleEnabled {
+		return Session{}, nil
+	}
+	ss, err := s.Store.Session(ctx, owner)
+	if err != nil {
+		return Session{}, err
+	}
+	if ss.State != "connected" {
+		return Session{}, errSyncPublicationDeferred
+	}
+	cycle, err := s.Store.SyncCycle(ctx, owner)
+	if err != nil {
+		return Session{}, err
+	}
+	if cycle != nil && (cycle.Stage == "blocked" || cycle.UserID != ss.UserID || cycle.Generation != ss.Generation) {
+		return Session{}, errSyncPublicationDeferred
+	}
+	return ss, nil
 }

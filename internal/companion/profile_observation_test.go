@@ -150,6 +150,22 @@ func TestCompatibilityObservationRecordsReturnAndChangesBeforeRescheduling(t *te
 	}
 	f.now = f.now.Add(time.Minute)
 	f.target["description"] = "returned with new text"
+	ss, err := f.service.Store.Session(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Known-unavailable targets are revisited by the shared checker, not GPT.
+	p, _, observed, err := f.service.Client.checkedProfileObserved(ctx, 1, ss, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu := f.service.Store.SessionMutex(1)
+	mu.Lock()
+	_, err = f.service.captureCheckedProfileLocked(ctx, 1, ss, p, observed)
+	mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if ran, err := f.service.compatibilityStep(ctx); err != nil || ran || f.state(t) != "cancelled" || f.posts != 0 {
 		t.Fatal("changed input reached GPT", ran, err)
 	}

@@ -141,7 +141,7 @@ func (s *Service) profilePostURL(ctx context.Context, recipient int64, p StoredP
 	if err := s.Store.DB.QueryRowContext(ctx, "SELECT thread_id FROM mirror_topics WHERE profile_id=?", p.ID).Scan(&thread); err != nil {
 		return ""
 	}
-	return forumTopicURL(s.Config.BackupChatID, thread)
+	return forumThreadURL(s.Config.BackupChatID, thread)
 }
 func (s *Service) cardText(ctx context.Context, owner int64, p StoredProfile) string {
 	text := profileText(p)

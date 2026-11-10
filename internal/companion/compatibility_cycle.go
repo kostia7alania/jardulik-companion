@@ -224,25 +224,20 @@ func (s *Service) planSyncCompatibilityTarget(ctx context.Context, cycle SyncCyc
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	// A terminal outcome is stable for this cycle and exact input. A meaningful
-	// profile change creates a new input without replaying an uncertain old POST.
-	if previousInput == inputHash && previousState != "pending" && previousState != "excluded" && previousState != "unavailable" && state == "pending" {
-		return nil
-	}
 	if state == "pending" {
-		exists, e := snapshotHasTable(ctx, s.Store.DB, "profile_presence")
+		unavailable, e := profileKnownUnavailable(ctx, s.Store.DB, cycle.OwnerID, target.ID)
 		if e != nil {
 			return e
 		}
-		if exists {
-			var unavailable bool
-			if e = s.Store.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM profile_presence WHERE owner_id=? AND profile_id=? AND availability='unavailable')`, cycle.OwnerID, target.ID).Scan(&unavailable); e != nil {
-				return e
-			}
-			if unavailable {
-				state, reason = "unavailable", "target_unavailable"
-			}
+		if unavailable {
+			state, reason = "unavailable", "target_unavailable"
 		}
+	}
+	// Keep the outcome and original analysis snapshot; only advance the current
+	// profile version when a new photo or another non-input field changes.
+	if previousInput == inputHash && previousState != "pending" && previousState != "excluded" && previousState != "unavailable" && state == "pending" {
+		_, err = s.Store.DB.ExecContext(ctx, "UPDATE compatibility_cycle_targets SET version_id=?,updated_at_ms=? WHERE cycle_id=? AND profile_id=? AND input_hash=?", target.VersionID, now.UnixMilli(), cycle.ID, target.ID, inputHash)
+		return err
 	}
 	_, err = s.Store.DB.ExecContext(ctx, `INSERT INTO compatibility_cycle_targets(cycle_id,profile_id,version_id,input_hash,state,reason,updated_at_ms) VALUES(?,?,?,?,?,?,?)
  ON CONFLICT(cycle_id,profile_id) DO UPDATE SET version_id=excluded.version_id,input_hash=excluded.input_hash,state=excluded.state,reason=excluded.reason,updated_at_ms=excluded.updated_at_ms`, cycle.ID, target.ID, target.VersionID, inputHash, state, reason, now.UnixMilli())

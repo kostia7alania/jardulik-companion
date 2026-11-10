@@ -776,6 +776,17 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 		}
 		return true, c.checkpointFailed(ctx, j, target, "profile_page", err)
 	}
+	if j.Mode == 3 {
+		stored, queueErr := s.Store.Profile(ctx, j.Owner, target)
+		if queueErr == nil {
+			queueErr = s.queueCheckedCompatibility(ctx, j.Owner, expected, stored)
+		}
+		if queueErr != nil {
+			// The full-read checkpoint is durable. The normal planner repairs the
+			// queue without replaying the successful source GET.
+			slog.Warn("compatibility enqueue deferred", "kind", safeError(queueErr))
+		}
+	}
 	return true, nil
 }
 

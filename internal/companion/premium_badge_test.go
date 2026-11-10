@@ -34,9 +34,9 @@ func TestPremiumBadgeUsesOnlyJardulikTypeOne(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			raw := `{"userId":7,"name":"Ира","surName":"Иванова","age":25,"height":170,"city":"Moscow","is_premium":true` + tc.field + `}`
 			p := premiumBadgeProfile(t, raw)
-			want := "Ира Иванова, 25/170"
+			want := "💁Ира Иванова, 25/170, ❔"
 			if tc.premium {
-				want += " ⭐ Premium"
+				want += " ⭐️"
 			}
 			text := profileText(p)
 			if first, _, _ := strings.Cut(text, "\n"); first != want {
@@ -60,7 +60,7 @@ func TestPremiumBadgeSharedPrivateArchiveAndRichKeepsExactRaw(t *testing.T) {
 	if err = json.Indent(&pretty, []byte(raw), "", "  "); err != nil {
 		t.Fatal(err)
 	}
-	const heading = "Ира, 25/170 ⭐ Premium"
+	const heading = "💁Ира, 25/170, ❔ ⭐️"
 	for _, private := range []bool{false, true} {
 		card, err := renderProfileCard(p, nil, 0, true, "", 4096, private)
 		if err != nil {

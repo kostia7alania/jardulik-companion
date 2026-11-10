@@ -84,16 +84,16 @@ func (s *Store) InitCompatibility(ctx context.Context) error {
 	return err
 }
 
-// Exclude balances, subscription dates and other account counters from cache identity.
+// The requested text-only policy ignores photo changes and account counters.
 func compatibilityProfileHash(p Profile) string {
 	fields := Profile{}
-	for _, key := range []string{"userId", "name", "surName", "birthday", "age", "gender", "country", "city", "worldview", "description", "profession", "familyNames", "children", "goal", "height", "language", "languages", "fileName", "miniFileName", "photos", "miniPhotos"} {
+	for _, key := range []string{"userId", "name", "surName", "birthday", "age", "gender", "country", "city", "worldview", "description", "profession", "familyNames", "children", "goal", "height", "language", "languages"} {
 		if value, ok := p[key]; ok {
 			fields[key] = value
 		}
 	}
 	raw, _ := json.Marshal(fields)
-	return digest(append([]byte("jardulik-compatibility-profile-v1\n"), raw...))
+	return digest(append([]byte("jardulik-compatibility-profile-text-v2\n"), raw...))
 }
 func compatibilityInputHash(ownHash, targetHash string) string {
 	return digest([]byte("jardulik-compatibility-pair-v1\n" + ownHash + "\n" + targetHash))
@@ -272,6 +272,33 @@ func (s *Store) StartCompatibilityJob(ctx context.Context, j CompatibilityJob, o
 	if paused || session.State != "connected" || session.UserID != j.FromUserID || session.Generation != j.Generation {
 		return ErrCompatibilityUnavailable
 	}
+	missing, err := profileKnownUnavailable(ctx, tx, j.OwnerID, j.TargetUserID)
+	if err != nil {
+		return err
+	}
+	if missing {
+		return ErrCompatibilityUnavailable
+	}
+	var currentAccount []byte
+	if err = tx.QueryRowContext(ctx, "SELECT account_json FROM sessions WHERE owner_id=?", j.OwnerID).Scan(&currentAccount); err != nil {
+		return err
+	}
+	latestOwn, ownErr := debugProfile(currentAccount)
+	if ownErr == nil {
+		frozen, known := latestOwn["freezeState"].(bool)
+		if !known || frozen || !compatibilityAdult(latestOwn) {
+			return ErrCompatibilityUnavailable
+		}
+	}
+	var latestRaw string
+	var latestVersion int64
+	if err = tx.QueryRowContext(ctx, `SELECT v.id,v.raw_json FROM queue q JOIN versions v ON v.id=q.version_id AND v.owner_id=q.owner_id AND v.profile_id=q.profile_id WHERE q.owner_id=? AND q.profile_id=?`, j.OwnerID, j.TargetUserID).Scan(&latestVersion, &latestRaw); err != nil {
+		return err
+	}
+	latestTarget, targetErr := debugProfile([]byte(latestRaw))
+	if j.VersionID != latestVersion || ownErr != nil || targetErr != nil || compatibilityProfileHash(latestOwn) != j.OwnHash || compatibilityProfileHash(latestTarget) != j.TargetHash {
+		return ErrCompatibilityInputChanged
+	}
 	if !s.cfg.SyncCycleEnabled && j.FilterHash == compatibilityArchiveScope {
 		return ErrCompatibilityUnavailable
 	}
@@ -325,8 +352,8 @@ func (s *Store) StartCompatibilityJob(ctx context.Context, j CompatibilityJob, o
 	if err = compatibilityCooldown(ctx, tx, now); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE compatibility_jobs SET state='sending',own_profile=?,target_profile=?,request_body=?,reason='',updated_at_ms=?
- WHERE id=? AND pair_id=? AND generation=? AND input_hash=? AND state='preparing'`, ownRaw, targetRaw, request, now.UnixMilli(), j.ID, j.PairID, j.Generation, j.InputHash)
+	result, err := tx.ExecContext(ctx, `UPDATE compatibility_jobs SET state='sending',version_id=?,own_profile=?,target_profile=?,request_body=?,reason='',updated_at_ms=?
+	WHERE id=? AND pair_id=? AND generation=? AND input_hash=? AND state='preparing'`, j.VersionID, ownRaw, targetRaw, request, now.UnixMilli(), j.ID, j.PairID, j.Generation, j.InputHash)
 	if err != nil {
 		return err
 	}

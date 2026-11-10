@@ -46,11 +46,45 @@ func forumThreadURL(chatID, threadID int64) string {
 }
 
 func profileHeading(v Profile) string {
-	name:=strings.Join(strings.Fields(v.String("name")+" "+v.String("surName"))," ")
-	age,height:=v.String("age"),v.String("height")
-	if age=="0" {age=""};if height=="0" {height=""}
-	if age!="" || height!="" {name+=", "+strings.Trim(age+"/"+height,"/")}
+	name := strings.Join(strings.Fields(v.String("name")+" "+v.String("surName")), " ")
+	age, height := v.String("age"), v.String("height")
+	if age == "0" {
+		age = ""
+	}
+	if height == "0" {
+		height = ""
+	}
+	if age != "" || height != "" {
+		name += ", " + strings.Trim(age+"/"+height, "/")
+	}
 	return name
+}
+
+// The card heading stays source-neutral; viewer-specific scores belong to their own posts.
+func profileCardHeading(p Profile, now time.Time) string {
+	icon := "💁"
+	if gender, known := autoInteger(p["gender"]); known {
+		switch gender {
+		case 1:
+			icon = "💁‍♂️"
+		case 2:
+			icon = "💁‍♀️"
+		}
+	}
+	heading := profileHeading(p)
+	if strings.TrimSpace(p.String("name")+p.String("surName")) == "" {
+		heading = strings.TrimSpace(strings.TrimPrefix(heading, ","))
+		if heading == "" {
+			heading = "Анкета"
+		} else {
+			heading = "Анкета, " + heading
+		}
+	}
+	heading = icon + heading + ", " + profileZodiac(p, now)
+	if premium, known := profileIndexPremium(p); known && premium {
+		heading += " ⭐️"
+	}
+	return heading
 }
 
 // Telegram entity offsets count UTF-16 units. Keeping this stricter budget also

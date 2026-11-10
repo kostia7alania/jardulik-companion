@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strconv"
+	"log/slog"
 	"time"
 )
 
@@ -201,11 +201,7 @@ func (s *Service) syncRefreshOne(ctx context.Context, c SyncCycle, ss Session, n
 	if err != nil || target == 0 {
 		return false, err
 	}
-	if err = s.Store.KnownProfile(ctx, c.OwnerID, target); err != nil {
-		return false, err
-	}
-	path := "/user/getUser?viewerUserId=" + strconv.FormatInt(c.UserID, 10) + "&targetUserId=" + strconv.FormatInt(target, 10)
-	raw, observed, requestErr := s.Client.requestSessionObserved(withCrawlPriority(ctx, s), c.OwnerID, "GET", path, nil, &ss)
+	p, _, observed, requestErr := s.Client.checkedProfileObserved(withCrawlPriority(ctx, s), c.OwnerID, ss, target)
 	finished := s.Client.Now()
 	gap := 20 * time.Second
 	if s.Watcher != nil {
@@ -224,20 +220,13 @@ func (s *Service) syncRefreshOne(ctx context.Context, c SyncCycle, ss Session, n
 	}
 	state, version := "unavailable", int64(0)
 	if requestErr == nil {
-		p, e := debugProfile(raw)
-		if e != nil || p.ID() != target {
-			return true, s.deferSyncRefreshError(ctx, c, target, errors.New("sync profile identity or format changed"), finished)
-		}
-		versions, e := s.Store.ArchiveViewed(ctx, c.OwnerID, []Profile{p}, "GET /user/getUser")
+		stored, e := s.captureCheckedProfileLocked(ctx, c.OwnerID, ss, p, observed)
 		if e != nil {
 			return true, e
 		}
-		version = versions[0]
-		if _, err = s.Store.recordProfilePresence(ctx, c.OwnerID, target, true, observed); err != nil {
-			return true, err
-		}
-		if err = s.Store.RecordSyncFullCapture(ctx, c.OwnerID, ss, target, version, observed); err != nil {
-			return true, err
+		version = stored.VersionID
+		if queueErr := s.queueCheckedCompatibility(ctx, c.OwnerID, ss, stored); queueErr != nil {
+			slog.Warn("compatibility enqueue deferred", "kind", safeError(queueErr))
 		}
 		state = "available"
 	} else if !errors.Is(requestErr, ErrProfileUnavailable) {

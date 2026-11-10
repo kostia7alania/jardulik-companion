@@ -55,6 +55,9 @@ func newProfileIndexesFixture(t *testing.T) *profileIndexesFixture {
 			f.nextThread++
 			return albumTestResponse(r, 200, fmt.Sprintf(`{"ok":true,"result":{"message_thread_id":%d}}`, f.nextThread)), nil
 		}
+		if method == "editForumTopic" {
+			return albumTestResponse(r, 200, `{"ok":true,"result":true}`), nil
+		}
 		var thread, message int64
 		_ = json.Unmarshal(body["message_thread_id"], &thread)
 		_ = json.Unmarshal(body["message_id"], &message)
@@ -186,14 +189,14 @@ func TestProfileIndexesCurrentOwnerConfirmedArchiveAndLatestRating(t *testing.T)
 	}
 }
 
-func TestProfileIndexesCreateTwoTopicsSendOnceAndEditExistingPages(t *testing.T) {
+func TestProfileIndexesCreateOneCatalogueSendBothViewsOnceAndEditExistingPages(t *testing.T) {
 	f := newProfileIndexesFixture(t)
 	p := f.add(t, 10, 23, "Name🙂", "2003-03-01")
 	f.analysis(t, p, "Оценка совместимости: 75%", f.now)
-	for range 4 {
+	for range 3 {
 		f.step(t)
 	}
-	if f.count(t, "SELECT count(*) FROM profile_index_topics WHERE state='sent'") != 2 || f.count(t, "SELECT count(*) FROM profile_index_pages WHERE state='sent' AND message_id>0") != 2 {
+	if f.count(t, "SELECT count(*) FROM profile_index_topics WHERE state='sent'") != 1 || f.count(t, "SELECT count(*) FROM profile_index_pages WHERE state='sent' AND message_id>0") != 2 {
 		t.Fatal("missing topics/pages")
 	}
 	oldIDs := []int64{}
@@ -233,10 +236,10 @@ func TestProfileIndexesCreateTwoTopicsSendOnceAndEditExistingPages(t *testing.T)
 	if !reflect.DeepEqual(oldIDs, gotIDs) {
 		t.Fatal("index edit created replacement posts", oldIDs, gotIDs)
 	}
-	if strings.Join(f.operations, ",") != "createForumTopic,createForumTopic,sendMessage,sendMessage,editMessageText,editMessageText" {
+	if strings.Join(f.operations, ",") != "createForumTopic,sendMessage,sendMessage,editMessageText,editMessageText" {
 		t.Fatal(f.operations)
 	}
-	for _, b := range f.bodies[4:] {
+	for _, b := range f.bodies[3:] {
 		var text string
 		_ = json.Unmarshal(b["text"], &text)
 		if !strings.Contains(text, "81%") {
@@ -291,7 +294,7 @@ func TestProfileIndexesUnknownCreateOrSendNeverBlindlyRepeats(t *testing.T) {
 func TestProfileIndexesKnownEditRetryAndNotModified(t *testing.T) {
 	f := newProfileIndexesFixture(t)
 	p := f.add(t, 10, 23, "Name", "2003-03-01")
-	for range 4 {
+	for range 3 {
 		f.step(t)
 	}
 	f.analysis(t, p, "Оценка совместимости: 75%", f.now)
@@ -410,7 +413,7 @@ func TestProfileIndexesUnsentPageReturnsAfterShrinkAndGrow(t *testing.T) {
 func TestProfileIndexesWrongEditAckKeepsKnownMessageID(t *testing.T) {
 	f := newProfileIndexesFixture(t)
 	p := f.add(t, 10, 23, "Name", "2003-03-01")
-	for range 4 {
+	for range 3 {
 		f.step(t)
 	}
 	var topic, known, thread int64
@@ -510,7 +513,7 @@ func TestProfileIndexesServerErrorNewEffectNeverRepeatsAfterChangeAndRestart(t *
 						creates++
 					}
 				}
-				if creates != 2 || f.count(t, "SELECT count(*) FROM profile_index_topics WHERE state='uncertain' AND thread_id=0") != 1 {
+				if creates != 1 || f.count(t, "SELECT count(*) FROM profile_index_topics WHERE state='uncertain' AND thread_id=0") != 1 {
 					t.Fatal("unknown server-side topic effect was repeated", f.operations)
 				}
 			} else {
@@ -522,7 +525,7 @@ func TestProfileIndexesServerErrorNewEffectNeverRepeatsAfterChangeAndRestart(t *
 						sends++
 					}
 				}
-				if sends != 1 || f.count(t, "SELECT count(*) FROM profile_index_pages WHERE state='uncertain' AND message_id=0") != 1 {
+				if sends != 2 || f.count(t, "SELECT count(*) FROM profile_index_pages WHERE state='uncertain' AND message_id=0") != 1 || f.count(t, "SELECT count(*) FROM profile_index_pages WHERE state='sent' AND message_id>0") != 1 {
 					t.Fatal("unknown server-side new post effect was repeated", f.operations)
 				}
 			}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"time"
 )
 
@@ -66,6 +65,13 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 		return settle("cancelled", "session_changed")
 	}
 	stored, err := s.Store.Profile(ctx, job.OwnerID, job.TargetUserID)
+	missing, missingErr := profileKnownUnavailable(ctx, s.Store.DB, job.OwnerID, job.TargetUserID)
+	if missingErr != nil {
+		return settle("queued", "preflight_unavailable")
+	}
+	if missing {
+		return settle("cancelled", "target_unavailable")
+	}
 	eligible, eligibilityErr := s.compatibilityEligible(ctx, *job, stored.Profile)
 	if err != nil || eligibilityErr != nil || !eligible {
 		return settle("cancelled", "outside_current_filters")
@@ -74,65 +80,57 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 		return settle("cancelled", "inputs_changed_before_send")
 	}
 
-	_, ownRaw, err := s.Client.debugRead(ctx, job.OwnerID, session, "/user/getMe?userId="+strconv.FormatInt(job.FromUserID, 10))
+	own, ownRaw, err := s.compatibilityOwnProfile(ctx, *job, session)
 	if err != nil {
 		return settle("queued", "preflight_unavailable")
 	}
-	own, decodeErr := debugProfile(ownRaw)
 	ownAge, knownAge := autoInteger(own["age"])
 	frozen, knownFrozen := own["freezeState"].(bool)
-	if decodeErr != nil || own.ID() != job.FromUserID || !knownAge || !knownFrozen {
+	if own.ID() != job.FromUserID || !knownAge || !knownFrozen {
 		return settle("cancelled", "own_profile_unavailable")
-	}
-	sessionMu := s.Store.SessionMutex(job.OwnerID)
-	sessionMu.Lock()
-	err = s.Client.debugBinding(ctx, job.OwnerID, session)
-	if err == nil {
-		err = s.Store.SaveAccount(ctx, job.OwnerID, own)
-	}
-	sessionMu.Unlock()
-	if err != nil {
-		return settle("queued", "preflight_unavailable")
 	}
 	if ownAge < 18 || ownAge > 111 || frozen {
 		return settle("cancelled", "own_profile_unavailable")
 	}
+	if compatibilityProfileHash(own) != job.OwnHash {
+		return settle("cancelled", "inputs_changed_before_send")
+	}
 	if s.foregroundPending() {
 		return settle("queued", "foreground_busy")
 	}
-	_, targetRaw, targetObserved, err := s.Client.debugReadObserved(ctx, job.OwnerID, session, "/user/getUser?viewerUserId="+strconv.FormatInt(job.FromUserID, 10)+"&targetUserId="+strconv.FormatInt(job.TargetUserID, 10))
+	target, targetRaw := stored.Profile, []byte(stored.RawJSON)
+	fresh, err := s.cachedCheckedProfile(ctx, job.OwnerID, session, stored, s.Client.Now())
 	if err != nil {
-		var upstream *UpstreamError
-		if errors.Is(err, ErrProfileUnavailable) || errors.As(err, &upstream) && (upstream.Status == http.StatusNotFound || upstream.Status == http.StatusGone) {
-			return settle("cancelled", "target_unavailable")
+		return settle("queued", "preflight_unavailable")
+	}
+	if !fresh {
+		var targetObserved time.Time
+		target, targetRaw, targetObserved, err = s.Client.checkedProfileObserved(ctx, job.OwnerID, session, job.TargetUserID)
+		if err != nil {
+			if errors.Is(err, ErrProfileUnavailable) {
+				return settle("cancelled", "target_unavailable")
+			}
+			return settle("queued", "preflight_unavailable")
 		}
-		return settle("queued", "preflight_unavailable")
+		sessionMu := s.Store.SessionMutex(job.OwnerID)
+		sessionMu.Lock()
+		stored, err = s.captureCheckedProfileLocked(ctx, job.OwnerID, session, target, targetObserved)
+		if err == nil {
+			err = s.queueCheckedCompatibility(ctx, job.OwnerID, session, stored)
+		}
+		sessionMu.Unlock()
+		if err != nil {
+			return settle("queued", "preflight_unavailable")
+		}
 	}
-	target, decodeErr := debugProfile(targetRaw)
 	eligible, eligibilityErr = s.compatibilityEligible(ctx, *job, target)
-	if decodeErr != nil || target.ID() != job.TargetUserID || eligibilityErr != nil || !eligible {
+	if target.ID() != job.TargetUserID || eligibilityErr != nil || !eligible {
 		return settle("cancelled", "outside_current_filters")
-	}
-	// Refresh the cache used by the planner before replacing a superseded input job.
-	sessionMu.Lock()
-	err = s.Client.debugBinding(ctx, job.OwnerID, session)
-	var captured []int64
-	if err == nil {
-		captured, err = s.Store.ArchiveViewed(ctx, job.OwnerID, []Profile{target}, "GET /user/getUser")
-	}
-	if err == nil {
-		_, err = s.Store.recordProfilePresence(ctx, job.OwnerID, job.TargetUserID, true, targetObserved)
-	}
-	if err == nil && s.Config.SyncCycleEnabled && len(captured) == 1 {
-		err = s.Store.RecordSyncFullCapture(ctx, job.OwnerID, session, job.TargetUserID, captured[0], targetObserved)
-	}
-	sessionMu.Unlock()
-	if err != nil {
-		return settle("queued", "preflight_unavailable")
 	}
 	if compatibilityProfileHash(own) != job.OwnHash || compatibilityProfileHash(target) != job.TargetHash {
 		return settle("cancelled", "inputs_changed_before_send")
 	}
+	job.VersionID = stored.VersionID
 
 	request, err := json.Marshal(map[string]int64{"fromUserId": job.FromUserID, "targetUserId": job.TargetUserID})
 	if err != nil {
@@ -199,6 +197,9 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 	defer cancelFinish()
 	if err = s.Store.FinishCompatibilityJob(finishCtx, *job, state, status, response, analysis.ID, reason, s.Client.Now()); err != nil {
 		return true, fmt.Errorf("compatibility result not committed: %w", err)
+	}
+	if state != "succeeded" && status != http.StatusUnauthorized && status != http.StatusForbidden && status != http.StatusTooManyRequests {
+		s.checkCompatibilityTargetAfterFailure(ctx, *job, session)
 	}
 	return true, saveErr
 }

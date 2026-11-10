@@ -130,6 +130,42 @@ func (f *openingPostsFixture) scalar(t *testing.T, query string, args ...any) st
 	return value
 }
 
+func (f *openingPostsFixture) addScore(t *testing.T, owner, upstream, target, observed int64, content string) {
+	t.Helper()
+	request, _ := json.Marshal(map[string]int64{"fromUserId": upstream, "targetUserId": target})
+	response, _ := json.Marshal(map[string]string{"model": "fixture-model", "content": content})
+	own, _ := json.Marshal(Profile{"userId": upstream, "age": 33})
+	profile, _ := json.Marshal(Profile{"userId": target, "age": 23})
+	if _, err := f.s.Store.SaveAnalysisCapture(context.Background(), owner, AnalysisCaptureInput{
+		UpstreamID: upstream, ProfileID: target, Method: http.MethodPost, Path: "/GPT/checkCompatibility",
+		ObservedAtMillis: observed, HTTPStatus: 200, State: "response_received", Generation: "saved-generation",
+		RequestBody: request, ResponseBody: response, OwnProfile: own, TargetProfile: profile,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func openingTestQuoted(t *testing.T, p openingPostPayload) string {
+	t.Helper()
+	var quoted string
+	count := 0
+	for _, entity := range p.Entities {
+		if entity.Type != "expandable_blockquote" {
+			continue
+		}
+		_, rest := telegramPrefix(p.Text, entity.Offset)
+		quoted, _ = telegramPrefix(rest, entity.Length)
+		if entity.Offset+entity.Length != textUnits(p.Text) {
+			t.Fatal("text remained outside the folded body")
+		}
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("expected one folded body, got %d", count)
+	}
+	return quoted
+}
+
 func TestOpeningPostsPreviewUsesCurrentRulesWithoutSendingOrMutating(t *testing.T) {
 	f := newOpeningPostsFixture(t)
 	raw := f.addDraft(t, 10, "Ира😀", "Ира😀, привет! Какая музыка тебе нравится? @fixture_user")
@@ -157,6 +193,10 @@ func TestOpeningPostsPreviewUsesCurrentRulesWithoutSendingOrMutating(t *testing.
 	}
 	if !linked || !folded {
 		t.Fatal(last.Entities)
+	}
+	heading := profileCardHeading(Profile{"userId": 10, "name": "Ира😀", "age": 23, "height": 170, "birthday": "2003-04-10"}, f.now)
+	if !strings.HasPrefix(last.Text, heading+"\n\n") || !strings.Contains(openingTestQuoted(t, last), "Правило:") {
+		t.Fatal("opening layout differs from the common card or leaks its rule", last.Text)
 	}
 	if cursor != f.scalar(t, "SELECT next_cursor FROM reaction_message_settings WHERE owner_id=123") || f.scalar(t, "SELECT count(*) FROM actions") != "0" || f.scalar(t, "SELECT count(*) FROM reaction_message_intents") != "0" {
 		t.Fatal("preview changed outgoing state")
@@ -440,5 +480,100 @@ func TestOpeningPostsRefreshRepairsThreadURLWithoutReposting(t *testing.T) {
 	}
 	if err = f.s.Store.DB.QueryRow("SELECT capture_json FROM reaction_message_drafts WHERE owner_id=123").Scan(&afterCapture); err != nil || string(afterCapture) != string(original) {
 		t.Fatal("URL repair changed raw draft", err)
+	}
+}
+
+func TestOpeningPostsScoreEditKeepsMessageAndSource(t *testing.T) {
+	f := newOpeningPostsFixture(t)
+	raw := f.addDraft(t, 10, "Ира", "Ира, привет! Какая музыка? @fixture_user")
+	f.step(t)
+	f.step(t)
+	f.step(t)
+	var id int64
+	var source []byte
+	var sourceSHA string
+	if err := f.s.Store.DB.QueryRow("SELECT message_id,source_json,source_sha FROM opening_audit_posts WHERE item_key='draft:10'").Scan(&id, &source, &sourceSHA); err != nil {
+		t.Fatal(err)
+	}
+	f.addScore(t, 123, 5696, 10, 1, "Совместимость: 0%")
+	f.refresh(t)
+	before := len(f.methods)
+	f.step(t)
+	last := f.texts[len(f.texts)-1]
+	heading := strings.SplitN(last.Text, "\n", 2)[0]
+	if !strings.HasSuffix(heading, " · 0%") || len(f.methods) != before+1 || f.methods[len(f.methods)-1] != "editMessageText" {
+		t.Fatal("new score did not edit the known opening heading", f.methods, heading)
+	}
+	if quoted := openingTestQuoted(t, last); !strings.Contains(quoted, "Предпросмотр") || !strings.Contains(quoted, "Правило:") || !strings.Contains(quoted, "Основание:") || !strings.Contains(quoted, "Ира, дӕ бон хорз! Какая музыка?") {
+		t.Fatal("folded body lost audit details", quoted)
+	}
+	linked := false
+	for _, entity := range last.Entities {
+		linked = linked || entity.Type == "text_link" && entity.Offset == 0 && entity.Length == textUnits(heading) && entity.URL == "https://t.me/c/123/110/110"
+	}
+	var afterID int64
+	var afterSource, afterRaw []byte
+	var afterSHA string
+	if err := f.s.Store.DB.QueryRow("SELECT message_id,source_json,source_sha FROM opening_audit_posts WHERE item_key='draft:10'").Scan(&afterID, &afterSource, &afterSHA); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.Store.DB.QueryRow("SELECT capture_json FROM reaction_message_drafts WHERE owner_id=123").Scan(&afterRaw); err != nil {
+		t.Fatal(err)
+	}
+	if !linked || afterID != id || string(afterSource) != string(source) || afterSHA != sourceSHA || string(afterRaw) != string(raw) || f.scalar(t, "SELECT count(*) FROM actions") != "0" {
+		t.Fatal("score/layout edit changed the source, destination or outgoing state")
+	}
+}
+
+func TestOpeningPostsUnavailableKeepsLastReadableOwnScore(t *testing.T) {
+	for _, unavailable := range []bool{false, true} {
+		t.Run(fmt.Sprint(unavailable), func(t *testing.T) {
+			f := newOpeningPostsFixture(t)
+			f.addDraft(t, 10, "Ира", "Ира, привет! Какая музыка? @fixture_user")
+			f.addScore(t, 123, 5696, 10, 1, "Совместимость: 75%")
+			f.addScore(t, 123, 5696, 10, 2, "Совместимость: 70%. Совместимость: 80%")
+			// A different owner cannot supply the public audit's score.
+			if err := f.s.Store.User(context.Background(), 456, "foreign"); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.s.Store.SaveSession(context.Background(), 456, Session{UserID: 999, Token: "foreign", Generation: "other"}); err != nil {
+				t.Fatal(err)
+			}
+			f.addScore(t, 456, 999, 10, 3, "Совместимость: 99%")
+			if unavailable {
+				if _, err := f.s.Store.DB.Exec(profilePresenceSchema); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.s.Store.DB.Exec("INSERT INTO profile_presence(owner_id,profile_id,availability,changed_at,checked_at) VALUES(123,10,'unavailable','fixture','fixture')"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tx, err := f.s.Store.DB.BeginTx(context.Background(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			value, known, err := openingProfileScoreTx(context.Background(), tx, 123, 5696, 10)
+			if err != nil || known != unavailable || known && value != 75 {
+				t.Fatalf("availability=%v score=%d,%v err=%v", unavailable, value, known, err)
+			}
+		})
+	}
+}
+
+func TestOpeningPostsOversizeRecipientDoesNotBlockLaterRecipients(t *testing.T) {
+	f := newOpeningPostsFixture(t)
+	original := f.addDraft(t, 10, strings.Repeat("И", 4200), "Привет! Какая музыка? @fixture_user")
+	f.addDraft(t, 11, "Лена", "Лена, привет! Какая музыка? @fixture_user")
+	f.step(t)
+	f.step(t)
+	f.step(t)
+	last := f.texts[len(f.texts)-1]
+	if !strings.Contains(last.Text, "Лена") || f.scalar(t, "SELECT count(*) FROM opening_audit_posts WHERE item_key='draft:10'") != "0" {
+		t.Fatal("oversize heading starved the next recipient")
+	}
+	var raw []byte
+	if err := f.s.Store.DB.QueryRow("SELECT capture_json FROM reaction_message_drafts WHERE owner_id=123 AND profile_id=10").Scan(&raw); err != nil || string(raw) != string(original) {
+		t.Fatal("oversize presentation changed its archived source", err)
 	}
 }

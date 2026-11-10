@@ -56,14 +56,16 @@ func TestSharedProfileRendererPrivateArchiveParity(t *testing.T) {
 					if err = validMessageEntities(card.Text, card.Entities); err != nil {
 						t.Fatal(err)
 					}
-					if !strings.HasSuffix(card.Text, "🔗 пост") || strings.Contains(card.Text, "https://") || !strings.Contains(card.Text, "🎂 29.02.2000 (вт)") {
+					if strings.Contains(card.Text, "🔗 пост") || strings.Contains(card.Text, "https://") || !strings.Contains(card.Text, "🎂 29.02.2000 (вт, ♓️)") {
 						t.Fatalf("human/footer parity lost: %+v", card)
 					}
 					quote := photoQuoteText(t, card)
 					if strings.Contains(quote, "UTC+3") || strings.Contains(quote, "🔗 пост") {
 						t.Fatal("footer included in quote")
 					}
-					if card.Entities[len(card.Entities)-1].URL != forumTopicURL(c.BackupChatID, 55) {
+					link := card.Entities[len(card.Entities)-1]
+					heading, _, _ := strings.Cut(card.Text, "\n")
+					if link.URL != forumThreadURL(c.BackupChatID, 55) || link.Offset != 0 || link.Length != textUnits(heading) {
 						t.Fatal("post URL lost")
 					}
 				}
@@ -129,7 +131,7 @@ func TestPostLinkEntitiesSecureAndSurviveJSONInsertionAndChunks(t *testing.T) {
 	if validMessageEntities("🙂пост", []MessageEntity{{Type: "text_link", Offset: 1, Length: 4, URL: link}}) == nil {
 		t.Fatal("UTF16 surrogate boundary accepted")
 	}
-	full := fullPhotoText(strings.Repeat("🙂", 2500)+"\n\nJardulik: 99\n📍 "+link, []string{`1: {"Make":"real"}`})
+	full := fullPhotoText("Ира🙂\n"+strings.Repeat("🙂", 2500)+"\n\nJardulik: 99\n📍 "+link, []string{`1: {"Make":"real"}`})
 	links := 0
 	var joined strings.Builder
 	for full.Text != "" {
@@ -148,7 +150,7 @@ func TestPostLinkEntitiesSecureAndSurviveJSONInsertionAndChunks(t *testing.T) {
 		joined.WriteString(part.Text)
 		full = rest
 	}
-	if links != 1 || !strings.HasSuffix(joined.String(), "🔗 пост") {
+	if links != 1 || strings.Contains(joined.String(), "🔗 пост") {
 		t.Fatal("fulltext post link lost")
 	}
 }

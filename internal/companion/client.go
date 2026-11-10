@@ -427,49 +427,12 @@ func (c *Client) FullProfile(ctx context.Context, owner, id int64) (Profile, err
 }
 
 func (c *Client) fullProfileObserved(ctx context.Context, owner, id int64) (Profile, time.Time, error) {
-	var observed time.Time
-	if err := c.Store.KnownProfile(ctx, owner, id); err != nil {
-		return nil, observed, errors.New("анкета недоступна этому аккаунту")
-	}
 	s, err := c.Store.Session(ctx, owner)
 	if err != nil {
-		return nil, observed, err
+		return nil, time.Time{}, err
 	}
-	q := url.Values{"viewerUserId": {strconv.FormatInt(s.UserID, 10)}, "targetUserId": {strconv.FormatInt(id, 10)}}
-	b, observed, err := c.requestSessionObserved(ctx, owner, "GET", "/user/getUser?"+q.Encode(), nil, &s)
-	current, currentErr := c.Store.Session(ctx, owner)
-	if currentErr != nil || current.Generation != s.Generation || current.UserID != s.UserID {
-		return nil, observed, errors.New("сессия изменилась; старый ответ отменён")
-	}
-	if err != nil {
-		var upstream *UpstreamError
-		if errors.As(err, &upstream) && upstream.Endpoint == "/user/getUser" && (upstream.Status == http.StatusNotFound || upstream.Status == http.StatusGone) {
-			return nil, observed, ErrProfileUnavailable
-		}
-		return nil, observed, err
-	}
-	b = bytes.TrimSpace(b)
-	if bytes.Equal(b, []byte("null")) || bytes.Equal(b, []byte("[]")) {
-		return nil, observed, ErrProfileUnavailable
-	}
-	if len(b) > 0 && b[0] == '[' {
-		var a []json.RawMessage
-		if json.Unmarshal(b, &a) != nil {
-			return nil, observed, errors.New("Jardulik profile format changed")
-		}
-		if len(a) == 0 {
-			return nil, observed, ErrProfileUnavailable
-		}
-		if len(a) != 1 {
-			return nil, observed, errors.New("Jardulik profile format changed")
-		}
-		b = a[0]
-	}
-	p, err := decodeProfile(b)
-	if err != nil || p == nil || p.ID() != id {
-		return nil, observed, errors.New("Jardulik profile identity or format changed")
-	}
-	return p, observed, nil
+	p, _, observed, err := c.checkedProfileObserved(ctx, owner, s, id)
+	return p, observed, err
 }
 
 type ReactionResult struct {

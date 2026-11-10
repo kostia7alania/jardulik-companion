@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProfileLabelsTimeAndCaption(t *testing.T) {
@@ -38,10 +39,10 @@ func TestProfileLabelsTimeAndCaption(t *testing.T) {
 func TestCompactProfileAndMissingFields(t *testing.T) {
 	p := StoredProfile{ID: 7, LastSeen: "2026-11-07 22:10:00", Profile: Profile{"name": "Ира", "surName": "Иванова", "age": 25, "height": 170, "country": "Russia", "city": "Vladikavkaz", "children": "none", "description": "", "languages": "[]", "profession": ""}}
 	text := profileText(p)
-	if !strings.HasPrefix(text, "Ира Иванова, 25/170\n📍 Россия, Владикавказ") || !strings.HasSuffix(text, "Jardulik: 7") {
+	if !strings.HasPrefix(text, "💁Ира Иванова, 25/170, ❔\n📍 Россия, Владикавказ") || !strings.HasSuffix(text, "Jardulik: 7") {
 		t.Fatal(text)
 	}
-	if !strings.Contains(text, "Не указано: занятие, языки, о себе") || strings.Contains(text, "Не указано: дети") {
+	if !strings.Contains(text, "❔ занятие, языки, о себе") || strings.Contains(text, "❔ дети") {
 		t.Fatal(text)
 	}
 	if !strings.Contains(text, "Детей нет") {
@@ -49,11 +50,27 @@ func TestCompactProfileAndMissingFields(t *testing.T) {
 	}
 	p.Profile["description"] = strings.Repeat("🙂", 800)
 	caption := profileCaption(profileText(p))
-	if _, rest := telegramPrefix(caption, 1024); rest != "" || !strings.Contains(caption, "Jardulik: 7") || !strings.Contains(caption, "(вс, UTC+3)") || !strings.Contains(caption, "Не указано:") {
+	if _, rest := telegramPrefix(caption, 1024); rest != "" || !strings.Contains(caption, "Jardulik: 7") || !strings.Contains(caption, "(вс, UTC+3)") || !strings.Contains(caption, "❔ ") {
 		t.Fatal("long biography displaced required footer")
 	}
 	if got := forumTopicURL(-1004401653948, 5); got != "https://t.me/c/4401653948/5" {
 		t.Fatal(got)
+	}
+}
+
+func TestProfileCardHeadingUsesSourceGenderBirthdayAndPremium(t *testing.T) {
+	now := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	p := Profile{"userId": 10, "name": "Диана", "age": 28, "height": 167, "gender": 2, "birthday": "1998-07-04T00:00:00", "type": 1}
+	if got := profileCardHeading(p, now); got != "💁‍♀️Диана, 28/167, ♋️ ⭐️" {
+		t.Fatal(got)
+	}
+	p["gender"], p["type"] = 1, 0
+	if got := profileCardHeading(p, now); got != "💁‍♂️Диана, 28/167, ♋️" {
+		t.Fatal(got)
+	}
+	p["birthday"] = "2098-07-04"
+	if got := profileCardHeading(p, now); !strings.HasSuffix(got, ", ❔") {
+		t.Fatal("future source birthday gained a zodiac", got)
 	}
 }
 

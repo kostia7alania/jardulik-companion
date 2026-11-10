@@ -82,6 +82,55 @@ func openingProfileTx(ctx context.Context, tx *sql.Tx, owner, id int64) (Profile
 	return p, current, nil
 }
 
+// Only the current owner's saved responses contribute to this personal audit heading.
+func openingProfileScoreTx(ctx context.Context, tx *sql.Tx, owner, upstream, target int64) (int, bool, error) {
+	present, err := openingTableTx(ctx, tx, "profile_analyses")
+	if err != nil || !present {
+		return 0, false, err
+	}
+	unavailable := false
+	present, err = openingTableTx(ctx, tx, "profile_presence")
+	if err != nil {
+		return 0, false, err
+	}
+	if present {
+		if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM profile_presence WHERE owner_id=? AND profile_id=? AND availability='unavailable')", owner, target).Scan(&unavailable); err != nil {
+			return 0, false, err
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT a.response_body,a.own_profile,a.target_profile FROM profile_analyses a
+ WHERE a.owner_id=? AND a.upstream_id=? AND a.profile_id=? AND `+analysisPostSuccessSQL("a")+` ORDER BY a.observed_at_ms DESC,a.id DESC`, owner, upstream, target)
+	if err != nil {
+		return 0, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var response, ownRaw, targetRaw []byte
+		if err = rows.Scan(&response, &ownRaw, &targetRaw); err != nil {
+			return 0, false, err
+		}
+		own, ownErr := debugProfile(ownRaw)
+		profile, targetErr := debugProfile(targetRaw)
+		var body struct {
+			Content string `json:"content"`
+		}
+		if ownErr == nil && targetErr == nil && own.ID() == upstream && profile.ID() == target && json.Unmarshal(response, &body) == nil {
+			ownAge, ownKnown := autoInteger(own["age"])
+			targetAge, targetKnown := autoInteger(profile["age"])
+			if ownKnown && targetKnown && ownAge >= 18 && ownAge <= 111 && targetAge >= 18 && targetAge <= 111 {
+				if score, known := analysisPostRating(body.Content); known {
+					return score, true, nil
+				}
+			}
+		}
+		// An unavailable profile retains its last readable score; a live profile uses the newest result.
+		if !unavailable {
+			return 0, false, nil
+		}
+	}
+	return 0, false, rows.Err()
+}
+
 func (s *Service) openingPostItemTx(ctx context.Context, tx *sql.Tx, expected Session, key string) (openingPostItem, error) {
 	if key == "formula" {
 		policy, err := openingPolicyTx(ctx, tx, s.Config.OwnerID)
@@ -128,7 +177,7 @@ func (s *Service) openingPostItemTx(ctx context.Context, tx *sql.Tx, expected Se
 		if e != nil || input.State != "approved" || input.ProfileID != id || input.Message != message || !reactionDraftHasHandle(message, handle) || parsedHash != hash || digest(item.Source) != captureSHA || binding != reactionDraftBindingHash(s.Config.OwnerID, expected.UserID, id, handle, hash) {
 			return item, sql.ErrNoRows
 		}
-		status = "Предпросмотр · отправка не выполнялась"
+		status = "📝 Предпросмотр"
 		personal := false
 		if !current {
 			rule = "Нет текущей анкеты в очереди; текст сейчас не выбран."
@@ -169,13 +218,13 @@ func (s *Service) openingPostItemTx(ctx context.Context, tx *sql.Tx, expected Se
 		if !openingFrozenRequest(item.Source, expected.UserID, item.Profile, reaction, quote) {
 			return item, sql.ErrNoRows
 		}
-		status = "Результат отправки неизвестен"
+		status = "❔ Результат отправки неизвестен"
 		if state == "succeeded" {
 			result, e := decodeReactionResult([]byte(response), time.Now().UTC())
 			if e != nil || result.Decision != ReactionSuccess {
 				return item, sql.ErrNoRows
 			}
-			status = "Отправка подтверждена API Jardulik"
+			status = "✅ Отправка подтверждена API Jardulik"
 		}
 		switch mode {
 		case "personal", "birthday", "explicit", "first", "rotate", "off":
@@ -200,7 +249,7 @@ func (s *Service) openingPostItemTx(ctx context.Context, tx *sql.Tx, expected Se
 		if json.Unmarshal(item.Source, &request) != nil || !openingFrozenRequest(item.Source, expected.UserID, item.Profile, 3, request.Message) || e != nil || result.Decision != ReactionSuccess {
 			return item, sql.ErrNoRows
 		}
-		quote, status = request.Message, "Отправка подтверждена API Jardulik"
+		quote, status = request.Message, "✅ Отправка подтверждена API Jardulik"
 		rule = fmt.Sprintf("Факт: прежний debug SuperLike, type=3 · receipt #%d.\nТекст взят из сохранённого запроса, без повторного рендера. Это не подтверждение прочтения.", id)
 		profile, _, err = openingProfileTx(ctx, tx, s.Config.OwnerID, item.Profile)
 		if err != nil {
@@ -217,7 +266,18 @@ func (s *Service) openingPostItemTx(ctx context.Context, tx *sql.Tx, expected Se
 	if link == "" {
 		return item, sql.ErrNoRows
 	}
-	item.Payload = openingRecipientPayload(profile, item.Profile, link, status, quote, rule, evidence)
+	heading := profileCardHeading(profile, s.Archiver.now())
+	score, known, err := openingProfileScoreTx(ctx, tx, s.Config.OwnerID, expected.UserID, item.Profile)
+	if err != nil {
+		return item, err
+	}
+	if known {
+		heading += fmt.Sprintf(" · %d%%", score)
+	}
+	item.Payload = openingRecipientPayload(heading, link, status, quote, rule, evidence)
+	if _, err = openingPostBytes(item.Payload); err != nil {
+		return item, errOpeningPostSource
+	}
 	return item, nil
 }
 
