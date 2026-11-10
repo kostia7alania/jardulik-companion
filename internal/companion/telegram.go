@@ -97,8 +97,17 @@ func validMessageEntities(text string, entities []MessageEntity) error {
 				return errors.New("unexpected bold URL")
 			}
 		case "text_link":
-			if !validPostURL(e.URL) {
+			if !validPostURL(e.URL) && !validJardulikProfileURL(e.URL) {
 				return errors.New("invalid Telegram post URL")
+			}
+		case "code":
+			if e.URL != "" {
+				return errors.New("unexpected code URL")
+			}
+			for _, other := range entities {
+				if other.Type != "code" && e.Offset < other.Offset+other.Length && other.Offset < e.Offset+e.Length {
+					return errors.New("code entity overlaps another Telegram entity")
+				}
 			}
 		default:
 			return errors.New("invalid Telegram message entity")
@@ -171,7 +180,24 @@ func (u *Update) UnmarshalJSON(raw []byte) error {
 func NewTelegram(c Config) *Telegram {
 	return &Telegram{Token: c.Token, Base: strings.TrimRight(c.TelegramBase, "/"), HTTP: &http.Client{Timeout: 45 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}}
 }
-func (t *Telegram) decode(res *http.Response, out any) error {
+func (t *Telegram) decode(res *http.Response, out any) (decodeErr error) {
+	defer func() {
+		ctx, method := context.Background(), ""
+		if res.Request != nil {
+			ctx = res.Request.Context()
+			if res.Request.URL != nil {
+				method = filepath.Base(res.Request.URL.Path)
+			}
+		}
+		failure := decodeErr
+		var te *TelegramError
+		if errors.As(failure, &te) && t.Token != "" {
+			description := strings.ReplaceAll(te.Description, t.Token, "[redacted]")
+			description = strings.ReplaceAll(description, url.QueryEscape(t.Token), "[redacted]")
+			failure = &TelegramError{Code: te.Code, Description: description, RetryAfter: te.RetryAfter}
+		}
+		logOperationsFailure(ctx, "Telegram", method, "", 0, failure)
+	}()
 	defer res.Body.Close()
 	var envelope struct {
 		OK          bool            `json:"ok"`
@@ -205,6 +231,7 @@ func (t *Telegram) Call(ctx context.Context, method string, payload, out any) er
 	r.Header.Set("Content-Type", "application/json")
 	res, err := t.HTTP.Do(r)
 	if err != nil {
+		logOperationsFailure(ctx, "Telegram", method, "", 0, err)
 		return fmt.Errorf("Telegram transport: %w", redactedTransportError(err))
 	}
 	return t.decode(res, out)
@@ -293,6 +320,7 @@ func (t *Telegram) upload(ctx context.Context, method string, chat, thread int64
 	uploadClient.Timeout = 3 * time.Minute
 	res, err := uploadClient.Do(r)
 	if err != nil {
+		logOperationsFailure(ctx, "Telegram", method, "", 0, err)
 		reader.CloseWithError(err)
 		return out, fmt.Errorf("Telegram upload: %w", redactedTransportError(err))
 	}
@@ -448,6 +476,7 @@ func (t *Telegram) SendAlbum(ctx context.Context, chat, thread int64, paths []st
 	uploadClient.Timeout = 3 * time.Minute
 	res, err := uploadClient.Do(r)
 	if err != nil {
+		logOperationsFailure(ctx, "Telegram", "sendMediaGroup", "", 0, err)
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("Telegram album transport: %w", ctx.Err())
 		}
@@ -517,6 +546,7 @@ func (t *Telegram) Download(ctx context.Context, fileID, path string) error {
 	}
 	res, err := t.HTTP.Do(r)
 	if err != nil {
+		logOperationsFailure(ctx, "Telegram", "download", "", 0, err)
 		return redactedTransportError(err)
 	}
 	defer res.Body.Close()
@@ -619,6 +649,7 @@ func (t *Telegram) SendRichProfileCard(ctx context.Context, chat, thread int64, 
 		request.Header.Set("Content-Type", form.FormDataContentType())
 		response, err := t.HTTP.Do(request)
 		if err != nil {
+			logOperationsFailure(ctx, "Telegram", "sendRichMessage", "", 0, err)
 			_ = reader.Close()
 			<-done
 			return out, fmt.Errorf("rich Telegram transport: %w", redactedTransportError(err))

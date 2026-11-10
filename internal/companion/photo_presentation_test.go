@@ -56,7 +56,8 @@ func TestPrivateAndArchiveCaptionShareBodyBudgetWithoutActionTail(t *testing.T) 
 			t.Fatal("album commands changed shared source body")
 		}
 		for _, card := range []photoText{private, archive} {
-			if textUnits(card.Text) > 1024 || strings.Contains(card.Text, "🔗 пост") || !strings.HasPrefix(quote, "Jardulik: 99\n1-3:") {
+			assertLegacySourceID(t, card, 99)
+			if textUnits(card.Text) > 1024 || strings.Contains(card.Text, "🔗 пост") || !strings.HasPrefix(quote, "1-3:") {
 				t.Fatal("album action displaced caption budget or details order")
 			}
 			if err := validMessageEntities(card.Text, card.Entities); err != nil {
@@ -115,7 +116,7 @@ func TestPhotoCaptionQuotePreservesFooterAndSafeNumberedOrder(t *testing.T) {
 	text := strings.Repeat("🙂<blockquote>О фото</blockquote>", 300) + "\n\n8.11.26, 01:10 (вс, UTC+3)\nJardulik: 99\n📍 https://t.me/c/123/55"
 	card := photoCardText(text, rows, "\nТекст: /text_99", 1024)
 	quote := photoQuoteText(t, card)
-	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "1:2×3") || !strings.Contains(quote, "2:4×5") || !strings.HasPrefix(quote, "Jardulik: 99\n") || !strings.Contains(card.Text, "UTC+3") || strings.Contains(card.Text, "🔗 пост") {
+	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "1:2×3") || !strings.Contains(quote, "2:4×5") || strings.Contains(quote, "Jardulik: 99") || !strings.Contains(card.Text, "UTC+3") || strings.Contains(card.Text, "🔗 пост") {
 		t.Fatalf("caption/entity/footer invalid: %+v", card)
 	}
 }
@@ -217,26 +218,37 @@ func TestTelegramPhotoEntitiesUsePlainTextAndFirstAlbumItem(t *testing.T) {
 	first := photoPresentationSource(t, 0, 2, 3)
 	second := photoPresentationSource(t, 1, 4, 5)
 	card := photoCardText("🙂 <script>plain</script>\n\nJardulik: 99", photoMetadataRows([]MediaJob{first, second}), "", 1024)
+	assertLegacySourceID(t, card, 99)
+	if len(card.Entities) != 3 {
+		t.Fatal("caption must contain its quote, service link and copyable userId")
+	}
 	calls := 0
 	a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
 		calls++
 		switch call.method {
 		case "sendMediaGroup":
 			var media []struct {
-				Caption  string          `json:"caption"`
-				Entities []MessageEntity `json:"caption_entities"`
+				Caption   string          `json:"caption"`
+				Entities  []MessageEntity `json:"caption_entities"`
+				ParseMode string          `json:"parse_mode"`
 			}
 			if err := json.Unmarshal([]byte(call.fields["media"]), &media); err != nil {
 				t.Fatal(err)
 			}
-			if len(media[0].Entities) != 1 || len(media[1].Entities) != 0 || media[1].Caption != "" || !strings.Contains(media[0].Caption, "<script>plain</script>") {
+			if len(media) != 2 || media[0].Caption != card.Text || !reflect.DeepEqual(media[0].Entities, card.Entities) || len(media[1].Entities) != 0 || media[1].Caption != "" || !strings.Contains(media[0].Caption, "<script>plain</script>") || media[0].ParseMode != "" || media[1].ParseMode != "" {
 				t.Fatal("album plain caption/entities misplaced")
+			}
+			if err := validMessageEntities(media[0].Caption, media[0].Entities); err != nil {
+				t.Fatal(err)
 			}
 			return `{"ok":true,"result":[{"message_id":1,"chat":{"id":-100123}},{"message_id":2,"chat":{"id":-100123}}]}`, nil
 		case "sendPhoto":
 			var entities []MessageEntity
-			if err := json.Unmarshal([]byte(call.fields["caption_entities"]), &entities); err != nil || len(entities) != 1 {
-				t.Fatal("photo entities missing")
+			if err := json.Unmarshal([]byte(call.fields["caption_entities"]), &entities); err != nil || !reflect.DeepEqual(entities, card.Entities) || call.fields["caption"] != card.Text {
+				t.Fatal("photo caption/entities changed")
+			}
+			if err := validMessageEntities(call.fields["caption"], entities); err != nil {
+				t.Fatal(err)
 			}
 			if call.fields["parse_mode"] != "" {
 				t.Fatal("untrusted profile text uses parse mode")
@@ -287,8 +299,13 @@ func TestFullTextIncludesMetadataAsExpandableQuote(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(payload.Text, "ImageWidth") || strings.Contains(payload.Text, "GPS") || strings.Contains(payload.Text, "{}") || !strings.Contains(payload.Text, "Полное описание") || len(payload.Entities) != 1 || filepath.Base(r.URL.Path) != "sendMessage" {
-			t.Fatalf("full safe text missing metadata: %+v", payload)
+		card := photoText{Text: payload.Text, Entities: payload.Entities}
+		assertLegacySourceID(t, card, p.ID)
+		if _, folded := photoQuote(payload.Entities); folded {
+			t.Fatal("photo without EXIF tags produced an empty metadata quote")
+		}
+		if strings.Contains(payload.Text, "ImageWidth") || strings.Contains(payload.Text, "GPS") || strings.Contains(payload.Text, "{}") || !strings.Contains(payload.Text, "Полное описание") || filepath.Base(r.URL.Path) != "sendMessage" {
+			t.Fatalf("full safe text lost its description or introduced synthetic metadata: %+v", payload)
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`)
 	})}
@@ -325,7 +342,7 @@ func TestCaptionIsCompactWhileFullEXIFContainsOnlySourceTags(t *testing.T) {
 		}
 	}
 	long := photoJSONCardText(strings.Repeat("🙂Биография ", 150)+footer, photos, "", 1024)
-	if textUnits(long.Text) > 1024 || !strings.HasPrefix(photoQuoteText(t, long), "Jardulik: 99\n") {
+	if textUnits(long.Text) > 1024 || strings.Contains(photoQuoteText(t, long), "Jardulik: 99") {
 		t.Fatal("caption budget/details lost")
 	}
 }
@@ -348,7 +365,7 @@ func TestPhotoQuoteContainsDetailsWhileSnapshotAndLinkStayOutside(t *testing.T) 
 				card = fullPhotoText(text, rows)
 			}
 			quote := photoQuoteText(t, card)
-			if strings.Contains(quote, "О фото") || !strings.HasPrefix(quote, "Jardulik: 99\n") || !strings.HasSuffix(quote, "❔ возраст, рост, город") || strings.Contains(quote, snapshot) || strings.Contains(quote, link) || strings.Count(card.Text, "Jardulik: 99") != 1 || strings.Count(card.Text, "❔ возраст, рост, город") != 1 || strings.Contains(card.Text, "🔗 пост") {
+			if strings.Contains(quote, "О фото") || strings.Contains(quote, "Jardulik: 99") || !strings.HasSuffix(quote, "❔ возраст, рост, город") || strings.Contains(quote, snapshot) || strings.Contains(quote, link) || strings.Count(card.Text, "Jardulik: 99") != 1 || strings.Count(card.Text, "❔ возраст, рост, город") != 1 || strings.Contains(card.Text, "🔗 пост") {
 				t.Fatalf("details/outer footer misplaced: %+v", card)
 			}
 		}
@@ -361,13 +378,13 @@ func TestPhotoQuoteDetailsSurviveLongBioManyMissingAndPlainLookalikes(t *testing
 	rows := []string{"Фото 1: " + strings.Repeat("Модель ", 100) + " · GPS: нет", "Фото 2: " + strings.Repeat("Модель ", 100) + " · GPS: есть"}
 	card := photoCardText(text, rows, "\n📍 https://t.me/c/123/55", 1024)
 	quote := photoQuoteText(t, card)
-	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "❔ "+strings.TrimPrefix(missing, "Не указано: ")) || !strings.HasPrefix(quote, "Jardulik: 99\n") || !strings.Contains(quote, "Фото 1:") || !strings.Contains(quote, "Фото 2:") {
+	if textUnits(card.Text) > 1024 || !strings.Contains(quote, "❔ "+strings.TrimPrefix(missing, "Не указано: ")) || strings.Contains(quote, "Jardulik: 99") || !strings.Contains(quote, "Фото 1:") || !strings.Contains(quote, "Фото 2:") {
 		t.Fatalf("fixed details budget lost: %+v", card)
 	}
 	plain := "Ира\n\nНе указано: текст из биографии\nJardulik: 666\n\nБиография продолжается\n\nJardulik: 99"
 	card = photoCardText(plain, nil, "", 1024)
-	quote = photoQuoteText(t, card)
-	if quote != "Jardulik: 99" || !strings.Contains(card.Text, "Не указано: текст из биографии\nJardulik: 666") {
+	assertLegacySourceID(t, card, 99)
+	if _, folded := photoQuote(card.Entities); folded || !strings.Contains(card.Text, "Не указано: текст из биографии\nJardulik: 666") {
 		t.Fatalf("biography lookalike was parsed as generated details: %+v", card)
 	}
 }
@@ -382,8 +399,10 @@ func TestNoPhotoPrivateCardUsesTextEntity(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
 		}
-		if filepath.Base(r.URL.Path) != "sendMessage" || !strings.HasPrefix(photoQuoteText(t, photoText{Text: payload.Text, Entities: payload.Entities}), "Jardulik: 10") {
-			t.Fatal("no-photo details were not quoted")
+		card := photoText{Text: payload.Text, Entities: payload.Entities}
+		assertLegacySourceID(t, card, 10)
+		if filepath.Base(r.URL.Path) != "sendMessage" || !strings.Contains(photoQuoteText(t, card), `"userId": 10`) {
+			t.Fatal("no-photo source JSON was not quoted")
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}`)
 	})}
@@ -403,8 +422,10 @@ func TestNoPhotoArchiveCardUsesTextEntityAndRefreshMethod(t *testing.T) {
 			t.Fatal(err)
 		}
 		text, _ := call.json["text"].(string)
-		if !strings.Contains(photoQuoteText(t, photoText{Text: text, Entities: entities}), fmt.Sprintf("Jardulik: %d", p.ID)) {
-			t.Fatal("archive text details missing")
+		card := photoText{Text: text, Entities: entities}
+		assertLegacySourceID(t, card, p.ID)
+		if !strings.Contains(photoQuoteText(t, card), fmt.Sprintf(`"userId": %d`, p.ID)) {
+			t.Fatal("archive source JSON missing")
 		}
 		return `{"ok":true,"result":{"message_id":101,"chat":{"id":-100123}}}`, nil
 	})
@@ -423,11 +444,12 @@ func TestNoPhotoArchiveCardUsesTextEntityAndRefreshMethod(t *testing.T) {
 	}
 }
 
-func TestPhotoQuotePutsIDThenPhotosThenMissingWithoutChangingMetadata(t *testing.T) {
+func TestPhotoQuoteKeepsPhotosThenMissingBelowCopyableSourceID(t *testing.T) {
 	const opaque = "opaque-a\t🙂\n\nopaque-b:{unchanged}\nopaque-c  "
 	card := photoCardText("body\n\nНе указано: языки\nJardulik: 99", []string{opaque}, "", 4096)
 	quote := photoQuoteText(t, card)
-	if quote != "Jardulik: 99\n"+opaque+"\n❔ языки" {
+	assertLegacySourceID(t, card, 99)
+	if quote != opaque+"\n❔ языки" {
 		t.Fatal("rendered caption changed metadata bytes or details order", quote)
 	}
 }
@@ -488,5 +510,59 @@ func TestPhotoSourceJSONDisplayProjectionKeepsOriginalValues(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func assertLegacySourceID(t *testing.T, card photoText, id int64) {
+	t.Helper()
+	if err := validMessageEntities(card.Text, card.Entities); err != nil {
+		t.Fatal(err)
+	}
+	idText := fmt.Sprint(id)
+	label, code := 0, 0
+	for _, e := range card.Entities {
+		_, rest := telegramPrefix(card.Text, e.Offset)
+		span, _ := telegramPrefix(rest, e.Length)
+		if e.Type == "text_link" && e.URL == jardulikProfileURL(id) {
+			label++
+			if span != "Jardulik" {
+				t.Fatal("profile link escaped the service name", span)
+			}
+		}
+		if e.Type == "code" && span == idText {
+			code++
+			for _, fold := range card.Entities {
+				if fold.Type == "expandable_blockquote" && e.Offset < fold.Offset+fold.Length && e.Offset+e.Length > fold.Offset {
+					t.Fatal("copyable userId was nested inside a folded quote")
+				}
+			}
+		}
+	}
+	if label != 1 || code != 1 {
+		t.Fatalf("expected one clean service link and source userId code span: %+v", card.Entities)
+	}
+}
+
+func TestLegacyUserIDUsesUpstreamIdentityOutsideFoldAndKeepsRaw(t *testing.T) {
+	const raw = `{"userId":115,"name":"Имя🙂","large":9007199254740993,"precise":1.00}`
+	p := StoredProfile{ID: 115, VersionID: 1620, RawJSON: raw, Profile: Profile{"userId": 115, "name": "Имя🙂"}}
+	for _, limit := range []int{1024, 4096} {
+		card, err := renderProfileCard(p, nil, 0, true, "https://t.me/c/123/55/55", limit, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertLegacySourceID(t, card, 115)
+		var pretty bytes.Buffer
+		if err := json.Indent(&pretty, []byte(raw), "", "  "); err != nil {
+			t.Fatal(err)
+		}
+		if !card.SourceJSONInline || !strings.HasSuffix(photoQuoteText(t, card), pretty.String()) || p.RawJSON != raw || textUnits(card.Text) > limit {
+			t.Fatal("copyable userId changed raw JSON or caption budget")
+		}
+	}
+	card := photoCardText("Имя🙂\n\nJardulik: 115", nil, "", 1024)
+	assertLegacySourceID(t, card, 115)
+	if _, ok := photoQuote(card.Entities); ok {
+		t.Fatal("ID-only legacy card contains an empty folded quote")
 	}
 }

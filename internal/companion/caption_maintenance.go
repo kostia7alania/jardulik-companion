@@ -1,6 +1,7 @@
 package companion
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -14,7 +15,7 @@ import (
 	"time"
 )
 
-const captionDesignRevision = "2026-11-10-linked-profile-cards-v6"
+const captionDesignRevision = "2026-11-10-profile-links-copy-id-v7"
 const captionNoticeRevision = "2026-11-10-rating-short-photo-v1"
 const captionMaintenanceSchema = `
 CREATE TABLE IF NOT EXISTS caption_maintenance_jobs (
@@ -242,6 +243,9 @@ func (w *captionMaintenanceWorker) recover(ctx context.Context) error {
 	return err
 }
 func (w *captionMaintenanceWorker) claim(ctx context.Context) (*captionMaintenanceJob, error) {
+	return w.claimProfile(ctx, 0)
+}
+func (w *captionMaintenanceWorker) claimProfile(ctx context.Context, profile int64) (*captionMaintenanceJob, error) {
 	tx, err := w.service.Store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -261,11 +265,12 @@ func (w *captionMaintenanceWorker) claim(ctx context.Context) (*captionMaintenan
 	err = tx.QueryRowContext(ctx, `SELECT id,kind,receipt_id,owner_id,version_id,inventory,source_sha,chat_id,thread_id,attempts FROM caption_maintenance_jobs
  WHERE revision=? AND state IN ('pending','retry') AND next_attempt<=?
  AND EXISTS(SELECT 1 FROM users u WHERE u.id=caption_maintenance_jobs.owner_id AND u.paused=0)
- ORDER BY CASE WHEN kind='archive' AND NOT EXISTS(
+ AND (?=0 OR (kind='archive' AND owner_id=? AND EXISTS(SELECT 1 FROM versions target WHERE target.id=caption_maintenance_jobs.version_id AND target.owner_id=caption_maintenance_jobs.owner_id AND target.profile_id=?)))
+ ORDER BY CASE WHEN ?>0 THEN -version_id ELSE 0 END,CASE WHEN kind='archive' AND NOT EXISTS(
  SELECT 1 FROM archive_versions newer JOIN versions current ON current.id=caption_maintenance_jobs.version_id
  WHERE newer.owner_id=caption_maintenance_jobs.owner_id AND newer.profile_id=current.profile_id
  AND newer.state IN ('sent','partial') AND newer.version_id>caption_maintenance_jobs.version_id) THEN 0
- WHEN kind='analysis' THEN 1 WHEN kind IN ('change','presence') THEN 2 WHEN EXISTS(SELECT 1 FROM versions v WHERE v.id=caption_maintenance_jobs.version_id AND CASE WHEN json_valid(v.raw_json) THEN json_extract(v.raw_json,'$.type')=1 ELSE 0 END) THEN 3 ELSE 4 END,CASE WHEN kind='analysis' THEN -receipt_id ELSE id END LIMIT 1`, captionDesignRevision, w.now().UnixMilli()).Scan(&j.id, &j.kind, &j.receipt, &j.owner, &j.version, &j.inventory, &j.source, &j.chat, &j.thread, &j.attempts)
+ WHEN kind='analysis' THEN 1 WHEN kind IN ('change','presence') THEN 2 WHEN EXISTS(SELECT 1 FROM versions v WHERE v.id=caption_maintenance_jobs.version_id AND CASE WHEN json_valid(v.raw_json) THEN json_extract(v.raw_json,'$.type')=1 ELSE 0 END) THEN 3 ELSE 4 END,CASE WHEN kind='analysis' THEN -receipt_id ELSE id END LIMIT 1`, captionDesignRevision, w.now().UnixMilli(), profile, w.service.Config.OwnerID, profile, profile).Scan(&j.id, &j.kind, &j.receipt, &j.owner, &j.version, &j.inventory, &j.source, &j.chat, &j.thread, &j.attempts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -420,7 +425,23 @@ func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMainte
 	payload["caption_entities"] = card.Entities
 	return "editMessageCaption", payload, nil
 }
+
+// RefreshProfileCaption edits one pending/retry archive card using the normal worker guards.
+func (s *Service) RefreshProfileCaption(ctx context.Context, profile int64) (bool, error) {
+	if profile <= 0 || s.Config.OwnerID <= 0 {
+		return false, errors.New("invalid profile caption target")
+	}
+	if err := s.ScheduleCaptionMaintenance(ctx); err != nil {
+		return false, err
+	}
+	w := captionMaintenanceWorker{s, time.Now}
+	return w.stepProfile(ctx, profile)
+}
+
 func (w *captionMaintenanceWorker) step(ctx context.Context) (bool, error) {
+	return w.stepProfile(ctx, 0)
+}
+func (w *captionMaintenanceWorker) stepProfile(ctx context.Context, profile int64) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -442,13 +463,20 @@ func (w *captionMaintenanceWorker) step(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	defer unlock()
-	j, err := w.claim(ctx)
+	j, err := w.claimProfile(ctx, profile)
 	if err != nil || j == nil {
 		return false, err
 	}
 	expected, err := s.savedMessageEditSession(ctx, j.owner)
 	if err != nil {
 		return true, w.finish(ctx, j, "retry", "source_binding_deferred", w.now().Add(4*time.Second))
+	}
+	if j.kind == "analysis" {
+		if reused, e := w.reuseConfirmedAnalysis(ctx, j, expected); e != nil {
+			return true, w.finish(ctx, j, "retry", "analysis_reuse_check_failed", w.now().Add(4*time.Second))
+		} else if reused {
+			return true, nil
+		}
 	}
 	if err = s.Archiver.groupSlot(ctx); err != nil {
 		return true, w.finish(ctx, j, "retry", "pacing_wait", w.now().Add(4*time.Second))
@@ -521,6 +549,91 @@ func (w *captionMaintenanceWorker) retry(ctx context.Context, j *captionMaintena
 		return w.finish(ctx, j, "failed", reason, time.Time{})
 	}
 	return w.finish(ctx, j, "retry", reason, w.now().Add(delay))
+}
+
+// The saved payload was written after a confirmed send/edit. An absent keyboard
+// and an explicit empty keyboard both mean the confirmed message has no buttons.
+func confirmedAnalysisPayloadEqual(raw []byte, desired map[string]any) bool {
+	var saved map[string]any
+	if json.Unmarshal(raw, &saved) != nil || saved == nil {
+		return false
+	}
+	if _, ok := saved["text"].(string); !ok {
+		return false
+	}
+	if saved["reply_markup"] == nil {
+		saved["reply_markup"] = map[string]any{"inline_keyboard": [][]map[string]string{}}
+	}
+	want, err := json.Marshal(map[string]any{"text": desired["text"], "entities": desired["entities"], "reply_markup": desired["reply_markup"]})
+	if err != nil {
+		return false
+	}
+	var normalized any
+	if json.Unmarshal(want, &normalized) != nil {
+		return false
+	}
+	want, err = json.Marshal(normalized)
+	if err != nil {
+		return false
+	}
+	have, err := json.Marshal(saved)
+	return err == nil && bytes.Equal(want, have)
+}
+
+func (w *captionMaintenanceWorker) reuseConfirmedAnalysis(ctx context.Context, j *captionMaintenanceJob, expected Session) (bool, error) {
+	method, payload, err := w.prepare(ctx, j)
+	if errors.Is(err, errCaptionMaintenanceReceipt) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if method != "editMessageText" {
+		return false, nil
+	}
+	var saved, receipt, source, encrypted []byte
+	var upstream int64
+	var sessionState string
+	err = w.service.Store.DB.QueryRowContext(ctx, `SELECT p.payload_json,p.receipt_json,a.response_body,se.encrypted,p.upstream_id,se.state
+ FROM analysis_posts p JOIN profile_analyses a ON a.id=p.analysis_id AND a.owner_id=p.owner_id AND a.upstream_id=p.upstream_id AND a.profile_id=p.profile_id
+ JOIN sessions se ON se.owner_id=p.owner_id AND se.upstream_id=p.upstream_id
+ JOIN mirror_topics t ON t.profile_id=p.profile_id AND t.thread_id=p.thread_id
+ WHERE p.analysis_id=? AND p.owner_id=? AND p.state='sent' AND p.chat_id=? AND p.thread_id=? AND p.message_id=? AND p.response_sha=?`, j.receipt, j.owner, j.chat, j.thread, payload["message_id"], j.source).Scan(&saved, &receipt, &source, &encrypted, &upstream, &sessionState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var ack SentMessage
+	if json.Unmarshal(receipt, &ack) != nil || ack.ID <= 0 || ack.ID != payload["message_id"].(int64) || ack.Chat.ID != j.chat || ack.ThreadID != j.thread || digest(source) != j.source || !confirmedAnalysisPayloadEqual(saved, payload) {
+		return false, nil
+	}
+	current, err := w.service.savedMessageEditSession(ctx, j.owner)
+	if err != nil || current.UserID != expected.UserID || current.Generation != expected.Generation {
+		return false, nil
+	}
+	cycleGuard := ""
+	args := []any{j.id, captionDesignRevision, j.receipt, j.owner, j.version, j.inventory, j.source, j.chat, j.thread, j.receipt, j.owner, upstream, j.chat, j.thread, ack.ID, j.source, saved, receipt, source, encrypted, sessionState}
+	if w.service.Config.SyncCycleEnabled {
+		cycleGuard = ` AND NOT EXISTS(SELECT 1 FROM sync_cycles c WHERE c.owner_id=caption_maintenance_jobs.owner_id
+ AND c.id=(SELECT latest.id FROM sync_cycles latest WHERE latest.owner_id=c.owner_id ORDER BY latest.started_at_ms DESC,latest.id DESC LIMIT 1)
+ AND (c.stage='blocked' OR c.upstream_id<>? OR c.generation<>?))`
+		args = append(args, expected.UserID, expected.Generation)
+	}
+	result, err := w.service.Store.DB.ExecContext(ctx, `UPDATE caption_maintenance_jobs SET state='done',error='',next_attempt=0,updated_at=CURRENT_TIMESTAMP
+ WHERE id=? AND revision=? AND kind='analysis' AND state='processing' AND receipt_id=? AND owner_id=? AND version_id=? AND inventory=? AND source_sha=? AND chat_id=? AND thread_id=?
+ AND EXISTS(SELECT 1 FROM users u WHERE u.id=caption_maintenance_jobs.owner_id AND u.paused=0)
+ AND EXISTS(SELECT 1 FROM analysis_posts p JOIN profile_analyses a ON a.id=p.analysis_id AND a.owner_id=p.owner_id AND a.upstream_id=p.upstream_id AND a.profile_id=p.profile_id
+ JOIN sessions se ON se.owner_id=p.owner_id AND se.upstream_id=p.upstream_id
+ JOIN mirror_topics t ON t.profile_id=p.profile_id AND t.thread_id=p.thread_id
+ WHERE p.analysis_id=? AND p.owner_id=? AND p.upstream_id=? AND p.state='sent' AND p.chat_id=? AND p.thread_id=? AND p.message_id=? AND p.response_sha=?
+ AND p.payload_json=? AND p.receipt_json=? AND a.response_body=? AND se.encrypted=? AND se.state=?)`+cycleGuard, args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
 }
 
 // Formatting edits use an existing receipt and immutable snapshot, so collection

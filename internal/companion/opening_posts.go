@@ -176,7 +176,7 @@ func (s *Service) refreshOpeningPosts(ctx context.Context, expected Session) err
 	for _, key := range keys {
 		item, err := s.openingPostItemTx(ctx, tx, expected, key)
 		if errors.Is(err, sql.ErrNoRows) || errors.Is(err, errOpeningPostSource) {
-			if _, e := tx.ExecContext(ctx, "UPDATE opening_audit_posts SET state='error',error='source_unavailable',updated_at=CURRENT_TIMESTAMP WHERE topic_id=? AND item_key=? AND NOT(state='uncertain' AND message_id=0)", topic.ID, key); e != nil {
+			if _, e := tx.ExecContext(ctx, "UPDATE opening_audit_posts SET state='error',error='source_unavailable',updated_at=CURRENT_TIMESTAMP WHERE topic_id=? AND item_key=? AND NOT(state IN ('uncertain','sending') AND message_id=0)", topic.ID, key); e != nil {
 				return e
 			}
 			continue
@@ -193,7 +193,7 @@ func (s *Service) refreshOpeningPosts(ctx context.Context, expected Session) err
  source_json=excluded.source_json,source_sha=excluded.source_sha,state=CASE WHEN opening_audit_posts.sent_sha=excluded.desired_sha THEN 'sent' ELSE 'pending' END,
  next_attempt=0,error='',updated_at=CURRENT_TIMESTAMP
  WHERE (opening_audit_posts.desired_sha<>excluded.desired_sha OR opening_audit_posts.source_sha<>excluded.source_sha OR (opening_audit_posts.state='error' AND opening_audit_posts.error='source_unavailable'))
- AND NOT(opening_audit_posts.state='uncertain' AND opening_audit_posts.message_id=0)`, topic.ID, item.Key, item.Kind, item.Profile, raw, digest(raw), item.Source, digest(item.Source))
+ AND NOT(opening_audit_posts.state IN ('uncertain','sending') AND opening_audit_posts.message_id=0)`, topic.ID, item.Key, item.Kind, item.Profile, raw, digest(raw), item.Source, digest(item.Source))
 		if err != nil {
 			return err
 		}

@@ -49,7 +49,9 @@ func TestSharedProfileRendererPrivateArchiveParity(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				var quotes []string
 				for _, card := range []photoText{private, archive} {
+					assertLegacySourceID(t, card, p.ID)
 					if textUnits(card.Text) > limit {
 						t.Fatal("caption budget exceeded")
 					}
@@ -59,7 +61,13 @@ func TestSharedProfileRendererPrivateArchiveParity(t *testing.T) {
 					if strings.Contains(card.Text, "🔗 пост") || strings.Contains(card.Text, "https://") || !strings.Contains(card.Text, "🎂 29.02.2000 (вт, ♓️)") {
 						t.Fatalf("human/footer parity lost: %+v", card)
 					}
-					quote := photoQuoteText(t, card)
+					quote := ""
+					if _, folded := photoQuote(card.Entities); folded {
+						quote = photoQuoteText(t, card)
+					} else if count > 0 || card.SourceJSONInline {
+						t.Fatal("photo metadata or source JSON lost its folded quote")
+					}
+					quotes = append(quotes, quote)
 					if strings.Contains(quote, "UTC+3") || strings.Contains(quote, "🔗 пост") {
 						t.Fatal("footer included in quote")
 					}
@@ -69,7 +77,7 @@ func TestSharedProfileRendererPrivateArchiveParity(t *testing.T) {
 						t.Fatal("post URL lost")
 					}
 				}
-				if photoQuoteText(t, private) != photoQuoteText(t, archive) || private.Truncated != archive.Truncated || private.SourceJSONInline != archive.SourceJSONInline {
+				if quotes[0] != quotes[1] || private.Truncated != archive.Truncated || private.SourceJSONInline != archive.SourceJSONInline {
 					t.Fatal("archive/private common body differs")
 				}
 				if !long {
@@ -87,7 +95,7 @@ func TestSharedProfileRendererPrivateArchiveParity(t *testing.T) {
 					t.Fatal(err)
 				}
 				for _, e := range other.Entities {
-					if e.Type == "text_link" {
+					if e.Type == "text_link" && !validJardulikProfileURL(e.URL) {
 						t.Fatal("other tenant received operator private topic URL")
 					}
 				}
@@ -117,7 +125,7 @@ func TestPostLinkEntitiesSecureAndSurviveJSONInsertionAndChunks(t *testing.T) {
 		}
 	}
 	card := photoJSONCardText("Ира🙂\n\nJardulik: 99\n📍 "+link, nil, "", 1024, `{"large":9007199254740993}`)
-	if !card.SourceJSONInline || len(card.Entities) != 2 || !strings.Contains(photoQuoteText(t, card), "9007199254740993") {
+	if !card.SourceJSONInline || len(card.Entities) != 4 || !strings.Contains(photoQuoteText(t, card), "9007199254740993") {
 		t.Fatal("JSON insertion assumed only one entity")
 	}
 	if err := validMessageEntities(card.Text, card.Entities); err != nil {
@@ -140,11 +148,10 @@ func TestPostLinkEntitiesSecureAndSurviveJSONInsertionAndChunks(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, e := range part.Entities {
-			if e.Type == "text_link" {
+			if e.Type == "text_link" && e.URL == link {
 				links++
-				if e.URL != link {
-					t.Fatal("chunk lost URL")
-				}
+			} else if e.Type == "text_link" && e.URL != jardulikProfileURL(99) {
+				t.Fatal("chunk lost URL")
 			}
 		}
 		joined.WriteString(part.Text)

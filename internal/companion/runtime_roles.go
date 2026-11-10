@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -69,43 +70,60 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		}
 	}
 	var background sync.WaitGroup
-	start := func(run func(context.Context)) {
+	start := func(name string, run func(context.Context)) {
 		background.Add(1)
-		go func() { defer background.Done(); run(ctx) }()
+		go func() {
+			defer background.Done()
+			defer func() {
+				if cause := recover(); cause != nil {
+					slog.Error("background worker panicked", "component", name, "kind", fmt.Sprintf("%T", cause))
+					panic(cause)
+				}
+			}()
+			run(ctx)
+			if ctx.Err() == nil {
+				slog.Warn("background worker stopped", "component", name)
+			}
+		}()
+	}
+	if s.operationsAllowed() && s.Config.Token != "" {
+		start("operations-heartbeat", func(ctx context.Context) { s.runOperationsHeartbeat(ctx, role) })
 	}
 	if role == RuntimeAll || role == RuntimeBotParser {
 		if debugRun != nil {
-			start(debugRun)
+			start("debug-http", debugRun)
 		}
-		start(s.Media.Run)
+		start("media", s.Media.Run)
 		if s.Config.SyncCycleEnabled {
-			start(s.RunSyncCycles)
+			start("sync-cycles", s.RunSyncCycles)
 		} else {
-			start(s.Watcher.RunChecks)
+			start("profile-checks", s.Watcher.RunChecks)
 		}
-		start(s.Crawler.Run)
-		start(s.Autoliker.Run)
-		start(s.runContacts)
+		start("crawler", s.Crawler.Run)
+		start("autoliker", s.Autoliker.Run)
+		start("contacts", s.runContacts)
 		if s.Config.CompatibilityEnabled {
-			start(s.runCompatibilityExecutor)
+			start("compatibility-executor", s.runCompatibilityExecutor)
 		}
-		start(s.runPrivateCardRepair)
+		start("private-card-repair", s.runPrivateCardRepair)
 	}
 	if role == RuntimeAll || role == RuntimePoster {
+		start("operations", s.RunOperations)
+		start("opening-timeline", s.RunOpeningTimeline)
 		if !s.Config.ArchivePaused {
-			start(s.Archiver.Run)
-			start(s.RunCaptionMaintenance)
-			start(s.RunProfileIndexes)
+			start("archiver", s.Archiver.Run)
+			start("caption-maintenance", s.RunCaptionMaintenance)
+			start("profile-indexes", s.RunProfileIndexes)
 		}
-		start(s.Watcher.RunPresence)
-		start(s.RunAnalysisPosts)
-		start(s.RunArchiveChangePosts)
+		start("profile-presence", s.Watcher.RunPresence)
+		start("analysis-posts", s.RunAnalysisPosts)
+		start("archive-changes", s.RunArchiveChangePosts)
 		if !s.Config.ArchivePaused {
-			start(s.RunOpeningPosts)
+			start("opening-posts", s.RunOpeningPosts)
 		}
 	}
 	if s.Config.CompatibilityEnabled && (role == RuntimeAll || role == RuntimeCompatibility) {
-		start(s.runCompatibilityPlanner)
+		start("compatibility-planner", s.runCompatibilityPlanner)
 	}
 	var once sync.Once
 	return func() { once.Do(func() { background.Wait(); unlock() }) }, nil

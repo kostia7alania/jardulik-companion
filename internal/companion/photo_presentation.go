@@ -68,11 +68,11 @@ func photoExifBlocks(photos []MediaJob) []string {
 
 // The main caption always keeps the compact summary, not a synthesized JSON dump.
 func photoJSONCardText(text string, photos []MediaJob, tail string, limit int, sourceJSON ...string) photoText {
-	value := photoCardText(text, photoMetadataRows(photos), tail, limit)
+	value := photoCardTextBase(text, photoMetadataRows(photos), tail, limit)
 	if len(sourceJSON) > 0 && sourceJSON[0] != "" {
 		display, projection := photoSourceJSONFit(sourceJSON[0], limit-textUnits(value.Text)-1)
 		if display == "" {
-			return value
+			return withProfileSourceIDLine(value)
 		}
 		for i, e := range value.Entities {
 			if e.Type != "expandable_blockquote" {
@@ -93,7 +93,7 @@ func photoJSONCardText(text string, photos []MediaJob, tail string, limit int, s
 			break
 		}
 	}
-	return value
+	return withProfileSourceIDLine(value)
 }
 
 // Caption-only projections keep the complete stored JSON available by its action.
@@ -233,6 +233,10 @@ func splitPhotoFooter(text string) (body, details, footer, link string) {
 // Offsets are calculated after truncation; generated details keep a fixed
 // budget and cannot be displaced by a long biography or photo metadata.
 func photoCardText(text string, rows []string, tail string, limit int) photoText {
+	return withProfileSourceIDLine(photoCardTextBase(text, rows, tail, limit))
+}
+
+func photoCardTextBase(text string, rows []string, tail string, limit int) photoText {
 	body, details, footer, link := splitPhotoFooter(text)
 	if len(rows) == 0 && details == "" {
 		return withProfileHeadingLink(photoText{Text: captionWithTail(body+footer, tail, limit)}, link)
@@ -295,7 +299,37 @@ func fullPhotoText(text string, rows []string) photoText {
 	}
 	prefix := body + "\n\n"
 	result := photoText{Text: prefix + quote + footer, Entities: []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(prefix), Length: textUnits(quote)}}}
-	return withProfileHeadingLink(result, link)
+	return withProfileHeadingLink(withProfileSourceIDLine(result), link)
+}
+
+// Legacy entities cannot nest code inside a folded quote. Keep the generated
+// source identity on its own line, with a clean profile link and monospaced ID.
+func withProfileSourceIDLine(value photoText) photoText {
+	for i, entity := range value.Entities {
+		if entity.Type != "expandable_blockquote" {
+			continue
+		}
+		_, rest := telegramPrefix(value.Text, entity.Offset)
+		quote, _ := telegramPrefix(rest, entity.Length)
+		line, remaining, hasRest := strings.Cut(quote, "\n")
+		idText := strings.TrimPrefix(line, "Jardulik: ")
+		id, err := strconv.ParseInt(idText, 10, 64)
+		if idText == line || err != nil || id <= 0 || strconv.FormatInt(id, 10) != idText {
+			continue
+		}
+		if hasRest && remaining != "" {
+			value.Entities[i].Offset += textUnits(line) + 1
+			value.Entities[i].Length -= textUnits(line) + 1
+		} else {
+			value.Entities = append(value.Entities[:i], value.Entities[i+1:]...)
+		}
+		value.Entities = append(value.Entities,
+			MessageEntity{Type: "text_link", Offset: entity.Offset, Length: textUnits("Jardulik"), URL: jardulikProfileURL(id)},
+			MessageEntity{Type: "code", Offset: entity.Offset + textUnits("Jardulik: "), Length: textUnits(idText)},
+		)
+		break
+	}
+	return value
 }
 
 func photoTextPart(value photoText, limit int) (photoText, photoText) {

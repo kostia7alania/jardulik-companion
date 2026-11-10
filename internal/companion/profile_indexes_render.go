@@ -111,10 +111,17 @@ func sortProfileIndex(kind string, entries []profileIndexEntry) []profileIndexEn
 	return out
 }
 
-func profileIndexRow(n int, e profileIndexEntry) string {
+func profileIndexRow(kind string, n int, e profileIndexEntry) string {
 	age, percent := "?", "—"
 	if e.AgeKnown {
 		age = strconv.FormatInt(e.Age, 10)
+	}
+	if kind == profileIndexAge {
+		birthday := "?"
+		if date, known := profileBirthdayDate(Profile{"birthday": e.Birthday}); known {
+			birthday = date.Format("2.1.2006")
+		}
+		age = birthday + " (" + age + ")"
 	}
 	if e.PercentKnown {
 		percent = strconv.Itoa(e.Percent) + "%"
@@ -145,7 +152,7 @@ func renderProfileIndexPagesMode(kind string, entries []profileIndexEntry, chat 
 	current := []row{}
 	units := 0
 	for i, entry := range ordered {
-		label := profileIndexRow(i+1, entry)
+		label := profileIndexRow(kind, i+1, entry)
 		tail := " " + profileIndexPremiumIcon(entry)
 		link := profileIndexCardURL(chat, entry.ThreadID, entry.CardID)
 		if entry.ID <= 0 || entry.ThreadID <= 0 || entry.CardID <= 0 || link == "" {

@@ -84,6 +84,56 @@ func TestProfileIndexAgeSortUsesExactDayAndStableFallbacks(t *testing.T) {
 	}
 }
 
+func TestProfileIndexAgeRowShowsSourceBirthdayAndStoredAge(t *testing.T) {
+	entry := profileIndexEntry{ID: 1, Name: "Лиза", Age: 18, AgeKnown: true, Birthday: "1992-01-01", Zodiac: "♎️", Percent: 70, PercentKnown: true}
+	if got := profileIndexRow(profileIndexAge, 1, entry); got != "1 ♎️ 1.1.1992 (18), Лиза, 70%" {
+		t.Fatalf("birthday or stored age changed: %q", got)
+	}
+	if got := profileIndexRow(profileIndexCompatibility, 1, entry); got != "1 ♎️ 18, Лиза, 70%" {
+		t.Fatalf("compatibility view changed its compact row: %q", got)
+	}
+	for _, tc := range []struct {
+		birthday string
+		knownAge bool
+		want     string
+	}{
+		{"2004-02-29", true, "29.2.2004 (18)"},
+		{"2004-02-30", true, "? (18)"},
+		{"", true, "? (18)"},
+		{"1992-01-01", false, "1.1.1992 (?)"},
+		{"", false, "? (?)"},
+	} {
+		entry.Birthday, entry.AgeKnown = tc.birthday, tc.knownAge
+		if got := profileIndexRow(profileIndexAge, 1, entry); got != "1 ♎️ "+tc.want+", Лиза, 70%" {
+			t.Fatalf("unknown or leap-day source %q: %q", tc.birthday, got)
+		}
+	}
+}
+
+func TestProfileIndexAge847BirthdaysFitActualRichBudgetAndStayLinked(t *testing.T) {
+	const chat int64 = -1004401653948
+	entries := make([]profileIndexEntry, 847)
+	for i := range entries {
+		entries[i] = profileIndexEntry{ID: int64(i + 1), ThreadID: int64(i + 100), CardID: int64(i + 1000), Name: "Лиза", Age: 18, AgeKnown: true, Birthday: "1992-01-01", Zodiac: "♎️", Percent: 70, PercentKnown: true, PremiumKnown: true, Premium: true}
+	}
+	before := append([]profileIndexEntry(nil), entries...)
+	pages, err := renderProfileIndexPages(profileIndexAge, entries, chat)
+	if err != nil || len(pages) != 1 || len(profileIndexRenderedRows(t, pages, chat)) != len(entries) {
+		t.Fatalf("847 short age rows unnecessarily split or lost: pages=%d err=%v", len(pages), err)
+	}
+	rows := profileIndexRenderedRows(t, pages, chat)
+	if rows[0] != "1 ♎️ 1.1.1992 (18), Лиза, 70%" || rows[846] != "847 ♎️ 1.1.1992 (18), Лиза, 70%" || !reflect.DeepEqual(entries, before) {
+		t.Fatal("DOB row numbering, age or source snapshot changed")
+	}
+	for i := range entries {
+		entries[i].Name = strings.Repeat("🙂", 40)
+	}
+	pages, err = renderProfileIndexPages(profileIndexAge, entries, chat)
+	if err != nil || len(pages) < 2 || len(profileIndexRenderedRows(t, pages, chat)) != len(entries) {
+		t.Fatal("long DOB rows did not follow the real Rich budget", err)
+	}
+}
+
 func TestProfileIndexCompactNamesZodiacAndSourceStayExact(t *testing.T) {
 	profile := Profile{"name": "  Lika\n🙂  ", "surName": "  Bazrova  ", "surname": "Ignored", "familyNames": "Not a surname", "age": 22, "height": 169, "birthday": "2004-07-08T00:00:00"}
 	before, _ := json.Marshal(profile)
@@ -107,11 +157,11 @@ func TestProfileIndexCompactNamesZodiacAndSourceStayExact(t *testing.T) {
 			t.Fatalf("unknown birthday %v gained a sign: %q", birthday, got)
 		}
 	}
-	row := profileIndexRow(1, profileIndexEntry{ID: 17, Name: name, Age: 22, AgeKnown: true, Percent: 75, PercentKnown: true, Zodiac: "♋️"})
+	row := profileIndexRow(profileIndexCompatibility, 1, profileIndexEntry{ID: 17, Name: name, Age: 22, AgeKnown: true, Percent: 75, PercentKnown: true, Zodiac: "♋️"})
 	if row != "1 ♋️ 22, Lika 🙂 Bazrova, 75%" || strings.Contains(row, "169") || strings.Contains(row, "#17") {
 		t.Fatalf("non-compact profile row: %q", row)
 	}
-	if got := profileIndexRow(2, profileIndexEntry{ID: 18, Name: "Anna"}); got != "2 ❔ ?, Anna, —" {
+	if got := profileIndexRow(profileIndexCompatibility, 2, profileIndexEntry{ID: 18, Name: "Anna"}); got != "2 ❔ ?, Anna, —" {
 		t.Fatalf("missing fields became invented values: %q", got)
 	}
 	after, _ := json.Marshal(profile)
@@ -132,7 +182,7 @@ func TestProfileIndexPagesLinkWholeUTF16RowsAndKeepGlobalNumbers(t *testing.T) {
 		t.Fatalf("unexpected arbitrary row pagination: pages=%d err=%v", len(pages), err)
 	}
 	rows := profileIndexRenderedRows(t, pages, chat)
-	if len(rows) != 51 || rows[0] != "1 ❔ 23, Name000🙂, 75%" || rows[50] != "51 ❔ 23, Name050🙂, 75%" {
+	if len(rows) != 51 || rows[0] != "1 ❔ ? (23), Name000🙂, 75%" || rows[50] != "51 ❔ ? (23), Name050🙂, 75%" {
 		t.Fatalf("global numbering or compact labels changed: %v", rows)
 	}
 	if pages[0].Entities[0].URL != profileIndexCardURL(chat, 100, 1000) || pages[0].Entities[50].URL != profileIndexCardURL(chat, 150, 1050) {
@@ -255,7 +305,7 @@ func TestProfileIndexPremiumStrictSourceAndOutsideLink(t *testing.T) {
 			t.Fatalf("type=%v: premium=%v known=%v", tc.value, premium, known)
 		}
 		e := profileIndexEntry{ID: 1, ThreadID: 2, CardID: 3, Name: "Сабина🙂", Age: 19, AgeKnown: true, Percent: 70, PercentKnown: true, Zodiac: "♑️", Premium: premium, PremiumKnown: known}
-		if got := profileIndexRow(37, e); got != "37 ♑️ 19, Сабина🙂, 70%" {
+		if got := profileIndexRow(profileIndexCompatibility, 37, e); got != "37 ♑️ 19, Сабина🙂, 70%" {
 			t.Fatalf("wrong horizontal label: %q", got)
 		}
 		for _, kind := range []string{profileIndexAge, profileIndexCompatibility} {
@@ -266,7 +316,11 @@ func TestProfileIndexPremiumStrictSourceAndOutsideLink(t *testing.T) {
 			entity := pages[0].Entities[0]
 			_, rest := telegramPrefix(pages[0].Text, entity.Offset)
 			label, tail := telegramPrefix(rest, entity.Length)
-			if label != "1 ♑️ 19, Сабина🙂, 70%" || tail != " "+tc.icon || validMessageEntities(pages[0].Text, pages[0].Entities) != nil {
+			want := "1 ♑️ 19, Сабина🙂, 70%"
+			if kind == profileIndexAge {
+				want = "1 ♑️ ? (19), Сабина🙂, 70%"
+			}
+			if label != want || tail != " "+tc.icon || validMessageEntities(pages[0].Text, pages[0].Entities) != nil {
 				t.Fatalf("Premium included in UTF-16 click span: label=%q tail=%q", label, tail)
 			}
 		}

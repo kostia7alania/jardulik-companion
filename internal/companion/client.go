@@ -275,7 +275,8 @@ func (c *Client) requestSession(ctx context.Context, owner int64, method, path s
 	return raw, err
 }
 
-func (c *Client) requestSessionObserved(ctx context.Context, owner int64, method, path string, payload any, expected *Session) ([]byte, time.Time, error) {
+func (c *Client) requestSessionObserved(ctx context.Context, owner int64, method, path string, payload any, expected *Session) (raw []byte, observedAt time.Time, requestErr error) {
+	defer func() { logOperationsFailure(ctx, "Jardulik", method, path, owner, requestErr) }()
 	s, err := c.token(ctx, owner, "")
 	if err != nil {
 		return nil, time.Time{}, err

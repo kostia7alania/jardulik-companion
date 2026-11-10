@@ -91,8 +91,25 @@ func TestRefreshCaptionsOnlyEditsKnownCardsPreservingSources(t *testing.T) {
 		if (input.Chat == svc.Config.BackupChatID && input.Message != 101) || (input.Chat == 123 && input.Message != 201) || (input.Chat != svc.Config.BackupChatID && input.Chat != 123) {
 			t.Fatalf("edited a source or unknown card: %+v", input)
 		}
-		if !strings.Contains(input.Caption, "1-2:") || strings.Contains(input.Caption, `[{"Фото":1}`) || len(input.Entities) != 2 {
-			t.Fatalf("existing card did not receive the compact expandable summary: %+v", input)
+		card := photoText{Text: input.Caption, Entities: input.Entities}
+		assertLegacySourceID(t, card, p.ID)
+		quote := photoQuoteText(t, card)
+		pretty, err := prettyProfileJSON(rawBefore)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(quote, "1-2:") || !strings.HasSuffix(quote, pretty) || strings.Contains(quote, fmt.Sprintf("Jardulik: %d", p.ID)) || strings.Contains(input.Caption, `[{"Фото":1}`) {
+			t.Fatalf("existing card did not keep compact metadata and exact source JSON folded: %+v", input)
+		}
+		heading, _, _ := strings.Cut(input.Caption, "\n")
+		headingLinks := 0
+		for _, entity := range input.Entities {
+			if entity.Type == "text_link" && entity.Offset == 0 && entity.Length == textUnits(heading) && entity.URL == forumThreadURL(svc.Config.BackupChatID, 55) {
+				headingLinks++
+			}
+		}
+		if headingLinks != 1 {
+			t.Fatal("known card lost its single heading link to the profile thread")
 		}
 		targets = append(targets, input.Message)
 		body := fmt.Sprintf(`{"ok":true,"result":{"message_id":%d,"chat":{"id":%d}}}`, input.Message, input.Chat)

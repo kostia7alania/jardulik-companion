@@ -1697,6 +1697,7 @@ func TestArchiveCaptionLinksHeadingWithinUTF16Budget(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		assertLegacySourceID(t, card, p.ID)
 		caption := card.Text
 		if textUnits(caption) > limit || strings.Contains(caption, "🔗 пост") {
 			t.Fatalf("caption has a footer link or exceeded budget: units=%d limit=%d", textUnits(caption), limit)
@@ -1744,6 +1745,7 @@ func TestZIPRepairRefreshesConfirmedCaptionWithoutReupload(t *testing.T) {
 			if err = json.Unmarshal(encoded, &entities); err != nil {
 				t.Fatal(err)
 			}
+			assertLegacySourceID(t, photoText{Text: caption, Entities: entities}, p.ID)
 			heading, _, _ := strings.Cut(caption, "\n")
 			headingLinks := 0
 			for _, entity := range entities {

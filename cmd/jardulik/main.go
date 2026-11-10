@@ -43,6 +43,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	roles := map[string]companion.RuntimeRole{"serve": companion.RuntimeAll, "serve-bot-parser": companion.RuntimeBotParser, "serve-poster": companion.RuntimePoster, "serve-compatibility": companion.RuntimeCompatibility}
+	if role, serving := roles[command]; serving {
+		if logErr := companion.InstallOperationsLogger(c, role); logErr != nil {
+			slog.Warn("operations log unavailable", "kind", fmt.Sprintf("%T", logErr))
+		}
+	}
 	if command == "restore-telegram" {
 		if len(os.Args) != 4 {
 			return errors.New("usage: jardulik restore-telegram <receipt.json> <new-empty-directory>")
@@ -102,6 +108,16 @@ func run() error {
 			return statusErr
 		}
 		return json.NewEncoder(os.Stdout).Encode(status)
+	case "operations-status":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik operations-status")
+		}
+		status, statusErr := s.OperationsStatus(ctx)
+		if statusErr != nil {
+			return statusErr
+		}
+		fmt.Println(status)
+		return nil
 	case "compatibility-status":
 		if len(os.Args) != 2 {
 			return errors.New("usage: jardulik compatibility-status")
@@ -267,19 +283,30 @@ func run() error {
 		result, err := s.RefreshCaptions(ctx, cardsOnly)
 		_ = json.NewEncoder(os.Stdout).Encode(result)
 		return err
+	case "refresh-profile-caption":
+		if len(os.Args) != 3 {
+			return errors.New("usage: jardulik refresh-profile-caption <userId>")
+		}
+		profile, parseErr := strconv.ParseInt(os.Args[2], 10, 64)
+		if parseErr != nil || profile <= 0 {
+			return errors.New("invalid profile userId")
+		}
+		edited, refreshErr := s.RefreshProfileCaption(ctx, profile)
+		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"userId": profile, "edited": edited})
+		return refreshErr
 	case "reconcile-albums":
 		if err = s.Archiver.ReconcileCaptionedAlbums(ctx); err != nil {
 			return err
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, sync-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, sync-status, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, version")
 	}
 }
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 	if err := run(); err != nil {
-		slog.Error("command failed", "error", err.Error())
+		slog.Error("command failed", "error", err)
 		os.Exit(1)
 	}
 }

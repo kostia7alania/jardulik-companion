@@ -116,7 +116,7 @@ func TestRichProfileSourceBodyAndAllMediaShapes(t *testing.T) {
 			if quote["type"] != "expandable_blockquote" || !strings.HasPrefix(richProfileTextValue(t, parts), "Jardulik: 77\n") || !strings.Contains(richProfileTextValue(t, parts), "❔ языки\n") {
 				t.Fatal("fold order/shape changed")
 			}
-			button := parts[1].(map[string]any)["button"].(map[string]any)
+			button := parts[2].(map[string]any)["button"].(map[string]any)
 			if button["text"] != "77" || button["copy_text"].(map[string]any)["text"] != "77" {
 				t.Fatal("source ID lost inline copy action")
 			}
@@ -186,10 +186,11 @@ func TestRichProfileHeadingLinksAndSourceIDCopiesInsideDetails(t *testing.T) {
 	}
 	quote := blocks[1].(map[string]any)
 	parts := quote["text"].([]any)
-	if parts[0] != "Jardulik: " || parts[1].(map[string]any)["type"] != "button" {
-		t.Fatal("source ID must be the first quoted detail")
+	serviceLink := parts[0].(map[string]any)
+	if serviceLink["type"] != "url" || serviceLink["text"] != "Jardulik" || serviceLink["url"] != jardulikProfileURL(p.ID) || parts[1] != ": " || parts[2].(map[string]any)["type"] != "button" {
+		t.Fatal("clean service link and copyable source ID must be the first quoted detail")
 	}
-	button := parts[1].(map[string]any)["button"].(map[string]any)
+	button := parts[2].(map[string]any)["button"].(map[string]any)
 	if button["text"] != "77" || button["copy_text"].(map[string]any)["text"] != "77" {
 		t.Fatal("inline ID copy changed the source ID")
 	}
@@ -374,5 +375,32 @@ func TestRichCardMarkerValidatedDurableAndExact(t *testing.T) {
 	}
 	if _, err = loadRichCardMarker(ctx, store, -100123, 123); !errors.Is(err, ErrRichCardMarker) {
 		t.Fatal("deleted source marker accepted", err)
+	}
+}
+
+func TestRichUserIDCopiesSourceIdentityAndLinksCleanProfile(t *testing.T) {
+	p, _ := richFixture(t, 0)
+	p.ID, p.VersionID = 115, 1620
+	p.RawJSON = `{"userId":115,"name":"Имя🙂","large":9007199254740993,"precise":1.00}`
+	if err := json.Unmarshal([]byte(p.RawJSON), &p.Profile); err != nil {
+		t.Fatal(err)
+	}
+	original := p.RawJSON
+	card, err := BuildRichProfileCard(p, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := card.Content["blocks"].([]any)[1].(map[string]any)["text"].([]any)
+	link := parts[0].(map[string]any)
+	button := parts[2].(map[string]any)["button"].(map[string]any)
+	if link["text"] != "Jardulik" || link["url"] != jardulikProfileURL(115) || parts[1] != ": " || button["text"] != "115" || button["copy_text"].(map[string]any)["text"] != "115" {
+		t.Fatal("rich card copied a local version ID or linked a credential-bearing URL")
+	}
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, []byte(original), "", "  "); err != nil {
+		t.Fatal(err)
+	}
+	if p.RawJSON != original || parts[len(parts)-1].(map[string]any)["text"] != pretty.String() {
+		t.Fatal("source identity presentation changed raw JSON")
 	}
 }

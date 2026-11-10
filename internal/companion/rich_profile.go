@@ -78,7 +78,8 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 		return card, errors.New("rich profile ID details mismatch")
 	}
 	blocks = append(blocks, map[string]any{"type": "expandable_blockquote", "text": []any{
-		"Jardulik: ",
+		map[string]any{"type": "url", "text": "Jardulik", "url": jardulikProfileURL(p.ID)},
+		": ",
 		map[string]any{"type": "button", "button": map[string]any{"text": idText, "copy_text": map[string]any{"text": idText}}},
 		remaining,
 		map[string]any{"type": "code", "text": pretty.String()},

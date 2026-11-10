@@ -65,3 +65,32 @@ func TestJardulikDeepLinksUseOfficialBotInAllControls(t *testing.T) {
 		}
 	})
 }
+
+func TestJardulikProfileURLHasOnlySourceUserIDAndRouteFlag(t *testing.T) {
+	const want = "https://mini.jardulik.app/mutuals?targetUserId=115&noCheck=1"
+	if got := jardulikProfileURL(115); got != want || !validJardulikProfileURL(got) {
+		t.Fatal("clean source profile URL changed", got)
+	}
+	for _, id := range []int64{0, -1} {
+		if jardulikProfileURL(id) != "" {
+			t.Fatal("invalid profile identity became a link")
+		}
+	}
+	for _, bad := range []string{
+		"http://mini.jardulik.app/mutuals?targetUserId=115&noCheck=1",
+		"https://other.invalid/mutuals?targetUserId=115&noCheck=1",
+		"https://user@mini.jardulik.app/mutuals?targetUserId=115&noCheck=1",
+		"https://mini.jardulik.app:443/mutuals?targetUserId=115&noCheck=1",
+		"https://mini.jardulik.app/mutuals?targetUserId=115&noCheck=1#tgWebAppData=secret",
+		want + "&token=secret", want + "&targetUserId=1620",
+		"https://mini.jardulik.app/mutuals?targetUserId=0&noCheck=1",
+		"https://mini.jardulik.app/mutuals?targetUserId=0115&noCheck=1",
+		"https://mini.jardulik.app/mutuals?targetUserId=-1&noCheck=1",
+		"https://mini.jardulik.app/mutuals?targetUserId=115&noCheck=0",
+		"https://mini.jardulik.app/mutuals?targetUserId=115",
+	} {
+		if validJardulikProfileURL(bad) {
+			t.Fatal("noncanonical or credential-bearing profile URL accepted", bad)
+		}
+	}
+}
