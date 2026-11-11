@@ -281,6 +281,53 @@ func TestSettingsUXShowsAppliedFiltersAndSelectedTapDoesNotRotateNonce(t *testin
 	}
 }
 
+func TestSettingsUXShowsEffectiveReactionLimits(t *testing.T) {
+	f, requests := settingsUXFixture(t)
+	s := f.worker.Service
+	ctx := context.Background()
+	j, err := f.worker.settings(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.worker.updateSetting(ctx, 1, j.Nonce, "cap", 500); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.ConfigureReactionMessagePolicy(ctx, 1, ReactionMessagePolicyConfig{Mode: "first", Templates: []string{"Привет!"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ cutoff, interval, cap int }{{23, 60, 100}, {112, 60, 100}, {0, 30, 500}} {
+		if err := s.Store.SetSuperBeforeAge(ctx, 1, tc.cutoff); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.OpenSettings(ctx, 1); err != nil {
+			t.Fatal(err)
+		}
+		menu := (*requests)[len(*requests)-1]
+		labels := make(map[string]bool)
+		for _, row := range menu.Markup.Rows {
+			for _, button := range row {
+				labels[button.Text] = true
+			}
+		}
+		if !labels[fmt.Sprintf("⏱ Интервал · %d с", tc.interval)] || !labels[fmt.Sprintf("🧮 Мой лимит · %d /24ч", tc.cap)] {
+			t.Fatalf("wrong limits in settings for cutoff %d: %v", tc.cutoff, labels)
+		}
+		wantStatus := fmt.Sprintf("интервал %d с; мой лимит %d /24ч", tc.interval, tc.cap)
+		if status := s.AutolikeStatus(ctx, 1); !strings.Contains(status, wantStatus) {
+			t.Fatalf("wrong limits in status for cutoff %d: %s", tc.cutoff, status)
+		}
+		settingsUXTap(t, s, 1, 100, settingsUXAction(t, menu, "view:cap"))
+		capMenu := (*requests)[len(*requests)-1]
+		if !strings.Contains(capMenu.Text, fmt.Sprintf("Мой лимит: %d лайков /24ч", tc.cap)) {
+			t.Fatalf("wrong cap details for cutoff %d: %s", tc.cutoff, capMenu.Text)
+		}
+		settingsUXAction(t, capMenu, "cap:500")
+	}
+	if len(f.requests) != 0 {
+		t.Fatalf("viewing limits contacted Jardulik: %v", f.requests)
+	}
+}
+
 func TestSettingsUXSuccessfulReconnectDoesNotShowOldDisconnectAsCurrent(t *testing.T) {
 	f, requests := settingsUXFixture(t)
 	s := f.worker.Service

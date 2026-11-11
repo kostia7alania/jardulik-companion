@@ -12,7 +12,9 @@ import (
 // Shared by initial presence delivery and edits of its confirmed receipt.
 func profilePresenceText(profile int64, availability, observed, reason, changes string) string {
 	title := "Анкета недоступна"
-	if availability == "available" {
+	if availability == "available" && reason == "feed_returned" {
+		title = "Анкета снова в выдаче"
+	} else if availability == "available" {
 		title = "Анкета снова доступна"
 	} else if reason == "feed_absent" {
 		title = "Анкета в этом обходе не обнаружена"

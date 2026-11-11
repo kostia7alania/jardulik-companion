@@ -16,6 +16,7 @@ import (
 const relationSchema = `
 CREATE TABLE IF NOT EXISTS relation_batches (
  id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ upstream_id INTEGER NOT NULL DEFAULT 0 CHECK(upstream_id>=0),
  mutual INTEGER NOT NULL CHECK(mutual IN (0,1)), source_page INTEGER NOT NULL, raw_json TEXT NOT NULL,
  captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -27,8 +28,45 @@ CREATE TABLE IF NOT EXISTS relation_profiles (
 CREATE INDEX IF NOT EXISTS relation_owner_profile ON relation_profiles(owner_id,profile_id);`
 
 func (s *Store) initRelations(ctx context.Context) error {
-	_, err := s.DB.ExecContext(ctx, relationSchema)
-	return err
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='relation_batches'"); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, relationSchema); err != nil {
+		return err
+	}
+	var bound, contactJobs bool
+	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('relation_batches') WHERE name='upstream_id')").Scan(&bound); err != nil {
+		return err
+	}
+	if bound {
+		return tx.Commit()
+	}
+	if _, err = tx.ExecContext(ctx, "ALTER TABLE relation_batches ADD COLUMN upstream_id INTEGER NOT NULL DEFAULT 0 CHECK(upstream_id>=0)"); err != nil {
+		return err
+	}
+	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='contact_requests')").Scan(&contactJobs); err != nil {
+		return err
+	}
+	if contactJobs {
+		// A contact request records the source account when its exact mutual batch is saved.
+		_, err = tx.ExecContext(ctx, `WITH proof AS (
+ SELECT b.id,MIN(r.upstream_id) AS upstream_id FROM relation_batches b
+ JOIN contact_requests r ON r.mutual_batch_id=b.id AND r.owner_id=b.owner_id
+ JOIN relation_profiles p ON p.batch_id=b.id AND p.owner_id=b.owner_id AND p.profile_id=r.profile_id
+ WHERE b.mutual=1 GROUP BY b.id
+ HAVING MIN(r.upstream_id)>0 AND MIN(r.upstream_id)=MAX(r.upstream_id) AND MIN(length(r.generation))>0
+ ) UPDATE relation_batches SET upstream_id=(SELECT proof.upstream_id FROM proof WHERE proof.id=relation_batches.id)
+ WHERE id IN (SELECT id FROM proof)`)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // KnownProfile accepts only this owner's discovery, relationship or location provenance.
@@ -44,7 +82,9 @@ func (s *Store) KnownProfile(ctx context.Context, owner, id int64) error {
 	if err = s.initRelations(ctx); err != nil {
 		return err
 	}
-	err = s.DB.QueryRowContext(ctx, `SELECT 1 FROM relation_profiles p JOIN relation_batches b ON b.id=p.batch_id AND b.owner_id=p.owner_id WHERE p.owner_id=? AND p.profile_id=? LIMIT 1`, owner, id).Scan(&found)
+	err = s.DB.QueryRowContext(ctx, `SELECT 1 FROM relation_profiles p JOIN relation_batches b ON b.id=p.batch_id AND b.owner_id=p.owner_id
+ JOIN sessions se ON se.owner_id=b.owner_id AND se.upstream_id=b.upstream_id AND se.state='connected'
+ WHERE p.owner_id=? AND p.profile_id=? AND b.upstream_id>0 LIMIT 1`, owner, id).Scan(&found)
 	if err == nil || !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -144,7 +184,7 @@ func (c *Client) reactUsers(ctx context.Context, owner int64, expected *Session,
 		return result, err
 	}
 	defer tx.Rollback()
-	inserted, err := tx.ExecContext(ctx, "INSERT INTO relation_batches(owner_id,mutual,source_page,raw_json) VALUES(?,?,?,?)", owner, mutual, page, string(raw))
+	inserted, err := tx.ExecContext(ctx, "INSERT INTO relation_batches(owner_id,upstream_id,mutual,source_page,raw_json) VALUES(?,?,?,?,?)", owner, session.UserID, mutual, page, string(raw))
 	if err != nil {
 		return result, err
 	}
@@ -169,13 +209,15 @@ func (c *Client) reactUsers(ctx context.Context, owner int64, expected *Session,
 	return result, tx.Commit()
 }
 
-func (s *Store) relationPage(ctx context.Context, owner, batch int64, mutual bool) (RelationPage, error) {
+func (s *Store) relationPage(ctx context.Context, owner, upstream, batch int64, mutual bool) (RelationPage, error) {
 	result := RelationPage{ID: batch, Mutual: mutual}
 	var raw string
 	if err := s.initRelations(ctx); err != nil {
 		return result, err
 	}
-	err := s.DB.QueryRowContext(ctx, "SELECT source_page,raw_json FROM relation_batches WHERE owner_id=? AND id=? AND mutual=?", owner, batch, mutual).Scan(&result.SourcePage, &raw)
+	err := s.DB.QueryRowContext(ctx, `SELECT b.source_page,b.raw_json FROM relation_batches b
+ JOIN sessions se ON se.owner_id=b.owner_id AND se.upstream_id=b.upstream_id AND se.state='connected'
+ WHERE b.owner_id=? AND b.upstream_id=? AND b.upstream_id>0 AND b.id=? AND b.mutual=?`, owner, upstream, batch, mutual).Scan(&result.SourcePage, &raw)
 	if err != nil {
 		return result, err
 	}
@@ -190,15 +232,20 @@ func (s *Service) OpenRelations(ctx context.Context, owner int64, mutual bool) {
 			return
 		}
 	}
-	page, err := s.Client.ReactUsers(ctx, owner, mutual, 1)
+	session, err := s.Store.Session(ctx, owner)
 	if err != nil {
 		_ = s.say(ctx, owner, "Не удалось загрузить список. Проверь подключение: /connect", nil)
 		return
 	}
-	s.showRelations(ctx, owner, page, 0)
+	page, err := s.Client.ReactUsersFrozen(ctx, owner, session, mutual, 1)
+	if err != nil {
+		_ = s.say(ctx, owner, "Не удалось загрузить список. Проверь подключение: /connect", nil)
+		return
+	}
+	s.showRelations(ctx, owner, session, page, 0)
 }
 
-func (s *Service) showRelations(ctx context.Context, owner int64, page RelationPage, offset int) {
+func (s *Service) showRelations(ctx context.Context, owner int64, session Session, page RelationPage, offset int) {
 	title, prefix, open := "Входящие", "rl", "ri"
 	if page.Mutual {
 		title, prefix, open = "Взаимности", "rm", "rt"
@@ -207,12 +254,12 @@ func (s *Service) showRelations(ctx context.Context, owner int64, page RelationP
 		return
 	}
 	if offset == len(page.Profiles) && len(page.Profiles) == 1000 {
-		next, err := s.Client.ReactUsers(ctx, owner, page.Mutual, page.SourcePage+1)
+		next, err := s.Client.ReactUsersFrozen(ctx, owner, session, page.Mutual, page.SourcePage+1)
 		if err != nil {
 			_ = s.say(ctx, owner, "Следующая часть списка пока недоступна.", nil)
 			return
 		}
-		s.showRelations(ctx, owner, next, 0)
+		s.showRelations(ctx, owner, session, next, 0)
 		return
 	}
 	if len(page.Profiles) == 0 {
@@ -266,14 +313,19 @@ func (s *Service) HandleRelationCallback(ctx context.Context, owner int64, data 
 		return true
 	}
 	mutual := parts[0] == "rm" || parts[0] == "rt"
-	page, err := s.Store.relationPage(ctx, owner, batch, mutual)
+	session, err := s.Store.Session(ctx, owner)
+	if err != nil || session.State != "connected" {
+		_ = s.say(ctx, owner, "Этот список недоступен. Открой его заново после /connect.", nil)
+		return true
+	}
+	page, err := s.Store.relationPage(ctx, owner, session.UserID, batch, mutual)
 	if err != nil {
 		_ = s.say(ctx, owner, "Этот список недоступен. Открой его заново.", nil)
 		return true
 	}
 	if parts[0] == "rl" || parts[0] == "rm" {
 		if value <= int64(len(page.Profiles)) {
-			s.showRelations(ctx, owner, page, int(value))
+			s.showRelations(ctx, owner, session, page, int(value))
 		}
 		return true
 	}
@@ -292,7 +344,7 @@ func (s *Service) HandleRelationCallback(ctx context.Context, owner int64, data 
 		return true
 	}
 	if !mutual {
-		viewer, e := s.Client.Me(ctx, owner)
+		viewer, e := s.Client.meForSession(ctx, owner, session)
 		if e != nil {
 			_ = s.say(ctx, owner, "Не удалось проверить твой тариф. Повтори подключение: /connect", nil)
 			return true
@@ -302,11 +354,7 @@ func (s *Service) HandleRelationCallback(ctx context.Context, owner int64, data 
 			return true
 		}
 	}
-	session, err := s.Store.Session(ctx, owner)
-	if err != nil {
-		return true
-	}
-	profile, err := s.Client.FullProfile(ctx, owner, value)
+	profile, _, _, err := s.Client.checkedProfileObserved(ctx, owner, session, value)
 	if err != nil {
 		_ = s.say(ctx, owner, "Полная анкета сейчас недоступна.", nil)
 		return true

@@ -1423,7 +1423,15 @@ func fullRelationRecords(ctx context.Context, db *sql.DB) ([]string, error) {
 	if err != nil || !exists {
 		return nil, err
 	}
-	rows, err := db.QueryContext(ctx, "SELECT owner_id,mutual,source_page,raw_json FROM relation_batches ORDER BY id")
+	var hasBinding bool
+	if err = db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('relation_batches') WHERE name='upstream_id')").Scan(&hasBinding); err != nil {
+		return nil, err
+	}
+	upstream := "0"
+	if hasBinding {
+		upstream = "upstream_id"
+	}
+	rows, err := db.QueryContext(ctx, "SELECT owner_id,"+upstream+",mutual,source_page,raw_json FROM relation_batches ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -1436,11 +1444,11 @@ func fullRelationRecords(ctx context.Context, db *sql.DB) ([]string, error) {
 		if count > fullBundleEntries {
 			return nil, errArchiveBudget
 		}
-		var owner int64
+		var owner, upstreamID int64
 		var mutual bool
 		var page int
 		var raw string
-		if err = rows.Scan(&owner, &mutual, &page, &raw); err != nil {
+		if err = rows.Scan(&owner, &upstreamID, &mutual, &page, &raw); err != nil {
 			return nil, err
 		}
 		if len(raw) > serviceManifestLimit {
@@ -1473,6 +1481,9 @@ func fullRelationRecords(ctx context.Context, db *sql.DB) ([]string, error) {
 		}
 		fp := hex.EncodeToString(hash.Sum(nil))
 		key := fmt.Sprintf("%d:%t:%d", owner, mutual, page)
+		if upstreamID > 0 {
+			key = fmt.Sprintf("%d:%d:%t:%d", owner, upstreamID, mutual, page)
+		}
 		records = append(records, "relation-version:"+key+":"+fp)
 		heads[key] = fp
 	}

@@ -294,13 +294,17 @@ func (w *ProfileWatcher) CheckOne(ctx context.Context) (bool, error) {
 
 func watchFingerprint(p Profile) (string, error) {
 	// shortcut: compare source filenames; add byte checks if the service reuses image URLs.
+	return mirrorFingerprint(p, photoJobsFromProfileURLs(p))
+}
+
+func photoJobsFromProfileURLs(p Profile) []MediaJob {
 	var jobs []MediaJob
 	for _, role := range []string{"photos", "miniPhotos"} {
 		for position, source := range p.Photos(role) {
 			jobs = append(jobs, MediaJob{Role: role, Position: position, URL: source})
 		}
 	}
-	return mirrorFingerprint(p, jobs)
+	return jobs
 }
 
 func watchErrorCode(err error) string {

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -33,7 +32,7 @@ CREATE TABLE IF NOT EXISTS profile_presence_events (
  FOREIGN KEY(owner_id,profile_id) REFERENCES profile_presence(owner_id,profile_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS profile_presence_pending ON profile_presence_events(state,next_attempt,id);
-`
+` + feedAbsenceSchema
 
 func migrateProfilePresenceTx(ctx context.Context, tx *sql.Tx) error {
 	// Serialize schema inspection and ALTER across startup workers and connections.
@@ -87,7 +86,10 @@ func migrateProfilePresenceTx(ctx context.Context, tx *sql.Tx) error {
  UPDATE profile_presence_events SET reason='direct_unavailable' WHERE availability='unavailable' AND reason='';
  UPDATE profile_presence_events SET version_id=COALESCE((SELECT q.version_id FROM queue q WHERE q.owner_id=profile_presence_events.owner_id AND q.profile_id=profile_presence_events.profile_id),0)
  WHERE version_id=0;`)
-	return err
+	if err != nil {
+		return err
+	}
+	return migrateFeedAbsencesTx(ctx, tx)
 }
 
 func seedProfilePresence(ctx context.Context, tx *sql.Tx) error {
@@ -238,41 +240,8 @@ func profilePresenceChangesTx(ctx context.Context, tx *sql.Tx, owner, profile, o
 	sort.Strings(sorted)
 	var changes []string
 	for _, key := range sorted {
-		if key == "distance" || key == "reactionView" || key == "isFire" || key == "fireText" {
-			continue
-		}
-		if key == "photos" || key == "miniPhotos" {
-			old, new := before.Photos(key), after.Photos(key)
-			if strings.Join(old, "\x00") == strings.Join(new, "\x00") {
-				continue
-			}
-			oldSet, newSet := map[string]bool{}, map[string]bool{}
-			for _, v := range old {
-				oldSet[v] = true
-			}
-			for _, v := range new {
-				newSet[v] = true
-			}
-			added, removed := 0, 0
-			for v := range newSet {
-				if !oldSet[v] {
-					added++
-				}
-			}
-			for v := range oldSet {
-				if !newSet[v] {
-					removed++
-				}
-			}
-			if added == 0 && removed == 0 {
-				if len(old) != len(new) {
-					changes = append(changes, fmt.Sprintf("%s: количество ссылок %d → %d", key, len(old), len(new)))
-				} else {
-					changes = append(changes, key+": изменён порядок ссылок")
-				}
-			} else {
-				changes = append(changes, fmt.Sprintf("%s: ссылок добавлено %d, убрано %d", key, added, removed))
-			}
+		switch key {
+		case "distance", "reactionView", "isFire", "fireText", "photos", "miniPhotos":
 			continue
 		}
 		old, oldExists := before[key]
@@ -284,6 +253,7 @@ func profilePresenceChangesTx(ctx context.Context, tx *sql.Tx, owner, profile, o
 		}
 		changes = append(changes, key+": "+presenceValue(old, oldExists)+" → "+presenceValue(new, newExists))
 	}
+	changes = append(changes, archiveChangePhotoRows(photoJobsFromProfileURLs(before), photoJobsFromProfileURLs(after))...)
 	return strings.Join(changes, "\n"), nil
 }
 

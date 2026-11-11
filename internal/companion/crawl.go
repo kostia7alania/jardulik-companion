@@ -301,6 +301,10 @@ func (c *FeedCrawler) requestRunLocked(ctx context.Context, owner int64, include
 	if _, err = tx.ExecContext(ctx, "DELETE FROM meta WHERE key=?", crawlRetryKey(owner)); err != nil {
 		return nil, err
 	}
+	// Migrate the completed presence ledger before replacing its run ID.
+	if err = initCrawlPresenceTx(ctx, tx, owner, run); err != nil {
+		return nil, err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO feed_crawls(owner_id,run_id,upstream_id,generation,filters_json,include_others,include_locations,unfiltered,next_request,state,started_at,updated_at)
 	 VALUES(?,?,?,?,?,?,?,1,?,'queued',?,?)
 	 ON CONFLICT(owner_id) DO UPDATE SET run_id=excluded.run_id,upstream_id=excluded.upstream_id,generation=excluded.generation,
@@ -311,9 +315,6 @@ func (c *FeedCrawler) requestRunLocked(ctx context.Context, owner int64, include
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, "DELETE FROM meta WHERE key=?", dailyCrawlBlockKey(owner)); err != nil {
-		return nil, err
-	}
-	if err = initCrawlPresenceTx(ctx, tx, owner, run); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -859,7 +860,7 @@ func crawlPageSeenTx(ctx context.Context, tx *sql.Tx, j *CrawlJob, fingerprint s
 func (c *FeedCrawler) checkpoint(ctx context.Context, j *CrawlJob, fingerprint string, count int, batches ...[]Profile) error {
 	return c.checkpointTx(ctx, j, func(tx *sql.Tx, next *CrawlJob) error {
 		if len(batches) > 0 {
-			if err := recordCrawlSeenTx(ctx, tx, j, batches[0], c.now()); err != nil {
+			if err := recordCrawlSeenTx(ctx, tx, j, batches[0]); err != nil {
 				return err
 			}
 		}
@@ -930,10 +931,16 @@ func (c *FeedCrawler) checkpointHydration(ctx context.Context, j *CrawlJob, targ
 				if len(profiles) != 1 || profiles[0].ID() != target {
 					return errors.New("invalid hydrated profile")
 				}
-				if err := recordCrawlSeenTx(ctx, tx, j, profiles, observed); err != nil {
+				if err := recordCrawlSeenTx(ctx, tx, j, profiles); err != nil {
 					return err
 				}
 				if err := tx.QueryRowContext(ctx, "SELECT version_id FROM queue WHERE owner_id=? AND profile_id=?", j.Owner, target).Scan(&version); err != nil {
+					return err
+				}
+				if err := migrateFeedAbsencesTx(ctx, tx); err != nil {
+					return err
+				}
+				if _, err := recordProfilePresenceTx(ctx, tx, j.Owner, target, true, "", 0, version, observed); err != nil {
 					return err
 				}
 				if c.Service.Config.SyncCycleEnabled {

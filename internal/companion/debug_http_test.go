@@ -185,6 +185,40 @@ func TestDebugHTTPBindsOwnIDsAndPreservesRawGET(t *testing.T) {
 		t.Fatal("credential echo exposed", w.Code, w.Body.String())
 	}
 }
+
+func TestDebugHTTPDoesNotRelayInvalidSuccessfulGET(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"challenge", "text/html", "<html>challenge</html>"},
+		{"oversize", "application/json", strings.Repeat(" ", debugResponseLimit+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDebugFixture(t)
+			f.service.Client.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {tc.contentType}}, Body: io.NopCloser(strings.NewReader(tc.body)), Request: r}, nil
+			})
+			w := f.request("GET", "/api/user/getUsers", "", "")
+			if w.Code != http.StatusBadGateway || !json.Valid(w.Body.Bytes()) || strings.Contains(w.Body.String(), "<html>") {
+				t.Fatalf("invalid successful GET leaked: %d %.180q", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestDebugHTTPPreservesConfirmedEmptyProfile(t *testing.T) {
+	f := newDebugFixture(t)
+	f.service.Client.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+	})
+	w := f.request("GET", "/api/user/getUser?targetUserId=7", "", "")
+	if w.Code != http.StatusNoContent || w.Body.Len() != 0 {
+		t.Fatalf("confirmed empty profile response changed: %d %q", w.Code, w.Body.String())
+	}
+}
+
 func TestDebugHTTPGPTSinglePostReplayAndStoredBytes(t *testing.T) {
 	f := newDebugFixture(t)
 	payload := `{"targetUserId":7}`

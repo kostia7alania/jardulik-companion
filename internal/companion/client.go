@@ -402,6 +402,10 @@ func (c *Client) Me(ctx context.Context, owner int64) (Profile, error) {
 	if err != nil {
 		return nil, errors.New("сначала /connect")
 	}
+	return c.meForSession(ctx, owner, s)
+}
+
+func (c *Client) meForSession(ctx context.Context, owner int64, s Session) (Profile, error) {
 	b, err := c.requestSession(ctx, owner, "GET", "/user/getMe?userId="+strconv.FormatInt(s.UserID, 10), nil, &s)
 	if err != nil {
 		return nil, err

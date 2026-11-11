@@ -50,6 +50,7 @@ func (s *Service) showSettings(ctx context.Context, owner, messageID int64, pane
 	if err != nil {
 		return err
 	}
+	interval, dailyCap := j.effectiveLimits(policy)
 	b := func(text, action string) map[string]string {
 		return map[string]string{"text": text, "callback_data": "as:" + j.Nonce + ":" + action}
 	}
@@ -105,7 +106,10 @@ func (s *Service) showSettings(ctx context.Context, owner, messageID int64, pane
 		}
 		rows = append(rows, []map[string]string{choice("18–22: 🔥", "super", 23, policy.SuperBeforeAge), choice("18–26: 🔥", "super", 27, policy.SuperBeforeAge)})
 	case "cap":
-		text += fmt.Sprintf("\n\nМой лимит: %s /24ч\nУчитывает ручные лайки и отправки с неизвестным результатом. Лимит Jardulik учитывается отдельно.", settingsLikeCount(j.DailyCap))
+		text += fmt.Sprintf("\n\nМой лимит: %s /24ч\nУчитывает ручные лайки и отправки с неизвестным результатом. Лимит Jardulik учитывается отдельно.", settingsLikeCount(dailyCap))
+		if dailyCap != j.DailyCap {
+			text += fmt.Sprintf("\nСохранённый лимит для режима простых лайков: %s /24ч.", settingsLikeCount(j.DailyCap))
+		}
 		rows = [][]map[string]string{{
 			choice("10 /24ч", "cap", 10, j.DailyCap), choice("20 /24ч", "cap", 20, j.DailyCap),
 		}, {
@@ -170,8 +174,8 @@ func (s *Service) showSettings(ctx context.Context, owner, messageID int64, pane
 			text += "\n\nФильтры недоступны до подключения Jardulik."
 		}
 		rows = append(rows,
-			[]map[string]string{b(fmt.Sprintf("⏱ Интервал · %d с", j.Interval), "view:interval"), b(fmt.Sprintf("🔢 Серия · %d", j.Count), "view:count")},
-			[]map[string]string{b(fmt.Sprintf("🧮 Мой лимит · %d /24ч", j.DailyCap), "view:cap")},
+			[]map[string]string{b(fmt.Sprintf("⏱ Интервал · %d с", interval), "view:interval"), b(fmt.Sprintf("🔢 Серия · %d", j.Count), "view:count")},
+			[]map[string]string{b(fmt.Sprintf("🧮 Мой лимит · %d /24ч", dailyCap), "view:cap")},
 			[]map[string]string{b("❤️ / 🔥 Режим реакций", "view:reactions")},
 			[]map[string]string{b("🔎 Фильтры", "filters"), b("↻ Обновить", "refresh")})
 		if j.Mode == "off" && j.Reason == "disconnected" && sourceState == "connected" {

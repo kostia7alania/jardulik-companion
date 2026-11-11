@@ -101,7 +101,7 @@ func TestMiniAppTestCardOneOwnerMessagePreservesSourcesAndReplay(t *testing.T) {
 					t.Fatal("test card must have exactly two Mini App buttons", err)
 				}
 				buttons := keyboard.Rows[0]
-				if buttons[0].Text != "🗃 Анкета" || buttons[0].WebApp["url"] != "https://companion.example/viewer?id=10" || buttons[1].Text != "Jardulik · прокси" || buttons[1].WebApp["url"] != "https://companion.example/mutuals?targetUserId=10&noCheck=1" || buttons[0].URL != "" || buttons[1].URL != "" || buttons[0].Action != "" || buttons[1].Action != "" {
+				if buttons[0].Text != "🗃 Анкета" || buttons[0].WebApp["url"] != fmt.Sprintf("https://companion.example/viewer?id=10&versionId=%d", p.VersionID) || buttons[1].Text != "Jardulik · прокси" || buttons[1].WebApp["url"] != "https://companion.example/mutuals?targetUserId=10&noCheck=1" || buttons[0].URL != "" || buttons[1].URL != "" || buttons[0].Action != "" || buttons[1].Action != "" {
 					t.Fatal("Mini App provider/profile binding changed", string(markup))
 				}
 				check, cancel := context.WithTimeout(r.Context(), time.Second)

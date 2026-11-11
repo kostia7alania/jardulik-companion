@@ -44,7 +44,7 @@ func initCrawlPresenceTx(ctx context.Context, tx *sql.Tx, owner int64, runID str
 }
 
 // The caller has archived this batch and records seen IDs in its checkpoint TX.
-func recordCrawlSeenTx(ctx context.Context, tx *sql.Tx, job *CrawlJob, profiles []Profile, observed ...time.Time) error {
+func recordCrawlSeenTx(ctx context.Context, tx *sql.Tx, job *CrawlJob, profiles []Profile) error {
 	var initialized bool
 	err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM crawl_presence_runs WHERE owner_id=? AND run_id=?)", job.Owner, job.RunID).Scan(&initialized)
 	if err != nil || !initialized {
@@ -53,10 +53,6 @@ func recordCrawlSeenTx(ctx context.Context, tx *sql.Tx, job *CrawlJob, profiles 
 	var active bool
 	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM feed_crawls WHERE owner_id=? AND run_id=? AND state IN ('queued','running'))", job.Owner, job.RunID).Scan(&active); err != nil || !active {
 		return err
-	}
-	at := time.Now()
-	if len(observed) > 0 {
-		at = observed[0]
 	}
 	seen := map[int64]bool{}
 	for _, profile := range profiles {
@@ -79,9 +75,6 @@ func recordCrawlSeenTx(ctx context.Context, tx *sql.Tx, job *CrawlJob, profiles 
  ON CONFLICT(owner_id,run_id,profile_id) DO UPDATE SET seen=1`, job.Owner, job.RunID, id); err != nil {
 			return err
 		}
-		if _, err = recordProfilePresenceTx(ctx, tx, job.Owner, id, true, "", 0, version, at); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -89,39 +82,20 @@ func recordCrawlSeenTx(ctx context.Context, tx *sql.Tx, job *CrawlJob, profiles 
 // Call after the final job UPDATE to done/empty_page, in that same checkpoint TX.
 // A stopped, partial, old or single-mode run can never declare profiles absent.
 func finishCrawlPresenceTx(ctx context.Context, tx *sql.Tx, job *CrawlJob, observed time.Time) error {
-	var complete bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM feed_crawls j JOIN crawl_presence_runs r ON r.owner_id=j.owner_id AND r.run_id=j.run_id
- WHERE j.owner_id=? AND j.run_id=? AND j.state='done' AND j.reason='empty_page' AND j.include_others=1 AND r.finished_at IS NULL)`, job.Owner, job.RunID).Scan(&complete)
-	if err != nil || !complete {
-		return err
+	var upstream int64
+	err := tx.QueryRowContext(ctx, `SELECT j.upstream_id FROM feed_crawls j JOIN crawl_presence_runs r ON r.owner_id=j.owner_id AND r.run_id=j.run_id
+ WHERE j.owner_id=? AND j.run_id=? AND j.state='done' AND j.reason='empty_page' AND j.include_others=1 AND j.unfiltered=1 AND r.finished_at IS NULL`, job.Owner, job.RunID).Scan(&upstream)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT profile_id,baseline_version_id FROM crawl_presence_profiles WHERE owner_id=? AND run_id=? AND is_baseline=1 AND seen=0 ORDER BY profile_id", job.Owner, job.RunID)
 	if err != nil {
 		return err
 	}
-	type missingProfile struct{ profile, baseline int64 }
-	var missing []missingProfile
-	for rows.Next() {
-		var m missingProfile
-		if err = rows.Scan(&m.profile, &m.baseline); err != nil {
-			rows.Close()
-			return err
-		}
-		missing = append(missing, m)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
+	if err = migrateFeedAbsencesTx(ctx, tx); err != nil {
 		return err
 	}
-	for _, m := range missing {
-		current, err := presenceVersionTx(ctx, tx, job.Owner, m.profile)
-		if err != nil {
-			return err
-		}
-		if _, err = recordProfilePresenceTx(ctx, tx, job.Owner, m.profile, false, "feed_absent", m.baseline, current, observed); err != nil {
-			return err
-		}
+	if err = finishFeedAbsencesTx(ctx, tx, job, upstream, observed); err != nil {
+		return err
 	}
 	_, err = tx.ExecContext(ctx, "UPDATE crawl_presence_runs SET finished_at=? WHERE owner_id=? AND run_id=?", observed.UTC().Format(time.RFC3339Nano), job.Owner, job.RunID)
 	return err

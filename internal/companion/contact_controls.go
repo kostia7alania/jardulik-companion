@@ -17,10 +17,17 @@ func (s *Service) telegramContactButton(ctx context.Context, owner, profile int6
 	return map[string]string{"text": "💬 Telegram", "url": contact.ContactURL}
 }
 
-func (s *Service) privateProfileButtons(ctx context.Context, owner int64, p StoredProfile, full, jsonSource bool) any {
+func (s *Service) privateProfileButtons(ctx context.Context, owner int64, p StoredProfile, full, jsonSource bool, copyID ...bool) any {
 	markup := profileButtons(p, full, jsonSource).(map[string]any)
+	rows := markup["inline_keyboard"].([][]any)
 	if button := s.telegramContactButton(ctx, owner, p.ID); button != nil {
-		markup["inline_keyboard"] = append(markup["inline_keyboard"].([][]map[string]string), []map[string]string{button})
+		rows = append(rows, []any{button})
 	}
+	if len(copyID) > 0 && copyID[0] {
+		if button := profileCopyButton(p.ID); button != nil {
+			rows = append(rows, []any{button})
+		}
+	}
+	markup["inline_keyboard"] = rows
 	return markup
 }

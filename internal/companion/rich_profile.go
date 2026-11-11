@@ -66,7 +66,7 @@ func BuildRichProfileCard(p StoredProfile, jobs []MediaJob, postLink string) (Ri
 	if len(media) == 1 {
 		blocks = append(blocks, media[0])
 	} else if len(media) > 1 {
-		// PhotoViewer reads each photo caption; the collage caption shows the body once in chat.
+		// Keep the caption on each Rich photo block and show it once under the collage in chat.
 		blocks = append(blocks, map[string]any{"type": "collage", "blocks": media, "caption": caption})
 	} else {
 		blocks = append(blocks, map[string]any{"type": "paragraph", "text": richBody})

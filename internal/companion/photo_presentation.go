@@ -171,7 +171,7 @@ func compactPhotoRows(rows []string, budget int) string {
 	}
 	per := (budget - len(rows) + 1) / len(rows)
 	if per < 22 {
-		summary, _ := telegramPrefix(fmt.Sprintf("1..%d: технические данные по кнопке.", len(rows)), budget)
+		summary, _ := telegramPrefix("Метаданные по кнопке", budget)
 		return summary
 	}
 	var compact []string

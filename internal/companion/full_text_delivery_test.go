@@ -301,3 +301,59 @@ func TestAdminFullTextUsesActualVersionOwnerMetadata(t *testing.T) {
 		t.Fatalf("repeated admin full text posted twice: %d", calls)
 	}
 }
+
+func TestFullTextCallbackOpensSavedVersionAndKeepsOldRoutes(t *testing.T) {
+	s, saved := cardFixture(t, 0)
+	ctx := context.Background()
+	archiveRevision := func(description string) {
+		t.Helper()
+		if _, err := s.Store.Archive(ctx, 1, []Profile{{"userId": saved.ID, "name": "Ира", "description": description}}, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	archiveRevision("Текст второй версии")
+	markup, err := json.Marshal(profileButtons(saved, true, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionRoute := fmt.Sprintf("tv:%d", saved.VersionID)
+	if !strings.Contains(string(markup), `"callback_data":"`+versionRoute+`"`) {
+		t.Fatal("card full-text action does not identify its saved version")
+	}
+	var texts []string
+	s.TG.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch filepath.Base(r.URL.Path) {
+		case "answerCallbackQuery":
+			fmt.Fprint(w, `{"ok":true,"result":true}`)
+		case "sendMessage":
+			var body struct {
+				Text string `json:"text"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			texts = append(texts, body.Text)
+			fmt.Fprintf(w, `{"ok":true,"result":{"message_id":%d,"chat":{"id":1}}}`, 100+len(texts))
+		default:
+			t.Fatal("unexpected full-text operation", filepath.Base(r.URL.Path))
+		}
+	})}
+	uxTap(s, 2, versionRoute)
+	if len(texts) != 0 {
+		t.Fatal("foreign owner opened a stored version")
+	}
+	uxTap(s, 1, versionRoute)
+	uxTap(s, 1, fmt.Sprintf("t:%d", saved.ID))
+	archiveRevision("Текст третьей версии")
+	m := keyboardMessage(1, 104, fmt.Sprintf("/text_%d", saved.ID))
+	s.Handle(ctx, Update{Message: &m})
+	want := []string{"Полное описание", "Текст второй версии", "Текст третьей версии"}
+	if len(texts) != len(want) {
+		t.Fatal("versioned action or legacy route did not deliver full text")
+	}
+	for i, text := range texts {
+		if !strings.Contains(text, want[i]) {
+			t.Fatal("full-text route opened the wrong snapshot", i)
+		}
+	}
+}

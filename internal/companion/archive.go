@@ -607,9 +607,14 @@ func (a *Archiver) profileZIP(ctx context.Context, p StoredProfile, owner int64,
 		}
 	}()
 	z := zip.NewWriter(f)
-	raw, err := json.MarshalIndent(p.Profile, "", "  ")
-	if err != nil {
-		return "", "", manifest, err
+	raw := []byte(p.RawJSON)
+	if len(raw) == 0 {
+		raw, err = json.MarshalIndent(p.Profile, "", "  ")
+		if err != nil {
+			return "", "", manifest, err
+		}
+	} else if !json.Valid(raw) {
+		return "", "", manifest, errors.New("stored profile JSON is invalid")
 	}
 	entry, err := addZipBytes(z, "raw.json", raw)
 	if err != nil {
@@ -723,12 +728,16 @@ func (a *Archiver) profileCardContent(p StoredProfile, missing int, thread int64
 	return renderProfileCard(p, photos, missing, noPhotos, forumThreadURL(a.Config.BackupChatID, thread), limit, false)
 }
 
-func archiveProfileKeyboard(version int64) any {
-	return map[string]any{"inline_keyboard": [][]map[string]string{{
+func (a *Archiver) archiveProfileKeyboard(owner, version int64) any {
+	rows := [][]map[string]string{{
 		{"text": "Описание в личку", "callback_data": fmt.Sprintf("av:%d", version)},
 		{"text": "JSON Jardulik в личку", "callback_data": fmt.Sprintf("aj:%d", version)},
 		{"text": "Исходные файлы ZIP", "callback_data": fmt.Sprintf("az:%d", version)},
-	}, {jardulikAppButton()}}}
+	}, {jardulikAppButton()}}
+	if a.Config.MiniAppPublicOrigin != "" && owner == a.Config.OwnerID {
+		rows = append(rows, []map[string]string{{"text": "Открыть сохранённую анкету", "callback_data": archiveMiniAppAction + strconv.FormatInt(version, 10)}})
+	}
+	return map[string]any{"inline_keyboard": rows}
 }
 
 // Each profile topic keeps its whole original ZIP followed by the visible card.
@@ -771,7 +780,7 @@ func (a *Archiver) sendProfileCard(ctx context.Context, p StoredProfile, jobs []
 		return nil, err
 	}
 	caption := card.Text
-	var keyboard any // Archive controls belong to the first, whole-ZIP message.
+	keyboard := legacyProfileCopyMarkup(p.ID)
 	var ids []int64
 	record := func(messages []SentMessage) error {
 		for _, m := range messages {
@@ -944,7 +953,7 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 	var document SentMessage
 	err = a.groupCall(ctx, func() error {
 		var e error
-		document, e = a.TG.SendDocumentCard(ctx, a.Config.BackupChatID, thread, path, fmt.Sprintf("Анкета #%d\nСохранено: %s\nЦелый исходный архив. SHA-256 %s\nИсточник: Jardulik API", p.ID, displayTime(p.LastSeen), sha), archiveProfileKeyboard(p.VersionID))
+		document, e = a.TG.SendDocumentCard(ctx, a.Config.BackupChatID, thread, path, fmt.Sprintf("Анкета #%d\nСохранено: %s\nЦелый исходный архив. SHA-256 %s\nИсточник: Jardulik API", p.ID, displayTime(p.LastSeen), sha), a.archiveProfileKeyboard(owner, p.VersionID))
 		return e
 	})
 	if err == nil {
@@ -1204,7 +1213,7 @@ func (a *Archiver) repairProfilePost(ctx context.Context, version int64) (retErr
 	var edited SentMessage
 	caption := fmt.Sprintf("Анкета #%d\nСохранено: %s\nЦелый исходный архив. SHA-256 %s\nИсточник: Jardulik API\nTelegram: ZIP сохранён %s", p.ID, displayTime(p.LastSeen), sourceSHA, displayTime(sentAt))
 	err = a.groupCall(ctx, func() error {
-		return a.TG.Call(ctx, "editMessageCaption", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": receiptMessage, "caption": caption, "reply_markup": archiveProfileKeyboard(version)}, &edited)
+		return a.TG.Call(ctx, "editMessageCaption", map[string]any{"chat_id": a.Config.BackupChatID, "message_id": receiptMessage, "caption": caption, "reply_markup": a.archiveProfileKeyboard(owner, version)}, &edited)
 	})
 	if err != nil {
 		return err
@@ -1446,7 +1455,7 @@ func (a *Archiver) reconcileCaptionedAlbum(ctx context.Context, version int64) (
 		}
 	}()
 	zipCaption := fmt.Sprintf("Анкета #%d\nСохранено: %s\nЦелый исходный архив. SHA-256 %s\nИсточник: Jardulik API", p.ID, displayTime(p.LastSeen), sourceSHA)
-	if err = a.editKnownCaption(ctx, zipID, zipCaption, archiveProfileKeyboard(version)); err != nil {
+	if err = a.editKnownCaption(ctx, zipID, zipCaption, a.archiveProfileKeyboard(owner, version)); err != nil {
 		return err
 	}
 	card, err := a.profileCardContent(p, missing, thread, 1024, false, selectedProfilePhotos(jobs))
@@ -1803,7 +1812,7 @@ func (a *Archiver) repairZIP(ctx context.Context, version int64) (retErr error) 
 	var edited SentMessage
 	caption := fmt.Sprintf("Анкета #%d\nСохранено: %s\nЦелый исходный архив. SHA-256 %s\nИсточник: Jardulik API", profile, displayTime(manifest.LastSeen), sha)
 	err = a.groupCall(ctx, func() (err error) {
-		edited, err = a.TG.EditDocument(ctx, a.Config.BackupChatID, r.MessageID, path, caption, archiveProfileKeyboard(version))
+		edited, err = a.TG.EditDocument(ctx, a.Config.BackupChatID, r.MessageID, path, caption, a.archiveProfileKeyboard(owner, version))
 		return err
 	})
 	if err != nil {

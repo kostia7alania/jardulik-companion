@@ -81,7 +81,7 @@ func (s *Service) SendMiniAppTestCard(ctx context.Context, profileID int64) (Min
 	}
 	id := strconv.FormatInt(p.ID, 10)
 	keyboard := map[string]any{"inline_keyboard": [][]map[string]any{{
-		{"text": "🗃 Анкета", "web_app": map[string]string{"url": receipt.Origin + "/viewer?id=" + id}},
+		{"text": "🗃 Анкета", "web_app": map[string]string{"url": miniAppArchiveViewerURL(receipt.Origin, p)}},
 		{"text": "Jardulik · прокси", "web_app": map[string]string{"url": receipt.Origin + "/mutuals?targetUserId=" + id + "&noCheck=1"}},
 	}}}
 	message, sendErr := s.TG.SendRichProfileCard(ctx, receipt.Owner, 0, card, keyboard)

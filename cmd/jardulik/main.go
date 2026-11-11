@@ -296,6 +296,22 @@ func run() error {
 		result, err := s.RefreshCaptions(ctx, cardsOnly)
 		_ = json.NewEncoder(os.Stdout).Encode(result)
 		return err
+	case "refresh-archive-viewer-control":
+		if len(os.Args) != 3 {
+			return errors.New("usage: jardulik refresh-archive-viewer-control <versionId>")
+		}
+		version, parseErr := strconv.ParseInt(os.Args[2], 10, 64)
+		if parseErr != nil || version <= 0 {
+			return errors.New("invalid archive versionId")
+		}
+		if owner != c.OwnerID {
+			return errors.New("archive viewer controls require the primary owner")
+		}
+		result, refreshErr := s.RefreshArchiveViewerControl(ctx, version)
+		if refreshErr != nil {
+			return refreshErr
+		}
+		return json.NewEncoder(os.Stdout).Encode(result)
 	case "refresh-profile-caption":
 		if len(os.Args) != 3 {
 			return errors.New("usage: jardulik refresh-profile-caption <userId>")
@@ -313,7 +329,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, serve-miniapp, miniapp-test-card, sync-status, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, serve-miniapp, miniapp-test-card, sync-status, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, refresh-archive-viewer-control, version")
 	}
 }
 func main() {

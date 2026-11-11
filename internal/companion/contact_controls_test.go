@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -42,7 +43,11 @@ func contactControlURL(t *testing.T, markup any) string {
 		t.Fatal(err)
 	}
 	var decoded struct {
-		Rows [][]map[string]string `json:"inline_keyboard"`
+		Rows [][]struct {
+			Text         string `json:"text"`
+			URL          string `json:"url"`
+			CallbackData string `json:"callback_data"`
+		} `json:"inline_keyboard"`
 	}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatal(err)
@@ -50,11 +55,11 @@ func contactControlURL(t *testing.T, markup any) string {
 	var found string
 	for _, row := range decoded.Rows {
 		for _, button := range row {
-			if button["text"] == "💬 Telegram" {
-				if found != "" || button["url"] == "" || button["callback_data"] != "" {
+			if button.Text == "💬 Telegram" {
+				if found != "" || button.URL == "" || button.CallbackData != "" {
 					t.Fatal("contact is not one clickable URL button")
 				}
-				found = button["url"]
+				found = button.URL
 			}
 		}
 	}
@@ -138,6 +143,14 @@ func TestContactControlsNewLegacyRichAndKeyboardMenuUseSavedURL(t *testing.T) {
 			}
 			if len(markups) != 1 || contactControlURL(t, markups[0]) != input.ContactURL {
 				t.Fatal("new card omitted saved contact or sent an extra message")
+			}
+			markup, err := json.Marshal(markups[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			copyID := fmt.Sprintf(`"copy_text":{"text":"%d"}`, p.ID)
+			if strings.Contains(string(markup), copyID) == rich {
+				t.Fatal("new legacy card copy action missing or duplicated on a rich card")
 			}
 			s.Store.Pause(ctx, 1, true)
 			m := keyboardMessage(1, 101, keyboardMenu)

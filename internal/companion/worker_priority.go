@@ -23,7 +23,7 @@ func (s *Service) isForegroundUpdate(u Update) bool {
 		owner, chat = u.Callback.From.ID, u.Callback.Message.Chat
 		if owner == s.Config.OwnerID && chat.ID == s.Config.BackupChatID && s.Config.BackupChatID != 0 {
 			data := u.Callback.Data
-			return strings.HasPrefix(data, "av:") || strings.HasPrefix(data, "az:") || strings.HasPrefix(data, "aj:")
+			return strings.HasPrefix(data, "av:") || strings.HasPrefix(data, "az:") || strings.HasPrefix(data, "aj:") || strings.HasPrefix(data, archiveMiniAppAction)
 		}
 	} else if u.Message != nil {
 		owner, chat = u.Message.From.ID, u.Message.Chat

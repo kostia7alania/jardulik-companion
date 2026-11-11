@@ -129,7 +129,7 @@ func TestBotKeyboardSaveMenuAndDisabledLikeDoNotContactSource(t *testing.T) {
 			actions = append(actions, button.Data)
 		}
 	}
-	for _, data := range []string{"p:1", "t:1", fmt.Sprintf("jv:%d", p.VersionID), "favorites", "likes", "matches", "settings", "next"} {
+	for _, data := range []string{"p:1", fmt.Sprintf("tv:%d", p.VersionID), fmt.Sprintf("jv:%d", p.VersionID), "favorites", "likes", "matches", "history", "connect_help", "settings", "next"} {
 		if !strings.Contains("|"+strings.Join(actions, "|")+"|", "|"+data+"|") {
 			t.Fatalf("missing menu route %s in %v", data, actions)
 		}

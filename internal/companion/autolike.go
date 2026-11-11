@@ -49,6 +49,13 @@ type AutoSettings struct {
 	NextAttempt                             int64
 }
 
+func (j *AutoSettings) effectiveLimits(policy ReactionMessagePolicy) (interval, dailyCap int) {
+	if policy.SuperBeforeAge != 0 {
+		return max(j.Interval, 60), min(j.DailyCap, 100)
+	}
+	return j.Interval, j.DailyCap
+}
+
 type Autoliker struct {
 	Service *Service
 	mu      sync.Mutex
@@ -188,7 +195,12 @@ func (s *Service) AutolikeStatus(ctx context.Context, owner int64) string {
 	if err != nil {
 		return "Автолайкер: состояние недоступно."
 	}
-	text := fmt.Sprintf("Автолайкер: %s; отправлено %d; интервал %d с; мой лимит %d /24ч.", map[string]string{"off": "выключен", "series": "серия", "automatic": "авто"}[j.Mode], j.Sent, j.Interval, j.DailyCap)
+	policy, err := s.Store.ReactionMessagePolicy(ctx, owner)
+	if err != nil {
+		return "Автолайкер: состояние недоступно."
+	}
+	interval, dailyCap := j.effectiveLimits(policy)
+	text := fmt.Sprintf("Автолайкер: %s; отправлено %d; интервал %d с; мой лимит %d /24ч.", map[string]string{"off": "выключен", "series": "серия", "automatic": "авто"}[j.Mode], j.Sent, interval, dailyCap)
 	if j.NextAttempt > time.Now().UnixMilli() && j.Mode != "off" {
 		text += " Следующая попытка: " + displayTime(time.UnixMilli(j.NextAttempt).UTC().Format(time.RFC3339)) + "."
 	}

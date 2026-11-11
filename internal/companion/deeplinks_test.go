@@ -41,7 +41,7 @@ func TestJardulikDeepLinksUseOfficialBotInAllControls(t *testing.T) {
 	for name, markup := range map[string]any{
 		"main":    mainButtons(),
 		"profile": profileButtons(StoredProfile{ID: 123, VersionID: 456}, true, true),
-		"archive": archiveProfileKeyboard(456),
+		"archive": (&Archiver{}).archiveProfileKeyboard(1, 456),
 	} {
 		t.Run(name, func(t *testing.T) { assertJardulikAppLink(t, markup) })
 	}

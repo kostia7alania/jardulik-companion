@@ -97,7 +97,7 @@ func (s *Service) RefreshCaptions(ctx context.Context, cardsOnly ...bool) (resul
 		}
 		var updated SentMessage
 		err = s.Archiver.groupCall(ctx, func() error {
-			return s.Archiver.TG.Call(ctx, "editMessageReplyMarkup", map[string]any{"chat_id": s.Config.BackupChatID, "message_id": item.zip, "reply_markup": archiveProfileKeyboard(item.version)}, &updated)
+			return s.Archiver.TG.Call(ctx, "editMessageReplyMarkup", map[string]any{"chat_id": s.Config.BackupChatID, "message_id": item.zip, "reply_markup": s.Archiver.archiveProfileKeyboard(item.owner, item.version)}, &updated)
 		})
 		var unchanged *TelegramError
 		notModified := errors.As(err, &unchanged) && unchanged.Code == 400 && strings.Contains(strings.ToLower(unchanged.Description), "message is not modified")

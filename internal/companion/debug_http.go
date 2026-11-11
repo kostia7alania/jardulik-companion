@@ -278,7 +278,7 @@ func (d *debugHTTP) get(w http.ResponseWriter, r *http.Request, ss Session) {
 		path += "?" + q.Encode()
 	}
 	status, body, e := d.service.Client.debugRead(r.Context(), d.service.Config.OwnerID, ss, path)
-	if e != nil && status == 0 {
+	if e != nil && (status == 0 || (status >= 200 && status < 300 && !errors.Is(e, ErrProfileUnavailable))) {
 		debugError(w, 502, "upstream_unavailable")
 		return
 	}

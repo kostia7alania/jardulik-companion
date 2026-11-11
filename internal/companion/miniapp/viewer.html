@@ -70,9 +70,13 @@
   <script>
     'use strict';
     const $ = (id) => document.getElementById(id);
-    const target = new URLSearchParams(location.search).get('id');
+    const params = new URLSearchParams(location.search);
+    const target = params.get('id');
+    const version = params.get('versionId');
     const targetID = Number(target);
-    const validTarget = /^[1-9]\d*$/.test(target || '') && Number.isSafeInteger(targetID);
+    const versionID = Number(version);
+    const validTarget = params.getAll('id').length === 1 && /^[1-9]\d*$/.test(target) && Number.isSafeInteger(targetID);
+    const validVersion = version === null || (params.getAll('versionId').length === 1 && /^[1-9]\d*$/.test(version) && Number.isSafeInteger(versionID));
     const app = window.Telegram?.WebApp;
     const blobURLs = new Set();
     let controller;
@@ -185,14 +189,16 @@
       $('status').hidden = false;
       $('retry').hidden = true;
       $('message').textContent = 'Загружаем анкету…';
-      if (!validTarget || !app?.initData) {
+      if (!validTarget || !validVersion || !app?.initData) {
         $('message').textContent = 'Открой анкету кнопкой бота';
         return;
       }
       try {
+        const launch = { initData: app.initData, targetUserId: targetID };
+        if (version !== null) launch.versionId = versionID;
         const authResponse = await request('/miniapp/auth', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ initData: app.initData, targetUserId: targetID }), signal
+          body: JSON.stringify(launch), signal
         });
         const auth = await authResponse.json();
         if (typeof auth.token !== 'string' || !auth.token) throw new Error('Missing token');
@@ -200,11 +206,12 @@
         const profile = await response.json();
         if (run !== generation || signal.aborted) return;
         if (profile.id !== targetID || typeof profile.formattedText !== 'string') throw new Error('Invalid profile');
+        if (version !== null && (profile.versionId !== versionID || typeof profile.rawJSON !== 'string')) throw new Error('Invalid archive version');
         fullText = profile.formattedText;
         const newline = fullText.indexOf('\n');
         $('title').textContent = newline < 0 ? fullText : fullText.slice(0, newline);
         $('profile-text').textContent = newline < 0 ? '' : fullText.slice(newline + 1);
-        $('raw-json').textContent = JSON.stringify(profile.raw, null, 2);
+        $('raw-json').textContent = version === null ? JSON.stringify(profile.raw, null, 2) : profile.rawJSON;
         document.title = $('title').textContent || 'Анкета';
         $('profile').hidden = false;
         $('status').hidden = true;
@@ -216,9 +223,11 @@
       }
     }
 
-    if (validTarget) {
-      $('mutuals').href = `/mutuals?targetUserId=${targetID}&noCheck=1${location.hash}`;
-      $('mutuals').hidden = false;
+    if (validTarget && validVersion) {
+      if (version === null) {
+        $('mutuals').href = `/mutuals?targetUserId=${targetID}&noCheck=1${location.hash}`;
+        $('mutuals').hidden = false;
+      }
       $('copy-id').textContent = `ID ${targetID}`;
       $('copy-id').hidden = false;
       $('copy-id').onclick = async () => {

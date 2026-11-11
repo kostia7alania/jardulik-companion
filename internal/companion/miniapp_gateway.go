@@ -34,14 +34,15 @@ type miniAppHTTP struct {
 }
 
 type miniAppClaims struct {
-	Audience   string `json:"aud"`
-	Owner      int64  `json:"owner"`
-	Upstream   int64  `json:"upstream"`
-	Generation string `json:"generation"`
-	Target     int64  `json:"target"`
-	Version    int64  `json:"version"`
-	Issued     int64  `json:"iat"`
-	Expires    int64  `json:"exp"`
+	Audience    string `json:"aud"`
+	Owner       int64  `json:"owner"`
+	Upstream    int64  `json:"upstream,omitempty"`
+	Generation  string `json:"generation,omitempty"`
+	Target      int64  `json:"target"`
+	Version     int64  `json:"version"`
+	Issued      int64  `json:"iat"`
+	Expires     int64  `json:"exp"`
+	ArchiveOnly bool   `json:"archiveOnly,omitempty"`
 }
 
 // NewMiniAppHandler serves public shells, but requires owner Telegram authentication for all data.
@@ -102,6 +103,10 @@ func (m *miniAppHTTP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/miniapp/media/"):
 		m.media(w, r, claims, ss)
 	case strings.HasPrefix(r.URL.Path, "/miniapp/api/"):
+		if claims.ArchiveOnly {
+			debugError(w, 403, "archive_view_only")
+			return
+		}
 		m.api(w, r, claims, ss)
 	default:
 		debugError(w, 404, "not_found")
@@ -209,7 +214,11 @@ func (m *miniAppHTTP) authenticate(w http.ResponseWriter, r *http.Request) {
 		debugError(w, 413, "body_too_large")
 		return
 	}
-	fields, err := debugObject(raw, "initData", "targetUserId")
+	allowed := []string{"initData", "targetUserId"}
+	if r.URL.Path == "/miniapp/auth" {
+		allowed = append(allowed, "versionId")
+	}
+	fields, err := debugObject(raw, allowed...)
 	if err != nil {
 		debugError(w, 400, "invalid_request")
 		return
@@ -224,28 +233,49 @@ func (m *miniAppHTTP) authenticate(w http.ResponseWriter, r *http.Request) {
 		debugError(w, 400, "invalid_target")
 		return
 	}
-	ss, err := m.current(r.Context())
+	version, err := debugJSONID(fields, "versionId", true)
 	if err != nil {
-		debugError(w, 409, "source_session_unavailable")
-		return
-	}
-	p, err := m.service.Store.Profile(r.Context(), m.service.Config.OwnerID, target)
-	if err != nil {
-		debugError(w, 404, "stored_profile_not_found")
+		debugError(w, 400, "invalid_version")
 		return
 	}
 	s := m.service
-	s.beginForeground()
-	defer s.endForeground()
-	if _, err = m.own(r.Context(), ss); err != nil {
-		debugError(w, 409, "source_account_unavailable")
+	var p StoredProfile
+	var ss Session
+	if version > 0 {
+		p, err = s.Store.Version(r.Context(), s.Config.OwnerID, version)
+	} else {
+		ss, err = m.current(r.Context())
+		if err != nil {
+			debugError(w, 409, "source_session_unavailable")
+			return
+		}
+		p, err = s.Store.Profile(r.Context(), s.Config.OwnerID, target)
+	}
+	if err != nil || p.ID != target {
+		debugError(w, 404, "stored_profile_not_found")
 		return
 	}
+	if version == 0 {
+		s.beginForeground()
+		defer s.endForeground()
+		if _, err = m.own(r.Context(), ss); err != nil {
+			debugError(w, 409, "source_account_unavailable")
+			return
+		}
+	}
 	now := m.now().Unix()
-	claims := miniAppClaims{miniAppAudience, s.Config.OwnerID, ss.UserID, ss.Generation, target, p.VersionID, now, now + int64(miniAppLifetime/time.Second)}
+	claims := miniAppClaims{
+		Audience: miniAppAudience, Owner: s.Config.OwnerID, Upstream: ss.UserID, Generation: ss.Generation,
+		Target: target, Version: p.VersionID, Issued: now, Expires: now + int64(miniAppLifetime/time.Second),
+		ArchiveOnly: version > 0,
+	}
 	token, err := m.sign(claims)
 	if err != nil {
 		debugError(w, 500, "token_unavailable")
+		return
+	}
+	if claims.ArchiveOnly {
+		m.json(w, 200, map[string]any{"token": token, "expiresAt": claims.Expires}, ss)
 		return
 	}
 	m.json(w, 200, map[string]any{"code": 200, "isReged": true, "userId": ss.UserID, "targetUserId": target, "token": token, "refreshToken": token, "expiresAt": claims.Expires, "adapter": "owner-read-only-bridge"}, ss)
@@ -287,9 +317,15 @@ func (m *miniAppHTTP) authorize(r *http.Request) (miniAppClaims, Session, error)
 	if claims.Audience != miniAppAudience || claims.Owner != m.service.Config.OwnerID || claims.Target <= 0 || claims.Version <= 0 || claims.Issued > now+30 || claims.Issued <= 0 || claims.Expires <= now || claims.Expires <= claims.Issued || claims.Expires-claims.Issued > int64(miniAppLifetime/time.Second) {
 		return claims, ss, errors.New("expired_token")
 	}
-	ss, err = m.current(r.Context())
-	if err != nil || ss.UserID != claims.Upstream || ss.Generation != claims.Generation {
-		return claims, ss, errors.New("source_binding_changed")
+	if claims.ArchiveOnly {
+		if claims.Upstream != 0 || claims.Generation != "" {
+			return claims, ss, errors.New("invalid_archive_binding")
+		}
+	} else {
+		ss, err = m.current(r.Context())
+		if err != nil || ss.UserID != claims.Upstream || ss.Generation != claims.Generation {
+			return claims, ss, errors.New("source_binding_changed")
+		}
 	}
 	p, err := m.service.Store.Version(r.Context(), claims.Owner, claims.Version)
 	if err != nil || p.ID != claims.Target {
@@ -443,11 +479,18 @@ func (m *miniAppHTTP) profile(w http.ResponseWriter, r *http.Request, c miniAppC
 		}
 		media = append(media, map[string]any{"id": job.ID, "role": job.Role, "position": job.Position, "mime": job.MIME, "size": job.Size, "url": "/miniapp/media/" + strconv.FormatInt(job.ID, 10)})
 	}
-	if m.binding(r.Context(), ss) != nil {
+	if !c.ArchiveOnly && m.binding(r.Context(), ss) != nil {
 		debugError(w, 409, "source_binding_changed")
 		return
 	}
-	m.json(w, 200, map[string]any{"id": p.ID, "versionId": p.VersionID, "firstSeen": p.FirstSeen, "lastSeen": p.LastSeen, "raw": json.RawMessage(p.RawJSON), "formattedText": profileText(p), "media": media}, ss)
+	result := map[string]any{"id": p.ID, "versionId": p.VersionID, "firstSeen": p.FirstSeen, "lastSeen": p.LastSeen, "formattedText": profileText(p), "media": media}
+	if c.ArchiveOnly {
+		// The browser renders the original JSON text without rounding its numbers.
+		result["rawJSON"] = p.RawJSON
+	} else {
+		result["raw"] = json.RawMessage(p.RawJSON)
+	}
+	m.json(w, 200, result, ss)
 }
 
 func miniAppSafeMedia(j MediaJob) bool {
@@ -490,7 +533,7 @@ func (m *miniAppHTTP) media(w http.ResponseWriter, r *http.Request, c miniAppCla
 		if e != nil || !os.SameFile(info, opened) || !opened.Mode().IsRegular() || opened.Size() != job.Size {
 			break
 		}
-		if m.binding(r.Context(), ss) != nil {
+		if !c.ArchiveOnly && m.binding(r.Context(), ss) != nil {
 			debugError(w, 409, "source_binding_changed")
 			return
 		}

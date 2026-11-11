@@ -53,7 +53,7 @@ func TestEditOriginalDocumentInPlace(t *testing.T) {
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":10,"chat":{"id":-10042},"document":{"file_id":"new-whole-zip","file_size":17}}}`)
 	})}
-	m, err := tg.EditDocument(context.Background(), -10042, 10, path, "Сохранено", archiveProfileKeyboard(1))
+	m, err := tg.EditDocument(context.Background(), -10042, 10, path, "Сохранено", (&Archiver{}).archiveProfileKeyboard(1, 1))
 	if err != nil || m.ID != 10 || calls != 1 {
 		t.Fatalf("%+v %v %d", m, err, calls)
 	}

@@ -286,3 +286,115 @@ func TestRelationsDiskReserveAndMalformedPageDoNotRequest(t *testing.T) {
 		t.Fatal("invalid page reached source")
 	}
 }
+
+func TestRelationsButtonsRequireOriginalAccountAfterReconnect(t *testing.T) {
+	for _, mutual := range []bool{false, true} {
+		for _, sameAccount := range []bool{false, true} {
+			t.Run(fmt.Sprintf("mutual=%t/same=%t", mutual, sameAccount), func(t *testing.T) {
+				s, sent, calls := relationFixture(t)
+				ctx := context.Background()
+				s.OpenRelations(ctx, 1, mutual)
+				open := (*sent)[0].Markup.Rows[0][0].Data
+				var batch int64
+				if err := s.Store.DB.QueryRow("SELECT id FROM relation_batches").Scan(&batch); err != nil {
+					t.Fatal(err)
+				}
+				upstream := int64(101)
+				if !sameAccount {
+					upstream = 201
+				}
+				if err := s.Store.SaveSession(ctx, 1, Session{Token: "fixture-access", UserID: upstream, Generation: "new-connection"}); err != nil {
+					t.Fatal(err)
+				}
+				prefix := "rl"
+				if mutual {
+					prefix = "rm"
+				}
+				if !s.HandleRelationCallback(ctx, 1, fmt.Sprintf("%s:%d:0", prefix, batch)) || len(*calls) != 1 {
+					t.Fatal("cached pagination made a source request")
+				}
+				text := (*sent)[len(*sent)-1].Text
+				proof := s.Store.KnownProfile(ctx, 1, 77)
+				if sameAccount {
+					if !strings.Contains(text, "Загружено записей: 1") || proof != nil {
+						t.Fatalf("same account lost its saved list: %s, %v", text, proof)
+					}
+				} else if !strings.Contains(text, "Открой его заново") || !errors.Is(proof, sql.ErrNoRows) {
+					t.Fatalf("different account inherited the list: %s, %v", text, proof)
+				}
+				if !s.HandleRelationCallback(ctx, 1, open) {
+					t.Fatal("open button not handled")
+				}
+				wantCalls := 1
+				if sameAccount {
+					wantCalls = 2
+					if !mutual {
+						wantCalls = 3
+					}
+				}
+				if len(*calls) != wantCalls || watchCount(t, s.Store, "actions") != 0 {
+					t.Fatalf("unexpected source requests after reconnect: %v", *calls)
+				}
+			})
+		}
+	}
+}
+
+func TestRelationsMigratesOnlyProvenLegacyBatchBindings(t *testing.T) {
+	s, _, _ := relationFixture(t)
+	ctx := context.Background()
+	legacy := `CREATE TABLE relation_batches (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ mutual INTEGER NOT NULL CHECK(mutual IN (0,1)), source_page INTEGER NOT NULL, raw_json TEXT NOT NULL,
+ captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`
+	if _, err := s.Store.DB.ExecContext(ctx, legacy+relationSchema+contactJobsSchema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.DB.ExecContext(ctx, `INSERT INTO relation_batches(id,owner_id,mutual,source_page,raw_json) VALUES
+ (1,1,0,1,'[{"userId":10}]'),(2,1,1,1,'[{"userId":20}]'),(3,1,1,2,'[{"userId":30},{"userId":31}]');
+ INSERT INTO relation_profiles(batch_id,owner_id,profile_id,position,raw_json) VALUES
+ (1,1,10,0,'{"userId":10}'),(2,1,20,0,'{"userId":20}'),(3,1,30,0,'{"userId":30}'),(3,1,31,1,'{"userId":31}');
+ INSERT INTO contact_requests(owner_id,upstream_id,profile_id,generation,mutual_batch_id,proof_at_ms,state,created_at_ms,updated_at_ms) VALUES
+ (1,101,20,'old-verified',2,1,'received',1,1),(1,101,30,'old-verified',3,1,'received',1,1),(1,201,31,'other',3,1,'received',1,1);`); err != nil {
+		t.Fatal(err)
+	}
+	legacyRecords, err := fullRelationRecords(ctx, s.Store.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Store.initRelations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		id, upstream int64
+		mutual       bool
+		raw          string
+	}{
+		{1, 0, false, `[{"userId":10}]`},
+		{2, 101, true, `[{"userId":20}]`},
+		{3, 0, true, `[{"userId":30},{"userId":31}]`},
+	} {
+		var upstream int64
+		var raw string
+		if err = s.Store.DB.QueryRowContext(ctx, "SELECT upstream_id,raw_json FROM relation_batches WHERE id=?", test.id).Scan(&upstream, &raw); err != nil || upstream != test.upstream || raw != test.raw {
+			t.Fatalf("legacy batch %d changed unexpectedly: upstream %d raw %s err %v", test.id, upstream, raw, err)
+		}
+		_, err = s.Store.relationPage(ctx, 1, 101, test.id, test.mutual)
+		if (test.upstream > 0 && err != nil) || (test.upstream == 0 && !errors.Is(err, sql.ErrNoRows)) {
+			t.Fatalf("legacy batch %d visibility: %v", test.id, err)
+		}
+	}
+	boundRecords, err := fullRelationRecords(ctx, s.Store.DB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, after := strings.Join(legacyRecords, "\n"), strings.Join(boundRecords, "\n")
+	if !strings.Contains(after, "relation-version:1:101:true:1:") || strings.Contains(after, "relation-version:1:true:1:") {
+		t.Fatal("verified binding missing from backup fingerprint")
+	}
+	for _, record := range strings.Split(before, "\n") {
+		if strings.Contains(record, ":1:false:1:") && !strings.Contains(after, record) {
+			t.Fatal("unbound legacy backup record changed")
+		}
+	}
+}

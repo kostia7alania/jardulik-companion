@@ -340,7 +340,7 @@ func TestAlbumKeepsFullTextAccessibleWithoutMarkup(t *testing.T) {
 			}
 		}
 	}
-	if textRoute != "t:10" {
+	if textRoute != fmt.Sprintf("tv:%d", p.VersionID) {
 		t.Fatal("album full text missing from menu")
 	}
 	uxTap(svc, 1, textRoute)

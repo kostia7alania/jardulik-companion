@@ -260,7 +260,7 @@ func (s *Service) handle(ctx context.Context, u Update) {
 			s.analysisPostCallback(ctx, *u.Callback)
 			return
 		}
-		if strings.HasPrefix(u.Callback.Data, "av:") || strings.HasPrefix(u.Callback.Data, "az:") || strings.HasPrefix(u.Callback.Data, "aj:") {
+		if strings.HasPrefix(u.Callback.Data, "av:") || strings.HasPrefix(u.Callback.Data, "az:") || strings.HasPrefix(u.Callback.Data, "aj:") || strings.HasPrefix(u.Callback.Data, archiveMiniAppAction) {
 			s.archiveCallback(ctx, *u.Callback)
 		}
 		return
@@ -326,6 +326,10 @@ func (s *Service) handle(ctx context.Context, u Update) {
 				}
 			case "t":
 				if p, err := s.Store.Profile(ctx, owner, id); err == nil {
+					s.fullText(ctx, owner, p)
+				}
+			case "tv":
+				if p, err := s.Store.Version(ctx, owner, id); err == nil {
 					s.fullText(ctx, owner, p)
 				}
 			}

@@ -175,13 +175,14 @@ func (s *Service) showKeyboardMenuLocked(ctx context.Context, owner int64) {
 	rows := [][]map[string]string{}
 	if p, err := s.activeKeyboardCard(ctx, owner, 0); err == nil {
 		rows = append(rows, []map[string]string{b("👤 Текущая анкета", fmt.Sprintf("p:%d", p.ID))})
-		rows = append(rows, []map[string]string{b("📄 Полный текст", fmt.Sprintf("t:%d", p.ID)), b("JSON", fmt.Sprintf("jv:%d", p.VersionID))})
+		rows = append(rows, []map[string]string{b("📄 Полный текст", fmt.Sprintf("tv:%d", p.VersionID)), b("JSON", fmt.Sprintf("jv:%d", p.VersionID))})
 		if button := s.telegramContactButton(ctx, owner, p.ID); button != nil {
 			rows = append(rows, []map[string]string{button})
 		}
 	}
 	rows = append(rows,
 		[]map[string]string{b("⭐ Избранное", "favorites"), b("❤️ Лайки", "likes"), b("💞 Взаимные", "matches")},
+		[]map[string]string{b("История", "history"), b("Подключение", "connect_help")},
 		[]map[string]string{b("⚙️ Настройки", "settings"), b("🔎 Фильтры", "filters")},
 		[]map[string]string{b("➡️ Следующая", "next"), jardulikAppButton()},
 	)

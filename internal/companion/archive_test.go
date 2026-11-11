@@ -1773,6 +1773,49 @@ func TestZIPRepairRefreshesConfirmedCaptionWithoutReupload(t *testing.T) {
 	}
 }
 
+func TestProfileZIPPreservesStoredRawJSONBytes(t *testing.T) {
+	ctx := context.Background()
+	c, s := archiveTestStore(t)
+	versions, err := s.Archive(ctx, c.OwnerID, []Profile{{"userId": 999}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const raw = " \n{\n  \"userId\" : 999, \"large\": 9007199254740993,\n\t\"precise\" : 1.00\n}\n "
+	if _, err = s.DB.ExecContext(ctx, "UPDATE versions SET raw_json=? WHERE owner_id=? AND id=?", raw, c.OwnerID, versions[0]); err != nil {
+		t.Fatal(err)
+	}
+	p, err := s.Version(ctx, c.OwnerID, versions[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewArchiver(c, s, nil, nil)
+	path, _, manifest, err := a.profileZIP(ctx, p, c.OwnerID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer z.Close()
+	in, err := z.Open("raw.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	got, err := io.ReadAll(in)
+	if err != nil || string(got) != raw {
+		t.Fatalf("raw.json = %q, want exact stored bytes %q (error: %v)", got, raw, err)
+	}
+	want := archiveFile{Name: "raw.json", SHA256: digest([]byte(raw)), ByteSize: int64(len(raw))}
+	for _, file := range manifest.Files {
+		if file == want {
+			return
+		}
+	}
+	t.Fatal("manifest lacks the exact raw.json size and hash")
+}
+
 func TestProfileMetadataPrivacyFollowsObserverAccount(t *testing.T) {
 	_, s, a, _, _ := archivePresentationFixture(t)
 	ctx := context.Background()
@@ -1826,11 +1869,7 @@ func TestProfileMetadataPrivacyFollowsObserverAccount(t *testing.T) {
 	if err != nil || changed || kept.ObserverID != other || kept.CaptureDevice != manifest.CaptureDevice || kept.OSRelease != manifest.OSRelease || kept.Hardware != manifest.Hardware {
 		t.Fatalf("other observer's historical metadata changed: changed=%t err=%v %+v", changed, err, kept)
 	}
-	expected, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(beforeRaw, expected) {
+	if string(beforeRaw) != p.RawJSON {
 		t.Fatal("conditional metadata export modified raw profile JSON")
 	}
 	primary := a.profileManifest(a.Config.OwnerID)

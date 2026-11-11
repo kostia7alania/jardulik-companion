@@ -12,17 +12,21 @@ import (
 )
 
 func profileButtons(p StoredProfile, full, jsonSource bool) any {
-	rows := [][]map[string]string{{{"text": "❤️ Лайк", "callback_data": fmt.Sprintf("l:%d", p.ID)}, {"text": "В избранное", "callback_data": fmt.Sprintf("f:%d", p.ID)}, {"text": "История", "callback_data": fmt.Sprintf("h:%d", p.ID)}}}
-	var actions []map[string]string
+	rows := [][]any{{
+		map[string]string{"text": "❤️ Лайк", "callback_data": fmt.Sprintf("l:%d", p.ID)},
+		map[string]string{"text": "В избранное", "callback_data": fmt.Sprintf("f:%d", p.ID)},
+		map[string]string{"text": "История", "callback_data": fmt.Sprintf("h:%d", p.ID)},
+	}}
+	var actions []any
 	if full {
-		actions = append(actions, map[string]string{"text": "Полный текст", "callback_data": fmt.Sprintf("t:%d", p.ID)})
+		actions = append(actions, map[string]string{"text": "Полный текст", "callback_data": fmt.Sprintf("tv:%d", p.VersionID)})
 	}
 	actions = append(actions, map[string]string{"text": "Следующая анкета", "callback_data": "next"})
 	rows = append(rows, actions)
 	if jsonSource {
-		rows = append(rows, []map[string]string{{"text": "JSON Jardulik", "callback_data": fmt.Sprintf("jv:%d", p.VersionID)}})
+		rows = append(rows, []any{map[string]string{"text": "JSON Jardulik", "callback_data": fmt.Sprintf("jv:%d", p.VersionID)}})
 	}
-	rows = append(rows, []map[string]string{jardulikAppButton()})
+	rows = append(rows, []any{jardulikAppButton()})
 	return map[string]any{"inline_keyboard": rows}
 }
 
@@ -38,7 +42,7 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		return nil, err
 	}
 	if len(photos) == 0 {
-		m, e := s.TG.SendText(ctx, owner, 0, card.Text, s.privateProfileButtons(ctx, owner, p, card.Truncated, !card.SourceJSONInline), card.Entities)
+		m, e := s.TG.SendText(ctx, owner, 0, card.Text, s.privateProfileButtons(ctx, owner, p, card.Truncated, !card.SourceJSONInline, true), card.Entities)
 		if e != nil {
 			return nil, e
 		}
@@ -47,7 +51,7 @@ func (s *Service) sendProfileCard(ctx context.Context, owner int64, p StoredProf
 		}
 		return []int64{m.ID}, nil
 	}
-	buttons := s.privateProfileButtons(ctx, owner, p, card.Truncated || len(photoExifBlocks(photos)) > 0, !card.SourceJSONInline)
+	buttons := s.privateProfileButtons(ctx, owner, p, card.Truncated || len(photoExifBlocks(photos)) > 0, !card.SourceJSONInline, true)
 	caption := card.Text
 	var ids []int64
 	for start := 0; start < len(photos); {
@@ -162,6 +166,13 @@ func (s *Service) renderPrivateCard(ctx context.Context, owner int64, p StoredPr
 // the configured private backup group. They never alter tenant authorizations.
 func (s *Service) archiveCallback(ctx context.Context, c Callback) {
 	if c.From.ID != s.Config.OwnerID || c.Message.Chat.ID != s.Config.BackupChatID || s.Config.BackupChatID == 0 {
+		return
+	}
+	if raw, ok := strings.CutPrefix(c.Data, archiveMiniAppAction); ok {
+		version, err := strconv.ParseInt(raw, 10, 64)
+		if err == nil {
+			s.archiveMiniAppCallback(ctx, c, version)
+		}
 		return
 	}
 	_ = s.TG.Call(ctx, "answerCallbackQuery", map[string]string{"callback_query_id": c.ID}, nil)
