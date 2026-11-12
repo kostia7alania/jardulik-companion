@@ -34,6 +34,7 @@ type Config struct {
 	AllowReactions                                     bool
 	RichCards                                          bool
 	ArchivePaused                                      bool
+	RelationNoticesEnabled                             bool
 	DailyCrawl                                         bool
 	SyncCycleEnabled                                   bool
 	MinFreeBytes                                       uint64
@@ -67,6 +68,7 @@ func LoadConfig() (Config, error) {
 	if c.SyncCycleEnabled && !c.CompatibilityEnabled {
 		return c, errors.New("SYNC_CYCLE_ENABLED requires COMPATIBILITY_ENABLED=true")
 	}
+	c.RelationNoticesEnabled = os.Getenv("RELATION_NOTICES_ENABLED") == "true"
 	c.DebugListen = strings.TrimSpace(os.Getenv("JARDULIK_DEBUG_LISTEN"))
 	if c.DebugListen != "" {
 		host, port, err := net.SplitHostPort(c.DebugListen)

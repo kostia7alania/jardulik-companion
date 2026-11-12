@@ -249,6 +249,7 @@ var operationsErrorSources = []operationsErrorSource{
 	{"opening_audit_topics", "poster", "opening_audit_topics t", "t.owner_id", "t.error", "t.updated_at"},
 	{"opening_audit_posts", "poster", "opening_audit_posts t JOIN opening_audit_topics topic ON topic.id=t.topic_id", "topic.owner_id", "t.error", "t.updated_at"},
 	{"opening_timeline_posts", "poster", "opening_timeline_posts t", "t.owner_id", "t.error", "t.updated_at"},
+	{"relation_notice_events", "poster", "relation_notice_events t", "t.owner_id", "t.error", "CAST(t.observed_at_ms AS TEXT)"},
 	{"compatibility_jobs", "bot-parser", "compatibility_jobs t JOIN compatibility_pairs pair ON pair.id=t.pair_id", "pair.owner_id", "t.reason", "CAST(t.updated_at_ms AS TEXT)"},
 	{"contact_requests", "bot-parser", "contact_requests t", "t.owner_id", "t.reason", "CAST(t.updated_at_ms AS TEXT)"},
 	{"media_jobs", "bot-parser", "media_jobs t", "t.owner_id", "t.error", "CAST(t.attempts AS TEXT)"},

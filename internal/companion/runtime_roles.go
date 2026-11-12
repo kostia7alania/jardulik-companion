@@ -103,6 +103,9 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		start("crawler", s.Crawler.Run)
 		start("autoliker", s.Autoliker.Run)
 		start("contacts", s.runContacts)
+		if s.Config.RelationNoticesEnabled {
+			start("relation-notice-poll", s.RunRelationNoticePoll)
+		}
 		if s.Config.CompatibilityEnabled {
 			start("compatibility-executor", s.runCompatibilityExecutor)
 		}
@@ -112,6 +115,9 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		start("operations", s.RunOperations)
 		start("opening-timeline", s.RunOpeningTimeline)
 		if !s.Config.ArchivePaused {
+			if s.Config.RelationNoticesEnabled {
+				start("relation-notice-delivery", s.RunRelationNoticesDelivery)
+			}
 			start("archiver", s.Archiver.Run)
 			start("caption-maintenance", s.RunCaptionMaintenance)
 			start("profile-indexes", s.RunProfileIndexes)

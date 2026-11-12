@@ -129,14 +129,14 @@ func decodeRelations(raw []byte) ([]Profile, error) {
 
 // ReactUsers preserves partial source previews; it never hydrates or archives a profile.
 func (c *Client) ReactUsers(ctx context.Context, owner int64, mutual bool, page int) (RelationPage, error) {
-	return c.reactUsers(ctx, owner, nil, mutual, page)
+	return c.reactUsers(ctx, owner, nil, mutual, page, true)
 }
 
 func (c *Client) ReactUsersFrozen(ctx context.Context, owner int64, expected Session, mutual bool, page int) (RelationPage, error) {
-	return c.reactUsers(ctx, owner, &expected, mutual, page)
+	return c.reactUsers(ctx, owner, &expected, mutual, page, true)
 }
 
-func (c *Client) reactUsers(ctx context.Context, owner int64, expected *Session, mutual bool, page int) (RelationPage, error) {
+func (c *Client) reactUsers(ctx context.Context, owner int64, expected *Session, mutual bool, page int, queueContacts bool) (RelationPage, error) {
 	result := RelationPage{Mutual: mutual, SourcePage: page}
 	if page < 1 {
 		return result, errors.New("invalid relationship page")
@@ -174,7 +174,7 @@ func (c *Client) reactUsers(ctx context.Context, owner int64, expected *Session,
 	if err = c.Store.initRelations(ctx); err != nil {
 		return result, err
 	}
-	if mutual {
+	if mutual && queueContacts {
 		if err = c.Store.initContactJobs(ctx); err != nil {
 			return result, err
 		}
@@ -201,7 +201,7 @@ func (c *Client) reactUsers(ctx context.Context, owner int64, expected *Session,
 			return result, err
 		}
 	}
-	if mutual {
+	if mutual && queueContacts {
 		if err = c.Store.queueMutualContactsTx(ctx, tx, owner, session, result.ID, result.Profiles, c.Now().UTC()); err != nil {
 			return result, err
 		}

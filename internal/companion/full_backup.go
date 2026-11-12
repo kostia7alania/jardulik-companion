@@ -1299,6 +1299,7 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		{"operations_events", "operations-event-unconfirmed", "SELECT owner_id,chat_id,id,fingerprint,state FROM operations_events WHERE message_id=0 AND state IN ('sending','uncertain')"},
 		{"opening_timeline_posts", "opening-timeline-post", "SELECT owner_id,upstream_id,action_id,profile_id,chat_id,thread_id,source_sha,message_id FROM opening_timeline_posts WHERE message_id>0"},
 		{"opening_timeline_posts", "opening-timeline-post-unconfirmed", "SELECT owner_id,upstream_id,action_id,profile_id,chat_id,thread_id,source_sha,state FROM opening_timeline_posts WHERE message_id=0 AND state IN ('sending','uncertain')"},
+		{"relation_notice_events", "relation-notice", "SELECT owner_id,upstream_id,profile_id,kind,observed_at_ms,CASE WHEN state IN ('pending','preparing') THEN 'pending' ELSE state END,message_id FROM relation_notice_events"},
 		{"meta", "miniapp-test-card", "SELECT key,value FROM meta WHERE key LIKE 'miniapp-test-card:v1:%'"},
 		{"sync_cycles", "sync-cycle-blocked", "SELECT owner_id,upstream_id,generation,reason FROM sync_cycles WHERE stage='blocked'"},
 		{"profile_analyses", "analysis", "SELECT owner_id,upstream_id,profile_id,provider,model,observed_at_ms,http_status,state,generation,request_body,response_body,own_profile,target_profile,capture_sha FROM profile_analyses"},
