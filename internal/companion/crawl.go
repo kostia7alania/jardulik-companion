@@ -220,10 +220,26 @@ func (c *FeedCrawler) requestLocked(ctx context.Context, owner int64, includeOth
 
 // replacement pins an active older broad query so its cursor is never reused for new parameters.
 func (c *FeedCrawler) requestRunLocked(ctx context.Context, owner int64, includeOthers, locations bool, replacement *CrawlJob) (*CrawlJob, error) {
-	s := c.Service
 	if err := c.init(ctx); err != nil {
 		return nil, err
 	}
+	tx, err := c.Service.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	job, err := c.requestRunTx(ctx, tx, owner, includeOthers, locations, replacement)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+func (c *FeedCrawler) requestRunTx(ctx context.Context, tx *sql.Tx, owner int64, includeOthers, locations bool, replacement *CrawlJob) (*CrawlJob, error) {
+	s := c.Service
 	filters := DefaultFeedFilters()
 	filters.AgeMin, filters.AgeMax = broadCrawlAgeMin, broadCrawlAgeMax
 	if err := filters.validate(); err != nil {
@@ -237,11 +253,6 @@ func (c *FeedCrawler) requestRunLocked(ctx context.Context, owner int64, include
 	if err != nil {
 		return nil, err
 	}
-	tx, err := s.Store.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
 	// Reserve the writer before reading lifecycle state shared with other processes.
 	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='feed_crawl_next'"); err != nil {
 		return nil, err
@@ -317,10 +328,7 @@ func (c *FeedCrawler) requestRunLocked(ctx context.Context, owner int64, include
 	if _, err = tx.ExecContext(ctx, "DELETE FROM meta WHERE key=?", dailyCrawlBlockKey(owner)); err != nil {
 		return nil, err
 	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
-	}
-	return s.Store.CrawlStatus(ctx, owner)
+	return scanCrawl(tx.QueryRowContext(ctx, "SELECT "+crawlColumns+" FROM feed_crawls WHERE owner_id=?", owner))
 }
 
 func (c *FeedCrawler) Run(ctx context.Context) {

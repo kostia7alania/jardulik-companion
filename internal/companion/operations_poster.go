@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -188,14 +190,57 @@ func (s *Service) markOperationsSending(ctx context.Context, op operationsOperat
 	return err
 }
 
-func operationsEventText(op operationsOperation) (string, []MessageEntity) {
+func operationsEventText(op operationsOperation, botToken string) (string, []MessageEntity) {
 	icon := "⚠️"
 	if op.Level == "ERROR" {
 		icon = "❌"
 	} else if op.Level == "INFO" {
 		icon = "ℹ️"
 	}
-	heading := fmt.Sprintf("%s %s · %s", icon, operationsStatusValue(op.Role, 40), operationsStatusValue(op.Text, 180))
+	redact := func(value string) string {
+		if botToken != "" {
+			value = strings.ReplaceAll(value, botToken, "[redacted]")
+			value = strings.ReplaceAll(value, url.QueryEscape(botToken), "[redacted]")
+		}
+		return value
+	}
+	fields := map[string]any{}
+	var saved map[string]any
+	decoder := json.NewDecoder(strings.NewReader(op.Detail))
+	decoder.UseNumber()
+	if decoder.Decode(&saved) == nil {
+		for key, value := range saved {
+			if v, ok := value.(string); ok {
+				value = redact(v)
+			}
+			operationsSafeAttr(fields, slog.Any(key, value))
+		}
+	}
+	heading := fmt.Sprintf("%s %s · %s", icon, operationsSafeText(redact(op.Role), 40), operationsSafeText(redact(op.Text), 180))
+	var request string
+	var reconnect bool
+	if op.Text == "API operation failed" {
+		source, _ := fields["source"].(string)
+		if source == "Jardulik" || source == "Telegram" {
+			heading = fmt.Sprintf("%s Ошибка запроса к %s", icon, source)
+			status, _ := fields["http_status"].(int64)
+			if status >= 100 && status <= 599 {
+				label := "HTTP"
+				if source == "Telegram" {
+					label = "код"
+				}
+				heading += fmt.Sprintf(" · %s %d", label, status)
+			}
+			method, _ := fields["method"].(string)
+			reconnect = source == "Jardulik" && method == "PUT" && fields["stage"] == "/appuser/refresh" && status == 400
+			switch method {
+			case "GET", "POST", "PUT", "PATCH", "DELETE":
+				if requestURL, ok := fields["request_url"].(string); ok && source == "Jardulik" {
+					request = fmt.Sprintf("%s: '%s'", method, requestURL)
+				}
+			}
+		}
+	}
 	if op.Count > 1 {
 		heading += fmt.Sprintf(" · ×%d", op.Count)
 	}
@@ -203,23 +248,30 @@ func operationsEventText(op operationsOperation) (string, []MessageEntity) {
 	if op.Count > 1 {
 		text += "\nПервый: " + displayTime(time.UnixMilli(op.First).UTC().Format(time.RFC3339))
 	}
-	var pretty any
-	details := op.Detail
-	if json.Unmarshal([]byte(details), &pretty) == nil {
-		if raw, err := json.MarshalIndent(pretty, "", "  "); err == nil {
-			details = string(raw)
+	var entities []MessageEntity
+	if request != "" {
+		text += "\n"
+		entities = append(entities, MessageEntity{Type: "code", Offset: textUnits(text), Length: textUnits(request)})
+		text += request
+		if fields["query_filtered"] == true {
+			text += "\nЧасть параметров URL скрыта."
 		}
 	}
-	if details == "" || details == "{}" {
-		return text, nil
+	if reconnect {
+		text += "\nJardulik отклонил обновление сессии. Переподключи аккаунт через /connect."
 	}
+	if len(fields) == 0 {
+		return text, entities
+	}
+	raw, _ := json.MarshalIndent(fields, "", "  ")
+	details := string(raw)
 	var remainder string
 	details, remainder = telegramPrefix(details, 3200)
 	if remainder != "" {
 		details += "\n…"
 	}
 	text += "\n\n"
-	entities := []MessageEntity{{Type: "expandable_blockquote", Offset: textUnits(text), Length: textUnits(details)}}
+	entities = append(entities, MessageEntity{Type: "expandable_blockquote", Offset: textUnits(text), Length: textUnits(details)})
 	return text + details, entities
 }
 
@@ -310,7 +362,7 @@ func (s *Service) deliverOperations(ctx context.Context) (bool, error) {
 		op.Text, err = s.OperationsStatus(send)
 		op.SHA = digest([]byte(op.Text))
 	} else if op.Kind == "event" {
-		op.Text, entities = operationsEventText(op)
+		op.Text, entities = operationsEventText(op, s.Config.Token)
 	}
 	if err != nil {
 		return true, errors.Join(err, s.finishOperations(ctx, op, "pending", a.now().Add(5*time.Second).UnixMilli(), "status_read_failed", nil, 0, op.Message))

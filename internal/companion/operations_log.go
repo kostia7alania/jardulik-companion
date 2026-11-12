@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -193,26 +194,58 @@ func operationsSafeAttr(fields map[string]any, attr slog.Attr) {
 		}
 		return
 	}
+	if attr.Key == "request_url" {
+		if attr.Value.Kind() == slog.KindString {
+			if safeURL, filtered := operationsUpstreamURL(attr.Value.String()); safeURL != "" {
+				fields[attr.Key] = safeURL
+				if filtered {
+					fields["query_filtered"] = true
+				}
+			}
+		}
+		return
+	}
+	if attr.Key == "query_filtered" {
+		if attr.Value.Kind() == slog.KindBool && attr.Value.Bool() {
+			fields[attr.Key] = true
+		}
+		return
+	}
 	switch attr.Key {
-	case "kind", "stage", "tenant", "owner", "owner_id", "upstream_id", "profile_id", "target_user_id", "run_id", "mode", "page", "sqlite_code", "fatal", "http_status", "retry_after", "component", "source", "job_id", "state", "pid", "method", "description":
+	case "kind", "stage", "requested_stage", "tenant", "owner", "owner_id", "upstream_id", "profile_id", "target_user_id", "run_id", "mode", "page", "sqlite_code", "fatal", "http_status", "retry_after", "component", "source", "job_id", "state", "pid", "method", "description":
 	default:
 		return
 	}
 	switch attr.Value.Kind() {
 	case slog.KindString:
-		fields[attr.Key] = operationsSafeText(attr.Value.String(), 180)
+		value := attr.Value.String()
+		if attr.Key == "stage" || attr.Key == "requested_stage" {
+			value, _, _ = strings.Cut(value, "?")
+		}
+		fields[attr.Key] = operationsSafeText(value, 180)
 	case slog.KindInt64:
 		fields[attr.Key] = attr.Value.Int64()
 	case slog.KindUint64:
 		fields[attr.Key] = attr.Value.Uint64()
 	case slog.KindBool:
 		fields[attr.Key] = attr.Value.Bool()
+	case slog.KindAny:
+		if number, ok := attr.Value.Any().(json.Number); ok {
+			if n, err := number.Int64(); err == nil {
+				fields[attr.Key] = n
+			}
+		}
 	}
 }
 
+var operationsTelegramCredential = regexp.MustCompile(`(?i)[0-9]{5,}(?::|%3a)[a-z0-9_-]{16,}`)
+
 func operationsSafeText(value string, limit int) string {
+	if operationsTelegramCredential.MatchString(value) {
+		return "details_available_locally"
+	}
 	lower := strings.ToLower(value)
-	for _, marker := range []string{"bearer ", "tgwebappdata", "accesstoken", "refreshtoken", "authorization", "https://", "http://"} {
+	for _, marker := range []string{"bearer ", "tgwebappdata", "accesstoken", "refreshtoken", "authorization", "initdata", "access_token", "refresh_token", "token=", "https://", "http://"} {
 		if strings.Contains(lower, marker) {
 			return "details_available_locally"
 		}

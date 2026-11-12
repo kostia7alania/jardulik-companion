@@ -25,10 +25,13 @@ import (
 var ErrProfileUnavailable = errors.New("Jardulik profile unavailable")
 
 type UpstreamError struct {
-	Status     int
-	Kind       string
-	RetryAfter time.Duration
-	Endpoint   string
+	Status        int
+	Kind          string
+	RetryAfter    time.Duration
+	Endpoint      string
+	Method        string
+	RequestURL    string
+	QueryFiltered bool
 }
 
 func (e *UpstreamError) Error() string {
@@ -128,6 +131,10 @@ func (c *Client) exchange(ctx context.Context, method, path, token string, paylo
 	if err != nil {
 		return nil, errors.New("Jardulik response interrupted")
 	}
+	failure := func(kind string, retryAfter time.Duration) *UpstreamError {
+		requestURL, filtered := operationsUpstreamURL(r.URL.String())
+		return &UpstreamError{Status: res.StatusCode, Kind: kind, RetryAfter: retryAfter, Endpoint: strings.SplitN(path, "?", 2)[0], Method: r.Method, RequestURL: requestURL, QueryFiltered: filtered}
+	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		kind := "request_rejected"
 		if res.StatusCode == 401 {
@@ -143,13 +150,13 @@ func (c *Client) exchange(ctx context.Context, method, path, token string, paylo
 		if n, _ := strconv.Atoi(res.Header.Get("Retry-After")); n > 0 {
 			d = time.Duration(n) * time.Second
 		}
-		return nil, &UpstreamError{Status: res.StatusCode, Kind: kind, RetryAfter: d, Endpoint: strings.SplitN(path, "?", 2)[0]}
+		return nil, failure(kind, d)
 	}
 	if profileNoContent(method, path, res.StatusCode, res.Header.Get("Content-Type"), b) {
 		return nil, ErrProfileUnavailable
 	}
 	if strings.Contains(strings.ToLower(res.Header.Get("Content-Type")), "text/html") || !json.Valid(b) {
-		return nil, &UpstreamError{Status: res.StatusCode, Kind: "unexpected_response_or_challenge", Endpoint: strings.SplitN(path, "?", 2)[0]}
+		return nil, failure("unexpected_response_or_challenge", 0)
 	}
 	return b, nil
 }

@@ -3,6 +3,7 @@ package companion
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -246,7 +247,6 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 	if err != nil {
 		return false, err
 	}
-	started := j.StartedAt
 	tx, err := s.Store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -255,7 +255,7 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='sync_cycle_writer'"); err != nil {
 		return false, err
 	}
-	cycle := SyncCycle{ID: id, OwnerID: owner, UserID: ss.UserID, Generation: ss.Generation, Stage: "search", SearchRunID: j.RunID, StartedAt: started}
+	cycle := SyncCycle{ID: id, OwnerID: owner, UserID: ss.UserID, Generation: ss.Generation}
 	if err = syncCycleBindingTx(ctx, tx, s.Store, cycle); err != nil {
 		return false, err
 	}
@@ -284,11 +284,174 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 	if !sameRun {
 		return false, errors.New("sync search run changed")
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO sync_cycles(id,owner_id,upstream_id,generation,stage,search_run_id,started_at_ms,updated_at_ms,next_cycle_ms) VALUES(?,?,?,?,?,?,?,?,?)", id, owner, ss.UserID, ss.Generation, "search", j.RunID, started, now.UnixMilli(), started+(24*time.Hour).Milliseconds())
-	if err != nil {
+	if err = insertSyncSearchTx(ctx, tx, &cycle, j, now); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
+}
+
+func insertSyncSearchTx(ctx context.Context, tx *sql.Tx, cycle *SyncCycle, job *CrawlJob, now time.Time) error {
+	cycle.Stage, cycle.SearchRunID, cycle.StartedAt = "search", job.RunID, job.StartedAt
+	cycle.UpdatedAt = now.UnixMilli()
+	cycle.NextCycle = job.StartedAt + (24 * time.Hour).Milliseconds()
+	result, err := tx.ExecContext(ctx, `INSERT INTO sync_cycles(id,owner_id,upstream_id,generation,stage,search_run_id,started_at_ms,updated_at_ms,next_cycle_ms)
+ VALUES(?,?,?,?,?,?,?,?,?)`, cycle.ID, cycle.OwnerID, cycle.UserID, cycle.Generation, cycle.Stage, cycle.SearchRunID, cycle.StartedAt, cycle.UpdatedAt, cycle.NextCycle)
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if count != 1 {
+		return errors.New("sync search cycle was not inserted")
+	}
+	return nil
+}
+
+// RecoverAuthStoppedCycle is an explicit operator action backed by a stored API error.
+func (s *Service) RecoverAuthStoppedCycle(ctx context.Context, owner int64, cycleID, runID string, receiptID int64) (*SyncCycle, error) {
+	if !s.Config.SyncCycleEnabled || owner <= 0 || owner != s.Config.OwnerID || cycleID == "" || runID == "" || receiptID <= 0 {
+		return nil, errors.New("invalid sync auth recovery request")
+	}
+	if err := s.Store.InitSyncCycles(ctx); err != nil {
+		return nil, err
+	}
+	if err := s.Crawler.init(ctx); err != nil {
+		return nil, err
+	}
+	unlock, acquired, err := s.Store.trySyncPublicationLock()
+	if err != nil {
+		return nil, err
+	}
+	if !acquired {
+		return nil, errors.New("sync publication is busy")
+	}
+	defer unlock()
+	id, err := filterNonce()
+	if err != nil {
+		return nil, err
+	}
+	now := s.Client.Now()
+	tx, err := s.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='sync_cycle_writer'"); err != nil {
+		return nil, err
+	}
+	previous, err := scanSyncCycle(tx.QueryRowContext(ctx, "SELECT "+syncCycleColumns+" FROM sync_cycles WHERE owner_id=? ORDER BY started_at_ms DESC,id DESC LIMIT 1", owner))
+	if err != nil {
+		return nil, err
+	}
+	if previous == nil || previous.ID != cycleID || previous.SearchRunID != runID || previous.Stage != "blocked" || previous.Reason != syncCycleBindingChanged {
+		return nil, errors.New("blocked sync cycle does not match recovery request")
+	}
+	job, err := scanCrawl(tx.QueryRowContext(ctx, "SELECT "+crawlColumns+" FROM feed_crawls WHERE owner_id=?", owner))
+	if err != nil {
+		return nil, err
+	}
+	if job.RunID != runID || !syncBroadRun(job, Session{UserID: previous.UserID, Generation: previous.Generation}) || job.State != "stopped" || job.Reason != "auth_required" ||
+		job.Mode != 0 || job.Page != 1 || job.Pages != 0 || job.Received != 0 || job.CatalogPages != 0 || job.CatalogReceived != 0 || job.CatalogProfiles != 0 || job.Hydrated != 0 || job.Unavailable != 0 {
+		return nil, errors.New("crawl did not stop at the first authentication check")
+	}
+	var untouched bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM crawl_presence_runs WHERE owner_id=? AND run_id=? AND finished_at IS NULL)
+ AND NOT EXISTS(SELECT 1 FROM crawl_presence_profiles WHERE owner_id=? AND run_id=? AND seen<>0)
+ AND NOT EXISTS(SELECT 1 FROM feed_crawl_pages WHERE owner_id=? AND run_id=?)
+ AND NOT EXISTS(SELECT 1 FROM crawl_location_results WHERE owner_id=? AND run_id=?)
+ AND NOT EXISTS(SELECT 1 FROM sync_refresh_items WHERE cycle_id=?)
+ AND NOT EXISTS(SELECT 1 FROM sync_publication_manifests WHERE cycle_id=?)`, owner, runID, owner, runID, owner, runID, owner, runID, cycleID, cycleID).Scan(&untouched)
+	if err != nil {
+		return nil, err
+	}
+	if !untouched {
+		return nil, errors.New("crawl recovery would replace recorded progress")
+	}
+	session, err := s.Store.businessSession(ctx, tx, owner)
+	if err != nil {
+		return nil, err
+	}
+	if session.UserID != previous.UserID || session.Generation == "" || session.Generation == previous.Generation || session.State != "connected" {
+		return nil, errors.New("a fresh connection to the same Jardulik account is required")
+	}
+	cycle := &SyncCycle{ID: id, OwnerID: owner, UserID: session.UserID, Generation: session.Generation}
+	if err = syncCycleBindingTx(ctx, tx, s.Store, *cycle); err != nil {
+		return nil, err
+	}
+	var reconnected bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM events WHERE owner_id=? AND kind='connect_success'
+ AND datetime(created_at)>=datetime(?/1000.0,'unixepoch'))`, owner, job.UpdatedAt).Scan(&reconnected)
+	if err != nil {
+		return nil, err
+	}
+	if !reconnected {
+		return nil, errors.New("no successful reconnection after the stopped crawl")
+	}
+	if err = verifySyncAuthRecoveryReceipt(ctx, tx, owner, receiptID, job); err != nil {
+		return nil, err
+	}
+	requestCtx := context.WithValue(ctx, dailyCrawlRequestKey{}, dailyCrawlIdentity{UserID: session.UserID, Generation: session.Generation})
+	fresh, err := s.Crawler.requestRunTx(requestCtx, tx, owner, true, true, nil)
+	if err != nil {
+		return nil, err
+	}
+	if fresh.StartedAt <= previous.StartedAt {
+		return nil, errors.New("replacement crawl must start after the old cycle")
+	}
+	history, err := json.Marshal(struct {
+		Crawl       *CrawlJob `json:"crawl"`
+		ReceiptID   int64     `json:"operations_event_id"`
+		NextCycleID string    `json:"next_cycle_id"`
+	}{job, receiptID, cycle.ID})
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?)", "sync_auth_recovery:"+previous.ID, string(history)); err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE sync_cycles SET stage='superseded',updated_at_ms=? WHERE id=? AND owner_id=?", now.UnixMilli(), previous.ID, owner); err != nil {
+		return nil, err
+	}
+	if err = insertSyncSearchTx(ctx, tx, cycle, fresh, now); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return cycle, nil
+}
+
+func verifySyncAuthRecoveryReceipt(ctx context.Context, tx *sql.Tx, owner, receiptID int64, job *CrawlJob) error {
+	var raw []byte
+	var first, last, count int64
+	err := tx.QueryRowContext(ctx, `SELECT fields_json,first_at_ms,last_at_ms,occurrence_count FROM operations_events
+ WHERE id=? AND owner_id=? AND role='bot-parser' AND level='WARN' AND message='API operation failed'`, receiptID, owner).Scan(&raw, &first, &last, &count)
+	if err != nil {
+		return err
+	}
+	var fields struct {
+		Source         string `json:"source"`
+		Stage          string `json:"stage"`
+		RequestedStage string `json:"requested_stage"`
+		Method         string `json:"method"`
+		Kind           string `json:"kind"`
+		Tenant         int64  `json:"tenant"`
+		Status         int    `json:"http_status"`
+		RetryAfter     int64  `json:"retry_after"`
+	}
+	if json.Unmarshal(raw, &fields) != nil || count != 1 || first != last || first < job.StartedAt || first < job.UpdatedAt-5000 || first > job.UpdatedAt ||
+		fields.Source != "Jardulik" || fields.Tenant != owner || fields.Status != 400 || fields.Kind != "Jardulik: request_rejected (HTTP 400)" || fields.RetryAfter != 0 {
+		return errors.New("stored API error does not prove this authentication stop")
+	}
+	refresh := fields.Stage == "/appuser/refresh" && fields.RequestedStage == "/user/getMe" && fields.Method == "PUT"
+	// Earlier logs attributed the nested refresh failure to its outer GET.
+	legacy := fields.Stage == "/user/getMe" && fields.RequestedStage == "" && fields.Method == "GET"
+	if !refresh && !legacy {
+		return errors.New("stored API error does not match the first account check")
+	}
+	return nil
 }
 
 func (s *Service) RunSyncCycles(ctx context.Context) {
