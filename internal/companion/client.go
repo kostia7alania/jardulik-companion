@@ -826,6 +826,18 @@ func (c *Client) positiveGuarded(ctx context.Context, owner, id int64, kind Posi
 	if err = c.Store.markPositiveAttempt(ctx, owner, action, current, automatic, c.Now); err != nil {
 		return release(err)
 	}
+	var wire struct {
+		Kind int64 `json:"reactionType"`
+	}
+	_ = json.Unmarshal(request, &wire)
+	logResult := func(state string) {
+		binding, ok := ctx.Value(automaticDispatchContextKey{}).(automaticDispatchBinding)
+		if ok && automatic && owner > 0 && owner == c.Store.cfg.OwnerID {
+			slog.InfoContext(ctx, autoLogResult, "owner_id", owner, "run_id", digest([]byte(binding.RunID))[:16],
+				"profile_id", id, "action_id", action, "reaction_type", wire.Kind, "state", state,
+				"kind", string(out.Decision), "mutual", state == "succeeded" && out.Mutual)
+		}
+	}
 	body, err := c.exchange(ctx, http.MethodPost, "/reactions/addNew", current.Token, json.RawMessage(request))
 	if err == nil {
 		out, err = decodeReactionResult(body, c.Now())
@@ -843,6 +855,9 @@ func (c *Client) positiveGuarded(ctx context.Context, owner, id int64, kind Posi
 		}
 		persistErr := c.Store.finishReactionAction(writeCtx, action, "unknown", body, time.Time{})
 		c.Store.Pause(writeCtx, owner, true)
+		if persistErr == nil {
+			logResult("unknown")
+		}
 		return out, errors.Join(errors.New("результат реакции неизвестен; повторная отправка запрещена"), persistErr)
 	}
 	state := "rejected"
@@ -850,19 +865,14 @@ func (c *Client) positiveGuarded(ctx context.Context, owner, id int64, kind Posi
 		state = "succeeded"
 	} else if out.Decision == ReactionQuota {
 		state = "quota_waiting"
-	} else if out.Decision == ReactionFireUnavailable {
-		var wire struct {
-			Kind int64 `json:"reactionType"`
-		}
-		_ = json.Unmarshal(request, &wire)
-		if wire.Kind == 3 {
-			state = "fire_waiting"
-		}
+	} else if out.Decision == ReactionFireUnavailable && wire.Kind == 3 {
+		state = "fire_waiting"
 	}
 	if err = c.Store.finishReactionAction(writeCtx, action, state, body, out.RetryAt); err != nil {
 		c.Store.Pause(writeCtx, owner, true)
 		return out, err
 	}
+	logResult(state)
 	if out.Decision == ReactionSuccess && out.Mutual {
 		if err := c.Store.RequestContactSync(writeCtx, owner, current, c.Now()); err != nil {
 			slog.Warn("contact sync scheduling failed", "kind", safeError(err))

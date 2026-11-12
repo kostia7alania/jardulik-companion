@@ -79,6 +79,28 @@ func TestOperationsLoggingInsideSQLiteWriterKeepsStderrAndOmitsCredentials(t *te
 	}
 }
 
+func TestOperationsAutoResultReachesCollapsedQuote(t *testing.T) {
+	var spool bytes.Buffer
+	logger := slog.New(&operationsLogHandler{base: slog.NewJSONHandler(io.Discard, nil), sink: &operationsLogSink{writer: &spool, role: RuntimeBotParser, boot: "auto"}})
+	logger.Info("ordinary diagnostic", "state", "ready")
+	logger.Info(autoLogResult, "reaction_type", 3, "action_id", 12, "state", "succeeded",
+		"mutual", false, "message_body", "private-message")
+	var record operationsLogRecord
+	if err := json.Unmarshal(spool.Bytes(), &record); err != nil || record.Message != autoLogResult {
+		t.Fatalf("unexpected spool: %s, %v", spool.Bytes(), err)
+	}
+	details, err := json.Marshal(record.Fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, entities := operationsEventText(operationsOperation{Role: record.Role, Level: record.Level, Text: record.Message, Detail: string(details), Last: record.At}, "")
+	if len(entities) != 1 || entities[0].Type != "expandable_blockquote" || validMessageEntities(body, entities) != nil ||
+		!strings.Contains(body, `"reaction_type": 3`) || !strings.Contains(body, `"action_id": 12`) ||
+		!strings.Contains(body, `"mutual": false`) || strings.Contains(body, "private-message") {
+		t.Fatalf("unexpected Telegram event: %s %+v", body, entities)
+	}
+}
+
 func TestOperationsCollectorPartialLineRestartAndRecordDedup(t *testing.T) {
 	s := operationsTestService(t)
 	ctx := context.Background()

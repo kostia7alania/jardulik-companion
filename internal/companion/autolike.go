@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -174,7 +175,25 @@ func (a *Autoliker) startLocked(ctx context.Context, owner int64, mode string, c
 			return err
 		}
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if owner == s.Config.OwnerID {
+		fields := []any{"mode", mode, "age_min", f.AgeMin, "age_max", f.AgeMax, "series_count", count}
+		if policy, err := s.Store.ReactionMessagePolicy(ctx, owner); err == nil {
+			interval, cap := j.effectiveLimits(policy)
+			fields = append(fields, "interval_seconds", interval, "daily_cap", cap,
+				"super_before_age", policy.SuperBeforeAge)
+		}
+		a.log(ctx, owner, run, autoLogStarted, fields...)
+	}
+	return nil
+}
+
+func (a *Autoliker) log(ctx context.Context, owner int64, run, message string, fields ...any) {
+	if owner > 0 && owner == a.Service.Config.OwnerID {
+		slog.InfoContext(ctx, message, append([]any{"owner_id", owner, "run_id", digest([]byte(run))[:16]}, fields...)...)
+	}
 }
 
 // DisableAutolike is DB-only and deliberately takes no userLock, so /pause can interrupt HTTP preflight.
@@ -187,8 +206,29 @@ func (s *Service) DisableAutolike(ctx context.Context, owner int64, reason strin
 	if err != nil {
 		return err
 	}
-	_, err = s.Store.DB.ExecContext(ctx, "UPDATE autolike_settings SET mode='off',state='off',reason=?,nonce=? WHERE owner_id=?", reason, nonce, owner)
-	return err
+	const update = "UPDATE autolike_settings SET mode='off',state='off',reason=?,nonce=? WHERE owner_id=?"
+	tx, err := s.Store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var run string
+	var sent, page int
+	err = tx.QueryRowContext(ctx, update+" AND mode<>'off' RETURNING run_id,sent,page", reason, nonce, owner).Scan(&run, &sent, &page)
+	transitioned := err == nil
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = tx.ExecContext(ctx, update, reason, nonce, owner)
+	}
+	if err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if transitioned {
+		a.log(ctx, owner, run, autoLogStopped, "kind", reason, "description", autoReason(reason), "sent", sent, "page", page)
+	}
+	return nil
 }
 func (s *Service) AutolikeStatus(ctx context.Context, owner int64) string {
 	j, err := NewAutoliker(s).settings(ctx, owner)
@@ -310,9 +350,17 @@ func (a *Autoliker) budget(ctx context.Context, owner int64) (int, time.Time, er
 	return budget.Count, budget.RetryAt, err
 }
 func (a *Autoliker) wait(ctx context.Context, j *AutoSettings, reason string, next time.Time) error {
-	_, err := a.Service.Store.DB.ExecContext(ctx, "UPDATE autolike_settings SET state='waiting',reason=?,next_attempt=? WHERE owner_id=? AND run_id=? AND mode<>'off'", reason, next.UnixMilli(), j.Owner, j.RunID)
-	return err
+	res, err := a.Service.Store.DB.ExecContext(ctx, "UPDATE autolike_settings SET state='waiting',reason=?,next_attempt=? WHERE owner_id=? AND run_id=? AND mode<>'off'", reason, next.UnixMilli(), j.Owner, j.RunID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 && (j.State != "waiting" || j.Reason != reason) {
+		a.log(ctx, j.Owner, j.RunID, autoLogWaiting, "kind", reason,
+			"description", autoReason(reason), "sent", j.Sent, "next_attempt", displayTime(next.Format(time.RFC3339)))
+	}
+	return nil
 }
+
 func (a *Autoliker) candidateState(ctx context.Context, j *AutoSettings, id int64, state string) error {
 	_, err := a.Service.Store.DB.ExecContext(ctx, "UPDATE autolike_candidates SET state=? WHERE owner_id=? AND run_id=? AND profile_id=?", state, j.Owner, j.RunID, id)
 	return err

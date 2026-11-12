@@ -26,6 +26,13 @@ var operationsProcessStarted = time.Now().UnixMilli()
 
 const operationsRecordLimit = 16 << 10
 
+const (
+	autoLogStarted = "Автолайкер запущен"
+	autoLogWaiting = "Автолайкер ждёт"
+	autoLogStopped = "Автолайкер остановлен"
+	autoLogResult  = "Результат автореакции"
+)
+
 type operationsLogRecord struct {
 	ID      string         `json:"id"`
 	At      int64          `json:"at_ms"`
@@ -107,7 +114,11 @@ func (h *operationsLogHandler) Handle(ctx context.Context, record slog.Record) e
 		baseErr = h.base.Handle(ctx, record)
 	}
 	if record.Level < slog.LevelWarn {
-		return baseErr
+		switch record.Message {
+		case autoLogStarted, autoLogWaiting, autoLogStopped, autoLogResult:
+		default:
+			return baseErr
+		}
 	}
 	fields := map[string]any{}
 	for _, attr := range h.attrs {
@@ -212,7 +223,8 @@ func operationsSafeAttr(fields map[string]any, attr slog.Attr) {
 		return
 	}
 	switch attr.Key {
-	case "kind", "stage", "requested_stage", "tenant", "owner", "owner_id", "upstream_id", "profile_id", "target_user_id", "run_id", "mode", "page", "sqlite_code", "fatal", "http_status", "retry_after", "component", "source", "job_id", "state", "pid", "method", "description":
+	case "kind", "stage", "requested_stage", "tenant", "owner", "owner_id", "upstream_id", "profile_id", "target_user_id", "run_id", "mode", "page", "sqlite_code", "fatal", "http_status", "retry_after", "component", "source", "job_id", "state", "pid", "method", "description",
+		"age_min", "age_max", "interval_seconds", "daily_cap", "series_count", "super_before_age", "sent", "next_attempt", "reaction_type", "action_id", "mutual":
 	default:
 		return
 	}
