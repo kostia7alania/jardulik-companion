@@ -188,7 +188,7 @@ func (s *Service) syncRefreshOne(ctx context.Context, c SyncCycle, ss Session, n
 		return false, err
 	}
 	if !pending {
-		return true, s.Store.syncCycleTransition(ctx, c, "draining", "", now)
+		return s.Store.finishSyncCollection(ctx, c, now)
 	}
 	if s.foregroundPending() {
 		return false, nil
@@ -256,6 +256,35 @@ func (s *Service) syncRefreshOne(ctx context.Context, c SyncCycle, ss Session, n
 		return true, fmt.Errorf("sync refresh cursor changed")
 	}
 	return true, tx.Commit()
+}
+
+// Close the source and pin its publication bounds in the same writer transaction.
+func (s *Store) finishSyncCollection(ctx context.Context, c SyncCycle, now time.Time) (bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='sync_cycle_writer'"); err != nil {
+		return false, err
+	}
+	if err = syncCycleBindingTx(ctx, tx, s, c); err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE sync_cycles SET stage='draining',reason='',updated_at_ms=?,collected_at_ms=?,
+ collected_version_id=(SELECT COALESCE(MAX(v.id),0) FROM versions v WHERE v.owner_id=sync_cycles.owner_id),
+ collected_presence_event_id=(SELECT COALESCE(MAX(e.id),0) FROM profile_presence_events e WHERE e.owner_id=sync_cycles.owner_id)
+ WHERE id=? AND owner_id=? AND upstream_id=? AND generation=? AND stage='refresh' AND collected_at_ms=0
+ AND NOT EXISTS(SELECT 1 FROM sync_refresh_items r WHERE r.cycle_id=sync_cycles.id AND r.state NOT IN ('available','unavailable'))`,
+		now.UnixMilli(), now.UnixMilli(), c.ID, c.OwnerID, c.UserID, c.Generation)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return count == 1, tx.Commit()
 }
 
 // Failed reads remain pending, with a longer retry delay so one broken ID cannot starve the sweep.

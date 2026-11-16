@@ -282,3 +282,105 @@ func TestPausedPosterRoleDoesNotScheduleCaptionEdits(t *testing.T) {
 		}
 	}
 }
+
+func TestBotParserCollectsWhileTelegramSetupIsUnavailable(t *testing.T) {
+	f := newPresenceFixture(t)
+	presenceObserve(t, f, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	c := f.watch.Config
+	c.Token = "fixture"
+	c.ArchivePaused = true
+	// A failed auxiliary listener must not prevent starting collection.
+	c.DebugListen = "0.0.0.0:0"
+	s := &Service{Config: c, Store: f.store, Client: f.watch.Client, TG: f.watch.Archiver.TG, Archiver: f.watch.Archiver, Watcher: f.watch}
+	s.Media = NewMediaManager(f.store, c)
+	s.Crawler = NewFeedCrawler(s)
+	s.Autoliker = NewAutoliker(s)
+	if err := s.Store.SetMeta(ctx, "private_card_repair", "processing"); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	setupCalled, sourceCalled := make(chan struct{}), make(chan struct{})
+	var setup, observed sync.Once
+	var unexpected atomic.Int64
+	s.TG.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if filepath.Base(r.URL.Path) != "getMe" {
+			unexpected.Add(1)
+		}
+		setup.Do(func() { close(setupCalled) })
+		return nil, errors.New("fixture: Telegram unreachable")
+	})
+	f.respond = func(_ *http.Request, id int64) (*http.Response, error) {
+		observed.Do(func() { close(sourceCalled) })
+		return watchResponse(http.StatusOK, watchProfile(id)), nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.RunBotParser(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("bot setup/collection did not stop")
+		}
+	}()
+	runtimeAwait(t, setupCalled)
+	runtimeAwait(t, sourceCalled)
+	if unexpected.Load() != 0 || s.Store.Meta(ctx, "private_card_repair") != "processing" {
+		t.Fatal("Telegram-dependent work started before bot setup")
+	}
+}
+
+func TestBotParserDailySearchCheckpointsWhileTelegramIsUnavailable(t *testing.T) {
+	s, _ := syncFixture(t)
+	s.Config.Token = "fixture"
+	s.TG.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if filepath.Base(r.URL.Path) != "getMe" {
+			t.Errorf("unexpected Telegram operation during setup: %s", filepath.Base(r.URL.Path))
+		}
+		return nil, errors.New("fixture: Telegram unreachable")
+	})
+	s.Client.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user/getMe":
+			_, _ = w.Write([]byte(`{"userId":101,"type":1}`))
+		case "/user/getUsers":
+			_, _ = w.Write([]byte(`[{"userId":90,"name":"fixture"}]`))
+		default:
+			t.Errorf("unexpected source operation: %s", r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.RunBotParser(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("bot and daily collector did not stop")
+		}
+	}()
+	deadline := time.NewTimer(4 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			t.Fatal("daily search did not save the next page")
+		case <-tick.C:
+			j, err := s.Store.CrawlStatus(ctx, 1)
+			if err == nil && j != nil && j.Page == 2 && j.Pages == 1 {
+				return
+			}
+		}
+	}
+}

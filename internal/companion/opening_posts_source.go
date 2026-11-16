@@ -62,7 +62,16 @@ func openingPolicyTx(ctx context.Context, tx *sql.Tx, owner int64) (ReactionMess
 	if !present {
 		return ReactionMessagePolicy{OwnerID: owner, Mode: "off"}, nil
 	}
-	return scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,super_before_age,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	columns := reactionMessagePolicyColumns
+	var hasOrdinaryWhenNoFire bool
+	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('reaction_message_settings') WHERE name='ordinary_when_no_fire')").Scan(&hasOrdinaryWhenNoFire); err != nil {
+		return ReactionMessagePolicy{}, err
+	}
+	if !hasOrdinaryWhenNoFire {
+		// The poster can read an existing database before the sender migrates it.
+		columns = strings.Replace(columns, "ordinary_when_no_fire", "0", 1)
+	}
+	return scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT "+columns+" FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 }
 
 func openingProfileTx(ctx context.Context, tx *sql.Tx, owner, id int64) (Profile, bool, error) {

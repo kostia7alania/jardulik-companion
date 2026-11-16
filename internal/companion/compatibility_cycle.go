@@ -82,12 +82,18 @@ func (s *Service) PlanSyncCompatibility(ctx context.Context, cycle SyncCycle, fi
 	if err := s.Store.InitCompatibility(ctx); err != nil {
 		return false, err
 	}
-	current, err := s.Store.SyncCycle(ctx, cycle.OwnerID)
+	current, err := scanSyncCycle(s.Store.DB.QueryRowContext(ctx, "SELECT "+syncCycleColumns+" FROM sync_cycles WHERE id=? AND owner_id=?", cycle.ID, cycle.OwnerID))
 	if err != nil {
 		return false, err
 	}
 	if current == nil || current.ID != cycle.ID || current.UserID != cycle.UserID || current.Generation != cycle.Generation || (current.Stage != "search" && current.Stage != "refresh" && current.Stage != "draining") {
 		return false, ErrCompatibilityUnavailable
+	}
+	if current.Stage != "draining" {
+		pending, err := s.compatibilityHasEarlierPublication(ctx, *current)
+		if err != nil || pending {
+			return false, err
+		}
 	}
 	session, err := s.Store.Session(ctx, cycle.OwnerID)
 	if err != nil {
@@ -124,9 +130,9 @@ func (s *Service) PlanSyncCompatibility(ctx context.Context, cycle SyncCycle, fi
 		}
 		defer tx.Rollback()
 		_, e = tx.ExecContext(ctx, `INSERT INTO compatibility_cycle_targets(cycle_id,profile_id,final_member,updated_at_ms)
- SELECT ?,q.profile_id,1,? FROM queue q JOIN sync_refresh_items r ON r.profile_id=q.profile_id AND r.cycle_id=?
- WHERE q.owner_id=? AND r.state IN ('available','unavailable')
- ON CONFLICT(cycle_id,profile_id) DO UPDATE SET final_member=1`, cycle.ID, now.UnixMilli(), cycle.ID, cycle.OwnerID)
+ SELECT ?,r.profile_id,1,? FROM sync_refresh_items r
+ WHERE r.cycle_id=? AND r.state IN ('available','unavailable')
+ ON CONFLICT(cycle_id,profile_id) DO UPDATE SET final_member=1`, cycle.ID, now.UnixMilli(), cycle.ID)
 		if e == nil {
 			_, e = tx.ExecContext(ctx, `UPDATE compatibility_cycle_scans SET final_pass=1,sealed=0,last_profile_id=0,next_plan_ms=0 WHERE cycle_id=?`, cycle.ID)
 		}
@@ -137,6 +143,11 @@ func (s *Service) PlanSyncCompatibility(ctx context.Context, cycle SyncCycle, fi
 			return false, e
 		}
 		cursor, next, finalPass, sealed = 0, 0, true, false
+	}
+	if finalPass {
+		if err = s.excludeStaleCompatibilitySnapshot(ctx, *current, now); err != nil {
+			return false, err
+		}
 	}
 	if next > now.UnixMilli() {
 		return s.syncCompatibilityReady(ctx, cycle.ID, finalPass, sealed)
@@ -149,7 +160,10 @@ func (s *Service) PlanSyncCompatibility(ctx context.Context, cycle SyncCycle, fi
 		args = append(args, cycle.ID)
 	}
 	if finalPass {
-		query += ` AND EXISTS(SELECT 1 FROM compatibility_cycle_targets ct WHERE ct.cycle_id=? AND ct.profile_id=q.profile_id AND ct.final_member=1`
+		query += ` AND EXISTS(SELECT 1 FROM compatibility_cycle_targets ct
+ JOIN sync_refresh_items r ON r.cycle_id=ct.cycle_id AND r.profile_id=ct.profile_id
+ WHERE ct.cycle_id=? AND ct.profile_id=q.profile_id AND ct.final_member=1
+ AND r.state='available' AND r.version_id=q.version_id`
 		args = append(args, cycle.ID)
 		if sealed {
 			query += ` AND ct.state='pending'`
@@ -195,6 +209,31 @@ func (s *Service) PlanSyncCompatibility(ctx context.Context, cycle SyncCycle, fi
 		return false, err
 	}
 	return s.syncCompatibilityReady(ctx, cycle.ID, finalPass, sealed)
+}
+
+func (s *Service) compatibilityHasEarlierPublication(ctx context.Context, cycle SyncCycle) (bool, error) {
+	var earlier bool
+	err := s.Store.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_cycles
+ WHERE owner_id=? AND stage IN ('draining','publishing') AND (started_at_ms,id)<(?,?))`,
+		cycle.OwnerID, cycle.StartedAt, cycle.ID).Scan(&earlier)
+	return earlier, err
+}
+
+func (s *Service) excludeStaleCompatibilitySnapshot(ctx context.Context, cycle SyncCycle, now time.Time) error {
+	_, err := s.Store.DB.ExecContext(ctx, `UPDATE compatibility_cycle_targets AS ct
+ SET version_id=r.version_id,
+ state=CASE WHEN r.state='unavailable' THEN 'unavailable' ELSE 'excluded' END,
+ reason=CASE WHEN r.state='unavailable' THEN 'target_unavailable' ELSE 'snapshot_version_changed' END,
+ updated_at_ms=?
+ FROM sync_refresh_items r
+ WHERE ct.cycle_id=? AND ct.final_member=1 AND r.cycle_id=ct.cycle_id AND r.profile_id=ct.profile_id
+ AND (r.state='unavailable' OR ct.state NOT IN ('succeeded','unknown','rejected') OR ct.version_id<>r.version_id)
+ AND (r.state='unavailable' OR NOT EXISTS(SELECT 1 FROM queue q WHERE q.owner_id=? AND q.profile_id=r.profile_id AND q.version_id=r.version_id))
+ AND (ct.version_id<>r.version_id OR
+ CASE WHEN r.state='unavailable' THEN ct.state<>'unavailable' OR ct.reason<>'target_unavailable'
+ ELSE ct.state<>'excluded' OR ct.reason<>'snapshot_version_changed' END)`,
+		now.UnixMilli(), cycle.ID, cycle.OwnerID)
+	return err
 }
 
 func (s *Service) syncCompatibilityReady(ctx context.Context, cycleID string, final, sealed bool) (bool, error) {

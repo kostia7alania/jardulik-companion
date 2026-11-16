@@ -85,6 +85,102 @@ func TestSyncCycleAdoptsBroadRunAndRestartPreservesCursor(t *testing.T) {
 	}
 }
 
+func TestSyncCycleStartsNextCollectionWhilePublicationIsBusy(t *testing.T) {
+	s, now := syncFixture(t)
+	ctx := context.Background()
+	if started, err := s.startSyncCycle(ctx, 1, *now); err != nil || !started {
+		t.Fatalf("initial collection: started=%t err=%v", started, err)
+	}
+	first := syncStatus(t, s)
+	ids := syncFinishSearch(t, s, first, *now, Profile{"userId": 7, "age": 30})
+	if _, err := s.SyncCycleStep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SyncCycleStep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	collected := syncStatus(t, s)
+	if collected.Stage != "draining" || collected.CollectedAt != now.UnixMilli() ||
+		collected.CollectedVersionID != ids[0] || collected.CollectedPresenceEventID != 0 {
+		t.Fatalf("source cutoff not committed: %+v", collected)
+	}
+	if started, err := s.startSyncCycle(ctx, 1, time.UnixMilli(first.NextCycle-1)); err != nil || started {
+		t.Fatalf("started too early: started=%t err=%v", started, err)
+	}
+	held, locked, err := s.Store.trySyncPublicationLock()
+	if err != nil || !locked {
+		t.Fatalf("publication lock: locked=%t err=%v", locked, err)
+	}
+	defer held()
+	*now = time.UnixMilli(first.NextCycle)
+	if started, err := s.startSyncCycle(ctx, 1, *now); err != nil || !started {
+		t.Fatalf("due collection waited for publication: started=%t err=%v", started, err)
+	}
+	second := syncStatus(t, s)
+	if second.ID == first.ID || second.SearchRunID == first.SearchRunID || second.Stage != "search" || second.CollectedAt != 0 {
+		t.Fatalf("next source cycle not isolated: %+v", second)
+	}
+	if _, err := s.Store.ArchiveViewed(ctx, 1, []Profile{{"userId": 7, "age": 30, "name": "next version"}}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	prior, err := scanSyncCycle(s.Store.DB.QueryRow("SELECT "+syncCycleColumns+" FROM sync_cycles WHERE id=?", first.ID))
+	if err != nil || prior == nil || !reflect.DeepEqual(*prior, collected) {
+		t.Fatalf("older cycle changed: %+v err=%v", prior, err)
+	}
+	if started, err := s.startSyncCycle(ctx, 1, now.Add(48*time.Hour)); err != nil || started {
+		t.Fatalf("duplicate active source cycle: started=%t err=%v", started, err)
+	}
+}
+
+func TestSyncCycleCollectionMigrationKeepsBlockedSourcesAndBackfillsCutoffs(t *testing.T) {
+	s, now := syncFixture(t)
+	ctx := context.Background()
+	db := s.Store.DB
+	if _, err := db.Exec(`DROP INDEX sync_cycle_active_owner;
+ ALTER TABLE sync_cycles DROP COLUMN collected_at_ms;
+ ALTER TABLE sync_cycles DROP COLUMN collected_version_id;
+ ALTER TABLE sync_cycles DROP COLUMN collected_presence_event_id;
+ CREATE UNIQUE INDEX sync_cycle_active_owner ON sync_cycles(owner_id) WHERE stage NOT IN ('complete','superseded');`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.User(ctx, 2, "other fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.SaveSession(ctx, 2, Session{Token: "test", Refresh: "test", UserID: 102, Generation: "new-source-two"}); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := s.Store.ArchiveViewed(ctx, 1, []Profile{{"userId": 7, "age": 30}}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := now.UnixMilli()
+	if _, err = db.Exec(`INSERT INTO sync_cycles(id,owner_id,upstream_id,generation,stage,search_run_id,started_at_ms,updated_at_ms,next_cycle_ms)
+ VALUES('prepared',1,101,'source-one','draining','first',?,?,?),
+ ('blocked',2,102,'source-two','blocked','second',?,?,?)`,
+		at, at, at, at, at, at); err != nil {
+		t.Fatal(err)
+	}
+	if c := syncStatus(t, s); c.ID != "prepared" || c.CollectedAt != 0 {
+		t.Fatalf("read-only legacy status failed: %+v", c)
+	}
+	for i := 0; i < 2; i++ {
+		if err = s.Store.InitSyncCycles(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prepared := syncStatus(t, s)
+	if prepared.Stage != "draining" || prepared.CollectedAt != at || prepared.CollectedVersionID != ids[0] {
+		t.Fatalf("prepared collection migration: %+v", prepared)
+	}
+	blocked, err := s.Store.SyncCycle(ctx, 2)
+	if err != nil || blocked == nil || blocked.CollectedAt != 0 || blocked.Stage != "blocked" {
+		t.Fatalf("blocked source migration: %+v err=%v", blocked, err)
+	}
+	if started, err := s.startSyncCycle(ctx, 2, now.Add(48*time.Hour)); err != nil || started {
+		t.Fatalf("legacy blocked source restarted: started=%t err=%v", started, err)
+	}
+}
+
 func TestSyncCycleHardPauseAndSourceSwitchNeverRestart(t *testing.T) {
 	for _, kind := range []string{"hard_pause", "user_pause", "generation", "upstream"} {
 		t.Run(kind, func(t *testing.T) {
@@ -200,6 +296,55 @@ func TestSyncCycleFiniteRefreshReusesAcceptedFullHydrations(t *testing.T) {
 	var version int64
 	if err := s.Store.DB.QueryRow("SELECT version_id FROM sync_refresh_items WHERE cycle_id=? AND profile_id=7", c.ID).Scan(&version); err != nil || version != ids[0] {
 		t.Fatal("hydration version not pinned")
+	}
+}
+
+func TestSyncCycleCollectionContinuesWhenCompatibilityPlanningFails(t *testing.T) {
+	s, now := syncFixture(t)
+	ctx := context.Background()
+	s.Config.CompatibilityEnabled = true
+	if err := s.Store.SaveAccount(ctx, 1, Profile{"userId": 101, "age": 30, "freezeState": false}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.InitCompatibility(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Store.DB.Exec(`CREATE TRIGGER fail_compatibility_plan BEFORE INSERT ON compatibility_cycle_scans
+ BEGIN SELECT RAISE(ABORT,'fixture compatibility planner unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.startSyncCycle(ctx, 1, *now); err != nil {
+		t.Fatal(err)
+	}
+	cycle := syncStatus(t, s)
+	if _, err := s.Store.ArchiveViewed(ctx, 1, []Profile{{"userId": 7, "age": 30}}, "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	syncFinishSearch(t, s, cycle, *now)
+	if worked, err := s.SyncCycleStep(ctx); err != nil || !worked || syncStatus(t, s).Stage != "refresh" {
+		t.Fatalf("source search did not checkpoint: worked=%t err=%v", worked, err)
+	}
+
+	calls := 0
+	s.Client.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/user/getUser" || r.URL.Query().Get("targetUserId") != "7" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		calls++
+		_ = json.NewEncoder(w).Encode(Profile{"userId": 7, "age": 30, "name": "updated"})
+	})}
+	if worked, err := s.SyncCycleStep(ctx); err != nil || !worked || calls != 1 {
+		t.Fatalf("source refresh did not run: worked=%t calls=%d err=%v", worked, calls, err)
+	}
+	var state string
+	if err := s.Store.DB.QueryRow(`SELECT state FROM sync_refresh_items WHERE cycle_id=? AND profile_id=7`, cycle.ID).Scan(&state); err != nil || state != "available" {
+		t.Fatalf("source refresh not saved: state=%s err=%v", state, err)
+	}
+	if worked, err := s.SyncCycleStep(ctx); err != nil || !worked || syncStatus(t, s).Stage != "draining" {
+		t.Fatalf("source refresh did not finish: worked=%t err=%v", worked, err)
+	}
+	if worked, err := s.SyncCycleStep(ctx); err == nil || worked || syncStatus(t, s).Stage != "draining" || calls != 1 {
+		t.Fatalf("final compatibility gate bypassed: worked=%t calls=%d err=%v", worked, calls, err)
 	}
 }
 
@@ -519,26 +664,16 @@ func TestSyncCycleIncludesAllConnectedUnpausedOwners(t *testing.T) {
 	}
 }
 
-func TestSyncCycleStartWaitsForCrossProcessPublicationLock(t *testing.T) {
+func TestSyncCycleFirstCollectionDoesNotWaitForCrossProcessPublicationLock(t *testing.T) {
 	s, now := syncFixture(t)
 	ctx := context.Background()
 	unlock, acquired, err := s.Store.trySyncPublicationLock()
 	if err != nil || !acquired {
 		t.Fatalf("lock %v %v", acquired, err)
 	}
-	held := true
-	defer func() {
-		if held {
-			unlock()
-		}
-	}()
-	if started, err := s.startSyncCycle(ctx, 1, *now); err != nil || started {
-		t.Fatalf("cycle crossed in-flight send %v %v", started, err)
-	}
-	unlock()
-	held = false
+	defer unlock()
 	if started, err := s.startSyncCycle(ctx, 1, *now); err != nil || !started {
-		t.Fatalf("cycle failed after confirmed send %v %v", started, err)
+		t.Fatalf("first collection waited on in-flight send %v %v", started, err)
 	}
 }
 

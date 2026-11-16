@@ -105,3 +105,44 @@ func TestPositiveSuperModesSettingsDoNotStartOrExpandFilters(t *testing.T) {
 		t.Fatal("changing modes performed source HTTP")
 	}
 }
+
+func TestPositiveSuperFirstModeRequiresExplicitChoiceAndDoesNotStart(t *testing.T) {
+	f, menus := settingsUXFixture(t)
+	s := f.worker.Service
+	ctx := context.Background()
+	if _, err := s.Store.ConfigureReactionMessagePolicy(ctx, 1, ReactionMessagePolicyConfig{
+		Mode: "first", Templates: []string{"Привет!"}, SuperBeforeAge: 23,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.showSettings(ctx, 1, 0, "reactions", ""); err != nil {
+		t.Fatal(err)
+	}
+	defaultMenu := (*menus)[len(*menus)-1]
+	chooseFirst := settingsUXAction(t, defaultMenu, "first")
+	policy, err := s.Store.ReactionMessagePolicy(ctx, 1)
+	if err != nil || policy.OrdinaryWhenNoFire {
+		t.Fatalf("fallback must start disabled: policy=%+v err=%v", policy, err)
+	}
+	if _, err = s.HandleSettingsCallback(ctx, 1, chooseFirst); err != nil {
+		t.Fatal(err)
+	}
+	enabledMenu := (*menus)[len(*menus)-1]
+	policy, err = s.Store.ReactionMessagePolicy(ctx, 1)
+	if err != nil || !policy.OrdinaryWhenNoFire || policy.SuperBeforeAge != 23 ||
+		!strings.Contains(enabledMenu.Text, "При подтверждённом нуле Огня") {
+		t.Fatalf("explicit mode not reflected in policy and menu: policy=%+v err=%v", policy, err)
+	}
+	if _, err = s.HandleSettingsCallback(ctx, 1, settingsUXAction(t, enabledMenu, "super:23")); err != nil {
+		t.Fatal(err)
+	}
+	policy, err = s.Store.ReactionMessagePolicy(ctx, 1)
+	if err != nil || policy.OrdinaryWhenNoFire || policy.SuperBeforeAge != 23 {
+		t.Fatalf("legacy mode must clear ordinary fallback: policy=%+v err=%v", policy, err)
+	}
+	job, err := f.worker.settings(ctx, 1)
+	if err != nil || job.Mode != "off" || len(f.requests) != 0 {
+		t.Fatalf("setting a strategy started source work: job=%+v err=%v", job, err)
+	}
+}

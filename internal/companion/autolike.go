@@ -595,6 +595,9 @@ func (a *Autoliker) Step(ctx context.Context) (bool, error) {
 	dispatchCtx := context.WithValue(ctx, automaticDispatchContextKey{}, automaticDispatchBinding{Owner: j.Owner, RunID: j.RunID, Generation: j.Generation, Upstream: j.UserID, FilterHash: j.FilterHash})
 	result, err := s.Client.AutomaticLikeGuarded(dispatchCtx, j.Owner, c.id, func(ctx context.Context) error { return a.guard(ctx, j) })
 	if err != nil {
+		if errors.Is(err, errPositiveAlreadyAttempted) {
+			return true, a.candidateState(ctx, j, c.id, "skipped")
+		}
 		var cap *OwnLikeLimitError
 		if errors.As(err, &cap) {
 			_ = a.candidateState(context.WithoutCancel(ctx), j, c.id, "pending")

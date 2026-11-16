@@ -65,9 +65,6 @@ func LoadConfig() (Config, error) {
 		}
 		c.SyncCycleEnabled = raw == "true"
 	}
-	if c.SyncCycleEnabled && !c.CompatibilityEnabled {
-		return c, errors.New("SYNC_CYCLE_ENABLED requires COMPATIBILITY_ENABLED=true")
-	}
 	c.RelationNoticesEnabled = os.Getenv("RELATION_NOTICES_ENABLED") == "true"
 	c.DebugListen = strings.TrimSpace(os.Getenv("JARDULIK_DEBUG_LISTEN"))
 	if c.DebugListen != "" {

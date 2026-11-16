@@ -686,6 +686,10 @@ func (s *Store) ClaimAction(ctx context.Context, owner, profile int64) (int64, e
 }
 
 func (s *Store) ClaimOwnerAction(ctx context.Context, owner, profile int64, now time.Time) (int64, error) {
+	return s.claimOwnerAction(ctx, owner, profile, now, false, 0)
+}
+
+func (s *Store) claimOwnerAction(ctx context.Context, owner, profile int64, now time.Time, automatic bool, upstream int64) (int64, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -696,6 +700,18 @@ func (s *Store) ClaimOwnerAction(ctx context.Context, owner, profile int64, now 
 	}
 	if err = s.checkReactionAction(ctx, tx, owner, profile, now); err != nil {
 		return 0, err
+	}
+	if automatic {
+		var firstOnly bool
+		err = tx.QueryRowContext(ctx, "SELECT ordinary_when_no_fire FROM reaction_message_settings WHERE owner_id=?", owner).Scan(&firstOnly)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return 0, err
+		}
+		if firstOnly {
+			if err = checkFirstPositiveAttempt(ctx, tx, owner, upstream, profile, 0); err != nil {
+				return 0, err
+			}
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE actions SET state='quota_retried' WHERE owner_id=? AND profile_id=? AND kind='Like'
  AND state='quota_waiting' AND retry_at>0 AND retry_at<=?`, owner, profile, now.Unix()); err != nil {

@@ -47,6 +47,75 @@ func positiveReactionForAge(age int64, cutoff int) PositiveReactionType {
 	return PositiveLike
 }
 
+type reactionFireObservationKey struct{}
+
+type reactionFireObservation struct {
+	upstream int64
+	balance  int64
+	known    bool
+}
+
+func positiveFireBalanceTx(ctx context.Context, tx *sql.Tx, owner, upstream int64) (int64, error) {
+	var raw string
+	if err := tx.QueryRowContext(ctx, "SELECT account_json FROM sessions WHERE owner_id=?", owner).Scan(&raw); err != nil {
+		return 0, err
+	}
+	account, err := decodeProfile([]byte(raw))
+	if err != nil || account.ID() != upstream {
+		return 0, ErrReactionSessionChanged
+	}
+	fire, known := autoInteger(account["fire"])
+	if !known || fire < 0 {
+		return 0, ErrReactionFireUnknown
+	}
+	return fire, nil
+}
+
+// Only a successful, fresh getMe with an explicit zero balance permits ordinary
+// for a Super candidate. The final transaction rechecks the same observation.
+func automaticPositiveKindTx(ctx context.Context, tx *sql.Tx, owner, upstream, age int64, policy ReactionMessagePolicy) (PositiveReactionType, error) {
+	kind := positiveReactionForAge(age, policy.SuperBeforeAge)
+	if !policy.OrdinaryWhenNoFire || kind != PositiveSuperLike {
+		return kind, nil
+	}
+	observed, ok := ctx.Value(reactionFireObservationKey{}).(reactionFireObservation)
+	if !ok || observed.upstream != upstream || !observed.known || observed.balance < 0 {
+		return kind, ErrReactionFireUnknown
+	}
+	fire, err := positiveFireBalanceTx(ctx, tx, owner, upstream)
+	if err != nil {
+		return kind, err
+	}
+	if (observed.balance == 0) != (fire == 0) {
+		return kind, ErrReactionFireUnknown
+	}
+	if fire == 0 {
+		return PositiveLike, nil
+	}
+	return kind, nil
+}
+
+var errPositiveAlreadyAttempted = errors.New("по анкете уже была попытка отправки реакции")
+
+func checkFirstPositiveAttempt(ctx context.Context, tx *sql.Tx, owner, upstream, target, action int64) error {
+	var attempted bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+  SELECT 1 FROM actions a LEFT JOIN reaction_message_intents i ON i.action_id=a.id
+  WHERE a.owner_id=? AND a.profile_id=? AND a.id<>? AND a.kind='Like'
+    AND (i.attempted_at_ms>0 OR a.state IN ('succeeded','unknown','rejected','quota_waiting','quota_retried','fire_waiting'))
+  UNION ALL
+  SELECT 1 FROM debug_api_calls WHERE owner_id=? AND upstream_id=? AND target_id=?
+    AND path='/reactions/addNew' AND reaction_type IN (1,3) AND state IN ('sending','received','unknown','rejected')
+ )`, owner, target, action, owner, upstream, target).Scan(&attempted)
+	if err != nil {
+		return err
+	}
+	if attempted {
+		return errPositiveAlreadyAttempted
+	}
+	return nil
+}
+
 func (s *Store) checkDebugPositive(ctx context.Context, q reactionQuerier, owner, target int64) error {
 	var state string
 	err := q.QueryRowContext(ctx, `SELECT d.state FROM debug_api_calls d JOIN sessions s ON s.owner_id=d.owner_id AND s.upstream_id=d.upstream_id WHERE d.owner_id=? AND d.target_id=? AND d.path='/reactions/addNew' AND d.reaction_type=3 AND d.state IN ('sending','received','unknown') AND d.id<>? ORDER BY d.id DESC LIMIT 1`, owner, target, claimedPositiveAuditID(ctx)).Scan(&state)
@@ -149,7 +218,11 @@ func (s *Store) checkPositiveBudgetRows(ctx context.Context, q reactionQuerier, 
 
 // Only the automatic type changes; message source text and its cursor stay intact.
 func (s *Store) SetSuperBeforeAge(ctx context.Context, owner int64, cutoff int) error {
-	if !validSuperBeforeAge(cutoff) {
+	return s.setAutomaticReactionRule(ctx, owner, cutoff, false)
+}
+
+func (s *Store) setAutomaticReactionRule(ctx context.Context, owner int64, cutoff int, ordinaryWhenNoFire bool) error {
+	if !validSuperBeforeAge(cutoff) || ordinaryWhenNoFire && cutoff != 23 {
 		return errors.New("правило суперлайков: 0 или возраст от 18 до 112")
 	}
 	if err := s.initReactionMessages(ctx); err != nil {
@@ -163,17 +236,17 @@ func (s *Store) SetSuperBeforeAge(ctx context.Context, owner int64, cutoff int) 
 	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='reaction_message_settings'"); err != nil {
 		return err
 	}
-	p, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,super_before_age,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	p, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT "+reactionMessagePolicyColumns+" FROM reaction_message_settings WHERE owner_id=?", owner), owner)
 	if err != nil {
 		return err
 	}
 	if cutoff != 0 && p.Mode == "off" {
 		return errors.New("сначала настрой сообщения для суперлайков")
 	}
-	if p.SuperBeforeAge == cutoff {
+	if p.SuperBeforeAge == cutoff && p.OrdinaryWhenNoFire == ordinaryWhenNoFire {
 		return tx.Commit()
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE reaction_message_settings SET super_before_age=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE owner_id=?", cutoff, owner); err != nil {
+	if _, err = tx.ExecContext(ctx, "UPDATE reaction_message_settings SET super_before_age=?,ordinary_when_no_fire=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE owner_id=?", cutoff, ordinaryWhenNoFire, owner); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -228,30 +301,34 @@ func (s *Store) markPositiveAttempt(ctx context.Context, owner, action int64, ex
 	if err = tx.QueryRowContext(ctx, "SELECT reaction_type FROM reaction_message_intents WHERE action_id=? AND owner_id=?", action, owner).Scan(&kind); err != nil {
 		return err
 	}
-	if kind == PositiveSuperLike {
-		var raw string
-		if err = tx.QueryRowContext(ctx, "SELECT account_json FROM sessions WHERE owner_id=?", owner).Scan(&raw); err != nil {
+
+	policy, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT "+reactionMessagePolicyColumns+" FROM reaction_message_settings WHERE owner_id=?", owner), owner)
+	if err != nil {
+		return err
+	}
+	if kind == PositiveSuperLike && (!automatic || !policy.OrdinaryWhenNoFire) {
+		fire, err := positiveFireBalanceTx(ctx, tx, owner, expected.UserID)
+		if err != nil {
 			return err
-		}
-		own, e := decodeProfile([]byte(raw))
-		if e != nil || own.ID() != expected.UserID {
-			return ErrReactionSessionChanged
-		}
-		fire, known := autoInteger(own["fire"])
-		if !known || fire < 0 {
-			return ErrReactionFireUnknown
 		}
 		if fire == 0 {
 			return ErrReactionFireUnavailable
 		}
 	}
 
-	policy, err := scanReactionMessagePolicy(tx.QueryRowContext(ctx, "SELECT mode,templates_json,telegram_username,prefer_drafts,iron_mix,super_before_age,next_cursor,revision FROM reaction_message_settings WHERE owner_id=?", owner), owner)
-	if err != nil {
-		return err
-	}
-	if automatic && kind != positiveReactionForAge(age, policy.SuperBeforeAge) {
-		return errAutoChanged
+	if automatic {
+		selected, err := automaticPositiveKindTx(ctx, tx, owner, expected.UserID, age, policy)
+		if err != nil {
+			return err
+		}
+		if kind != selected {
+			return errAutoChanged
+		}
+		if policy.OrdinaryWhenNoFire {
+			if err = checkFirstPositiveAttempt(ctx, tx, owner, expected.UserID, target, action); err != nil {
+				return err
+			}
+		}
 	}
 	if err = reactionDraftHoldTx(ctx, tx, owner, expected.UserID, target); err != nil {
 		return err

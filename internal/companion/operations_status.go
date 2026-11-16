@@ -94,10 +94,34 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 			stage = cycle.Stage
 		}
 		line := "🔄 Цикл: " + stage
+		if cycle.Stage == "blocked" {
+			line = "🔴 Суточный цикл остановлен · " + displayTime(time.UnixMilli(cycle.UpdatedAt).UTC().Format(time.RFC3339))
+		}
 		if cycle.Reason != "" {
-			line += " · " + operationsStatusValue(cycle.Reason, 120)
+			reason := cycle.Reason
+			if reason == "search_incomplete" {
+				reason = "поиск и проверка выдачи не завершились"
+			}
+			line += " · " + operationsStatusValue(reason, 120)
 		}
 		lines = append(lines, line)
+		if cycle.Stage == "blocked" {
+			var completed int64
+			if err := s.Store.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated_at_ms),0) FROM sync_cycles WHERE owner_id=? AND upstream_id=? AND stage='complete'`, cycle.OwnerID, cycle.UserID).Scan(&completed); err != nil {
+				return "", err
+			}
+			if completed > 0 {
+				lines = append(lines, "Последний полный цикл: "+displayTime(time.UnixMilli(completed).UTC().Format(time.RFC3339)))
+			}
+		}
+		var downstream int
+		if err := s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_cycles
+ WHERE owner_id=? AND id<>? AND stage IN ('draining','publishing')`, cycle.OwnerID, cycle.ID).Scan(&downstream); err != nil {
+			return "", err
+		}
+		if downstream > 0 {
+			lines = append(lines, fmt.Sprintf("📦 Предыдущие циклы в обработке: %d", downstream))
+		}
 		for _, item := range []struct{ table, label, done string }{
 			{"sync_refresh_items", "🔎 Проверено", "available"},
 			{"compatibility_cycle_targets", "🧩 GPT", "succeeded"},
@@ -144,10 +168,27 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 		done := counts[item.done]
 		if item.table == "archive_versions" {
 			done += counts["duplicate"] + counts["partial"]
-		} else if item.table == "full_backup_jobs" {
-			done += counts["skipped"] + counts["superseded"]
 		}
 		line := fmt.Sprintf("%s: %d/%d", item.label, done, operationsCountTotal(counts))
+		if item.table == "full_backup_jobs" {
+			line = fmt.Sprintf("%s: отправлено %d · без изменений %d", item.label, done, counts["skipped"])
+			if n := counts["pending"] + counts["ready"]; n > 0 {
+				line += fmt.Sprintf(" · в очереди %d", n)
+			}
+			if n := counts["building"] + counts["sending"]; n > 0 {
+				line += fmt.Sprintf(" · в работе %d", n)
+			}
+			if n := counts["waiting_activation"] + counts["waiting_transport"]; n > 0 {
+				line += fmt.Sprintf(" · ждут настройки %d", n)
+			}
+			if done > 0 {
+				var deliveredAt string
+				if err := s.Store.DB.QueryRowContext(ctx, "SELECT updated_at FROM full_backup_jobs WHERE state='sent' ORDER BY updated_at DESC,id DESC LIMIT 1").Scan(&deliveredAt); err != nil {
+					return "", err
+				}
+				line += " · последний " + displayTime(deliveredAt)
+			}
+		}
 		if item.table == "archive_versions" && counts["partial"] > 0 {
 			line += fmt.Sprintf(" · частично %d", counts["partial"])
 		}

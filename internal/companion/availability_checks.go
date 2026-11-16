@@ -101,6 +101,13 @@ func (s *Service) queueCheckedCompatibility(ctx context.Context, owner int64, ex
 	if cycle.UserID != expected.UserID || cycle.Generation != expected.Generation || (cycle.Stage != "search" && cycle.Stage != "refresh" && cycle.Stage != "draining") {
 		return nil
 	}
+	if cycle.Stage == "draining" {
+		return nil
+	}
+	earlier, err := s.compatibilityHasEarlierPublication(ctx, *cycle)
+	if err != nil || earlier {
+		return err
+	}
 	if cycle.Stage != "search" {
 		var member bool
 		if err = s.Store.DB.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sync_refresh_items WHERE cycle_id=? AND profile_id=?)", cycle.ID, target.ID).Scan(&member); err != nil || !member {

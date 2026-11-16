@@ -27,6 +27,10 @@ func filterMenuUXFixture(t *testing.T) (*Service, *[]filterMenuUXRequest, *int64
 			t.Fatal(err)
 		}
 		request.Method = filepath.Base(r.URL.Path)
+		if request.Method == "answerCallbackQuery" {
+			fmt.Fprint(w, `{"ok":true,"result":true}`)
+			return
+		}
 		if request.Method != "sendMessage" && request.Method != "editMessageText" {
 			t.Fatalf("unexpected filter menu request: %s", request.Method)
 		}
@@ -63,7 +67,7 @@ func filterMenuUXOnlyEdits(t *testing.T, requests []filterMenuUXRequest, owner, 
 func TestFilterMenuUXGeographyAndApplyEditTheCheckedMessage(t *testing.T) {
 	s, requests, _, source := filterMenuUXFixture(t)
 	ctx := context.Background()
-	if err := s.OpenFiltersMessage(ctx, 1, 100); err != nil {
+	if err := s.openFiltersMessage(ctx, 1, 100, "settings"); err != nil {
 		t.Fatal(err)
 	}
 	// Stored IDs only continue a text picker; a private callback always supplies its actual target.
@@ -108,7 +112,7 @@ func TestFilterMenuUXCancelAndBackStopConsumingText(t *testing.T) {
 		t.Run(action, func(t *testing.T) {
 			s, requests, _, _ := filterMenuUXFixture(t)
 			ctx := context.Background()
-			if err := s.OpenFiltersMessage(ctx, 1, 100); err != nil {
+			if err := s.openFiltersMessage(ctx, 1, 100, "settings"); err != nil {
 				t.Fatal(err)
 			}
 			filterMenuUXTap(t, s, 1, 100, "edit:country")
@@ -247,5 +251,141 @@ func TestFeedFiltersValidationAllowsGlobal111WithoutChangingPersonalDefaults(t *
 	}
 	if f := DefaultFeedFilters(); f.AgeMin != 18 || f.AgeMax != 60 {
 		t.Fatal("global bound changed ordinary personal defaults")
+	}
+}
+
+func TestFilterMenuUXReturnsToOriginAndClosesInput(t *testing.T) {
+	for _, tc := range []struct {
+		name, origin, action, want string
+	}{
+		{"main back", "menu", "leave", "📋 Меню"},
+		{"main apply", "menu", "apply", "📋 Меню"},
+		{"settings cancel", "settings", "cancel", "Автолайкер:"},
+		{"legacy draft", "", "settings", "Автолайкер:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, requests, _, _ := filterMenuUXFixture(t)
+			ctx := context.Background()
+			if err := s.openFiltersMessage(ctx, 1, 100, tc.origin); err != nil {
+				t.Fatal(err)
+			}
+			filterMenuUXTap(t, s, 1, 100, "edit:age")
+			if !s.FilterText(ctx, 1, "18 25") {
+				t.Fatal("filter text was not accepted")
+			}
+			filterMenuUXTap(t, s, 1, 100, tc.action)
+			state, err := s.Store.filterState(ctx, 1)
+			if err != nil || state.Draft != nil || s.FilterText(ctx, 1, "18 21") {
+				t.Fatalf("exit left an active draft: %+v, %v", state, err)
+			}
+			if (state.Applied != nil) != (tc.action == "apply") {
+				t.Fatal("wrong applied state after exiting")
+			}
+			last := (*requests)[len(*requests)-1]
+			if !strings.HasPrefix(last.Text, tc.want) {
+				t.Fatalf("wrong return screen: %s", last.Text)
+			}
+			filterMenuUXOnlyEdits(t, *requests, 1, 100)
+		})
+	}
+}
+
+func TestFilterMenuUXMainMenuExitsPickerAndPreservesApplied(t *testing.T) {
+	for _, action := range []string{"menu", "/menu", keyboardMenu} {
+		t.Run(action, func(t *testing.T) {
+			s, requests, _, source := filterMenuUXFixture(t)
+			ctx := context.Background()
+			if err := s.OpenFiltersMessage(ctx, 1, 100); err != nil {
+				t.Fatal(err)
+			}
+			filterMenuUXTap(t, s, 1, 100, "edit:age")
+			s.FilterText(ctx, 1, "18 25")
+			filterMenuUXTap(t, s, 1, 100, "apply")
+			if err := s.OpenFiltersMessage(ctx, 1, 100); err != nil {
+				t.Fatal(err)
+			}
+			filterMenuUXTap(t, s, 1, 100, "edit:city")
+			before := len(*source)
+			msg := keyboardMessage(1, 101, action)
+			if action == "menu" {
+				msg.ID = 100
+				s.Handle(ctx, Update{Callback: &Callback{ID: "tap", From: msg.From, Message: msg, Data: action}})
+			} else {
+				s.Handle(ctx, Update{Message: &msg})
+			}
+			state, err := s.Store.filterState(ctx, 1)
+			if err != nil || state.Draft == nil || state.Draft.Input != "" || state.Applied == nil || state.Applied.AgeMin != 18 || state.Applied.AgeMax != 25 {
+				t.Fatalf("menu exit changed filters or left a picker: %+v, %v", state, err)
+			}
+			if s.FilterText(ctx, 1, "Москва") || len(*source) != before {
+				t.Fatal("menu exit left the old picker or made source requests")
+			}
+			last := (*requests)[len(*requests)-1]
+			if last.Text != "📋 Меню" {
+				t.Fatalf("menu did not render: %+v", last)
+			}
+			if action == "menu" {
+				filterMenuUXOnlyEdits(t, []filterMenuUXRequest{last}, 1, 100)
+			} else if last.Method != "sendMessage" {
+				t.Fatalf("wrong menu method: %s", last.Method)
+			}
+		})
+	}
+}
+
+func TestFilterMenuUXOldScreenDoesNotTakeOverCurrentDraft(t *testing.T) {
+	s, requests, _, source := filterMenuUXFixture(t)
+	ctx := context.Background()
+	if err := s.OpenFiltersMessage(ctx, 1, 100); err != nil {
+		t.Fatal(err)
+	}
+	old, err := s.Store.filterState(ctx, 1)
+	if err != nil || old.Draft == nil {
+		t.Fatalf("missing old draft: %+v, %v", old, err)
+	}
+	if err := s.openFiltersMessage(ctx, 1, 101, "settings"); err != nil {
+		t.Fatal(err)
+	}
+	filterMenuUXTap(t, s, 1, 101, "edit:age")
+	before := len(*source)
+	s.FilterMessageCallback(ctx, 1, 100, "flt:"+old.Draft.ID+":settings")
+	current, err := s.Store.filterState(ctx, 1)
+	if err != nil || current.Draft == nil || current.Draft.MessageID != 101 || current.Draft.Input != "age" || current.Draft.ReturnTo != "settings" || len(*source) != before {
+		t.Fatalf("stale callback mutated current draft: %+v, %v", current, err)
+	}
+	last := (*requests)[len(*requests)-1]
+	if last.MessageID != 100 || !strings.Contains(last.Text, "устарела") {
+		t.Fatalf("stale callback did not explain the result: %+v", last)
+	}
+}
+
+func TestFilterMenuUXSettingsAndUnavailableCardHaveWayOut(t *testing.T) {
+	s, requests, _, source := filterMenuUXFixture(t)
+	ctx := context.Background()
+	tap := func(data string) {
+		msg := keyboardMessage(1, 100, "")
+		s.Handle(ctx, Update{Callback: &Callback{ID: "tap", From: msg.From, Message: msg, Data: data}})
+	}
+	tap("settings")
+	last := (*requests)[len(*requests)-1]
+	found := false
+	for _, row := range last.Markup.Rows {
+		for _, button := range row {
+			if button.Data == "menu" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("settings has no main-menu button")
+	}
+	tap("menu")
+	filterMenuUXOnlyEdits(t, *requests, 1, 100)
+	if last = (*requests)[len(*requests)-1]; last.Text != "📋 Меню" {
+		t.Fatalf("settings back = %q", last.Text)
+	}
+	tap("p:999")
+	if last = (*requests)[len(*requests)-1]; last.Text != "Анкета недоступна." || len(*source) != 0 {
+		t.Fatalf("unavailable profile = %q, upstream calls = %d", last.Text, len(*source))
 	}
 }

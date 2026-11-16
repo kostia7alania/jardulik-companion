@@ -739,6 +739,10 @@ func (c *Client) positiveGuarded(ctx context.Context, owner, id int64, kind Posi
 			return out, ErrAccountFrozen
 		}
 	}
+	if automatic {
+		fire, known := autoInteger(account["fire"])
+		ctx = context.WithValue(ctx, reactionFireObservationKey{}, reactionFireObservation{upstream: account.ID(), balance: fire, known: known})
+	}
 	// Refresh is allowed for this read-only preflight, never as a replay of POST.
 	if _, err = c.token(ctx, owner, ""); err != nil {
 		return out, err
@@ -764,7 +768,7 @@ func (c *Client) positiveGuarded(ctx context.Context, owner, id int64, kind Posi
 			return out, err
 		}
 	}
-	action, err := c.Store.ClaimOwnerAction(ctx, owner, id, c.Now())
+	action, err := c.Store.claimOwnerAction(ctx, owner, id, c.Now(), automatic, initial.UserID)
 	if err != nil {
 		return out, err
 	}

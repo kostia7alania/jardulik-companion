@@ -85,15 +85,27 @@ func (s *Service) showSettings(ctx context.Context, owner, messageID int64, pane
 			rows = append(rows, []map[string]string{choice(settingsLikeCount(j.Count), "count", j.Count, j.Count)})
 		}
 	case "reactions":
-		text += "\n\nРежим авто: " + positiveRuleLabel(policy.SuperBeforeAge) + "\nТолько по текущим фильтрам."
-		if policy.SuperBeforeAge != 0 {
+		text += "\n\nРежим авто: " + automaticReactionRuleLabel(policy) + "\nТолько по текущим фильтрам."
+		if policy.OrdinaryWhenNoFire {
+			text += "\nПри подтверждённом нуле Огня: ❤️ обычный лайк с сообщением. Интервал от 60 с."
+		} else if policy.SuperBeforeAge != 0 {
 			text += "\nПри отсутствии Огня отправка останавливается. Интервал от 60 с."
 		}
 		conditional := policy.SuperBeforeAge
 		if conditional == 0 || conditional == 112 {
 			conditional = 23
 		}
-		rows = [][]map[string]string{{choice("❤️ Простые", "super", 0, policy.SuperBeforeAge), choice("🔥 Супер", "super", 112, policy.SuperBeforeAge)}, {choice("⚙️ По возрасту", "super", conditional, policy.SuperBeforeAge)}}
+		selected := policy.SuperBeforeAge
+		firstLabel := "🔥 По возрасту, при 0 Огня ❤️"
+		if policy.OrdinaryWhenNoFire {
+			selected = -1
+			firstLabel = "✅ " + firstLabel
+		}
+		rows = [][]map[string]string{
+			{choice("❤️ Простые", "super", 0, selected), choice("🔥 Супер", "super", 112, selected)},
+			{choice("⚙️ По возрасту", "super", conditional, selected)},
+			{b(firstLabel, "first")},
+		}
 		if policy.SuperBeforeAge > 0 && policy.SuperBeforeAge < 112 {
 			lower, upper := policy.SuperBeforeAge-1, policy.SuperBeforeAge+1
 			if lower < 18 {
@@ -104,7 +116,7 @@ func (s *Service) showSettings(ctx context.Context, owner, messageID int64, pane
 			}
 			rows = append(rows, []map[string]string{b("−1 год", "super:"+strconv.Itoa(lower)), b("+1 год", "super:"+strconv.Itoa(upper))})
 		}
-		rows = append(rows, []map[string]string{choice("18–22: 🔥", "super", 23, policy.SuperBeforeAge), choice("18–26: 🔥", "super", 27, policy.SuperBeforeAge)})
+		rows = append(rows, []map[string]string{choice("18–22: 🔥", "super", 23, selected), choice("18–26: 🔥", "super", 27, selected)})
 	case "cap":
 		text += fmt.Sprintf("\n\nМой лимит: %s /24ч\nУчитывает ручные лайки и отправки с неизвестным результатом. Лимит Jardulik учитывается отдельно.", settingsLikeCount(dailyCap))
 		if dailyCap != j.DailyCap {
@@ -126,7 +138,7 @@ func (s *Service) showSettings(ctx context.Context, owner, messageID int64, pane
 			text += fmt.Sprintf("\nОтправлено за запуск: %d", j.Sent)
 		}
 		text += "\n\n⭐ Избранное → анкеты по фильтрам. Только анкеты 18+.\nАвто продолжает после снятия лимита. Серия заканчивается после выбранного числа лайков."
-		text += "\nРежим авто: " + positiveRuleLabel(policy.SuperBeforeAge)
+		text += "\nРежим авто: " + automaticReactionRuleLabel(policy)
 		if policy.SuperBeforeAge != 0 {
 			text += ". Интервал от 60 с."
 		}
@@ -192,6 +204,8 @@ func (s *Service) showSettings(ctx context.Context, owner, messageID int64, pane
 	}
 	if panel != "" {
 		rows = append(rows, []map[string]string{b("← Автолайкер", "home")})
+	} else {
+		rows = append(rows, []map[string]string{{"text": "← Меню", "callback_data": "menu"}})
 	}
 	if notice != "" {
 		text += "\n\n" + notice
@@ -258,22 +272,31 @@ func (s *Service) handleSettingsCallback(ctx context.Context, owner, messageID i
 			return true, errors.New("неверная кнопка")
 		}
 		return true, s.showSettings(ctx, owner, messageID, parts[3], "")
-	case "super":
-		if len(parts) != 4 {
-			return true, errors.New("неверное правило суперлайков")
-		}
-		cutoff, e := strconv.Atoi(parts[3])
-		if e != nil || !validSuperBeforeAge(cutoff) {
-			return true, errors.New("неверное правило суперлайков")
+	case "super", "first":
+		cutoff := 23
+		ordinaryWhenNoFire := parts[2] == "first"
+		if ordinaryWhenNoFire {
+			if len(parts) != 3 {
+				return true, errors.New("неверное правило суперлайков")
+			}
+		} else {
+			if len(parts) != 4 {
+				return true, errors.New("неверное правило суперлайков")
+			}
+			value, e := strconv.Atoi(parts[3])
+			if e != nil || !validSuperBeforeAge(value) {
+				return true, errors.New("неверное правило суперлайков")
+			}
+			cutoff = value
 		}
 		old, e := s.Store.ReactionMessagePolicy(ctx, owner)
 		if e != nil {
 			return true, e
 		}
-		if old.SuperBeforeAge == cutoff {
+		if old.SuperBeforeAge == cutoff && old.OrdinaryWhenNoFire == ordinaryWhenNoFire {
 			return true, s.showSettings(ctx, owner, messageID, "reactions", "")
 		}
-		if err = s.Store.SetSuperBeforeAge(ctx, owner, cutoff); err != nil {
+		if err = s.Store.setAutomaticReactionRule(ctx, owner, cutoff, ordinaryWhenNoFire); err != nil {
 			return true, s.showSettings(ctx, owner, messageID, "reactions", err.Error())
 		}
 		if err = s.DisableAutolike(ctx, owner, "settings_changed"); err != nil {
@@ -281,7 +304,7 @@ func (s *Service) handleSettingsCallback(ctx context.Context, owner, messageID i
 		}
 		return true, s.showSettings(ctx, owner, messageID, "reactions", "Режим сохранён. Автолайкер выключен; запусти его отдельно.")
 	case "filters":
-		return true, s.OpenFiltersMessage(ctx, owner, messageID)
+		return true, s.openFiltersMessage(ctx, owner, messageID, "settings")
 	case "series", "automatic":
 		if err = a.startLocked(ctx, owner, parts[2], j.Count, j.Nonce); err != nil {
 			if messageID > 0 {
@@ -402,4 +425,11 @@ func positiveRuleLabel(cutoff int) string {
 	default:
 		return fmt.Sprintf("18–%d: 🔥 суперлайк · %d+: ❤️ лайк", cutoff-1, cutoff)
 	}
+}
+
+func automaticReactionRuleLabel(policy ReactionMessagePolicy) string {
+	if policy.OrdinaryWhenNoFire {
+		return "18–22: 🔥 при наличии Огня · 23+: ❤️ с сообщением"
+	}
+	return positiveRuleLabel(policy.SuperBeforeAge)
 }

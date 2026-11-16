@@ -23,16 +23,17 @@ const syncFullReadsSchema = `CREATE TABLE IF NOT EXISTS sync_full_reads (
 const syncCycleBindingChanged = "source_binding_or_pause_changed"
 
 const syncCycleActiveIndex = `CREATE UNIQUE INDEX IF NOT EXISTS sync_cycle_active_owner
- ON sync_cycles(owner_id) WHERE stage NOT IN ('complete', 'superseded');`
+ ON sync_cycles(owner_id) WHERE collected_at_ms=0 AND stage NOT IN ('complete', 'superseded');`
 
-const syncCycleSchema = `
+const syncCycleTables = `
 CREATE TABLE IF NOT EXISTS sync_cycles (
  id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  upstream_id INTEGER NOT NULL, generation TEXT NOT NULL, stage TEXT NOT NULL,
  search_run_id TEXT NOT NULL, started_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
- next_cycle_ms INTEGER NOT NULL, reason TEXT NOT NULL DEFAULT '', last_tick_ms INTEGER NOT NULL DEFAULT 0
+ next_cycle_ms INTEGER NOT NULL, reason TEXT NOT NULL DEFAULT '', last_tick_ms INTEGER NOT NULL DEFAULT 0,
+ collected_at_ms INTEGER NOT NULL DEFAULT 0, collected_version_id INTEGER NOT NULL DEFAULT 0,
+ collected_presence_event_id INTEGER NOT NULL DEFAULT 0
 );
-` + syncCycleActiveIndex + `
 CREATE TABLE IF NOT EXISTS sync_refresh_items (
  cycle_id TEXT NOT NULL REFERENCES sync_cycles(id) ON DELETE CASCADE, profile_id INTEGER NOT NULL,
  state TEXT NOT NULL DEFAULT 'pending', version_id INTEGER NOT NULL DEFAULT 0,
@@ -40,26 +41,31 @@ CREATE TABLE IF NOT EXISTS sync_refresh_items (
  PRIMARY KEY(cycle_id,profile_id)
 );
 INSERT OR IGNORE INTO meta(key,value) VALUES('sync_cycle_writer','0');`
+const syncCycleSchema = syncCycleTables + syncCycleActiveIndex
 
 // SyncCycle pins a daily operation to one authenticated source. Milliseconds are UTC.
 type SyncCycle struct {
-	ID          string `json:"id"`
-	OwnerID     int64  `json:"owner_id"`
-	UserID      int64  `json:"upstream_id"`
-	Generation  string `json:"-"`
-	Stage       string `json:"stage"`
-	SearchRunID string `json:"search_run_id"`
-	StartedAt   int64  `json:"started_at_ms"`
-	UpdatedAt   int64  `json:"updated_at_ms"`
-	NextCycle   int64  `json:"next_cycle_ms"`
-	Reason      string `json:"reason,omitempty"`
+	ID                       string `json:"id"`
+	OwnerID                  int64  `json:"owner_id"`
+	UserID                   int64  `json:"upstream_id"`
+	Generation               string `json:"-"`
+	Stage                    string `json:"stage"`
+	SearchRunID              string `json:"search_run_id"`
+	StartedAt                int64  `json:"started_at_ms"`
+	UpdatedAt                int64  `json:"updated_at_ms"`
+	NextCycle                int64  `json:"next_cycle_ms"`
+	Reason                   string `json:"reason,omitempty"`
+	CollectedAt              int64  `json:"collected_at_ms,omitempty"`
+	CollectedVersionID       int64  `json:"-"`
+	CollectedPresenceEventID int64  `json:"-"`
 }
 
-const syncCycleColumns = "id,owner_id,upstream_id,generation,stage,search_run_id,started_at_ms,updated_at_ms,next_cycle_ms,reason"
+const syncCycleLegacyColumns = "id,owner_id,upstream_id,generation,stage,search_run_id,started_at_ms,updated_at_ms,next_cycle_ms,reason"
+const syncCycleColumns = syncCycleLegacyColumns + ",collected_at_ms,collected_version_id,collected_presence_event_id"
 
 func scanSyncCycle(row interface{ Scan(...any) error }) (*SyncCycle, error) {
 	var c SyncCycle
-	err := row.Scan(&c.ID, &c.OwnerID, &c.UserID, &c.Generation, &c.Stage, &c.SearchRunID, &c.StartedAt, &c.UpdatedAt, &c.NextCycle, &c.Reason)
+	err := row.Scan(&c.ID, &c.OwnerID, &c.UserID, &c.Generation, &c.Stage, &c.SearchRunID, &c.StartedAt, &c.UpdatedAt, &c.NextCycle, &c.Reason, &c.CollectedAt, &c.CollectedVersionID, &c.CollectedPresenceEventID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -67,23 +73,41 @@ func scanSyncCycle(row interface{ Scan(...any) error }) (*SyncCycle, error) {
 }
 
 func (s *Store) InitSyncCycles(ctx context.Context) error {
-	if _, err := s.DB.ExecContext(ctx, syncCycleSchema+syncFullReadsSchema+syncPublicationSchema+watchSchema+profilePresenceSchema); err != nil {
+	if _, err := s.DB.ExecContext(ctx, syncCycleTables+syncFullReadsSchema+syncPublicationSchema+watchSchema+profilePresenceSchema); err != nil {
 		return err
 	}
 	var indexSQL string
-	if err := s.DB.QueryRowContext(ctx, "SELECT sql FROM sqlite_schema WHERE type='index' AND name='sync_cycle_active_owner'").Scan(&indexSQL); err != nil {
+	if err := s.DB.QueryRowContext(ctx, "SELECT COALESCE((SELECT sql FROM sqlite_schema WHERE type='index' AND name='sync_cycle_active_owner'),'')").Scan(&indexSQL); err != nil {
 		return err
 	}
-	if strings.Contains(indexSQL, "'superseded'") {
+	if strings.Contains(indexSQL, "collected_at_ms") {
 		return nil
 	}
-	// Keep the name for older processes that still run their IF NOT EXISTS schema.
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, "DROP INDEX sync_cycle_active_owner;"+syncCycleActiveIndex); err != nil {
+	if _, err = tx.ExecContext(ctx, "UPDATE meta SET value=value WHERE key='sync_cycle_writer'"); err != nil {
+		return err
+	}
+	var hasCutoff bool
+	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sync_cycles') WHERE name='collected_at_ms')").Scan(&hasCutoff); err != nil {
+		return err
+	}
+	if !hasCutoff {
+		if _, err = tx.ExecContext(ctx, `ALTER TABLE sync_cycles ADD COLUMN collected_at_ms INTEGER NOT NULL DEFAULT 0;
+ ALTER TABLE sync_cycles ADD COLUMN collected_version_id INTEGER NOT NULL DEFAULT 0;
+ ALTER TABLE sync_cycles ADD COLUMN collected_presence_event_id INTEGER NOT NULL DEFAULT 0;
+ UPDATE sync_cycles SET collected_at_ms=MAX(1,updated_at_ms),
+ collected_version_id=(SELECT COALESCE(MAX(v.id),0) FROM versions v WHERE v.owner_id=sync_cycles.owner_id),
+ collected_presence_event_id=(SELECT COALESCE(MAX(e.id),0) FROM profile_presence_events e WHERE e.owner_id=sync_cycles.owner_id)
+ WHERE stage IN ('draining','publishing','complete')
+ OR (stage='blocked' AND EXISTS(SELECT 1 FROM sync_publication_manifests m WHERE m.cycle_id=sync_cycles.id AND m.owner_id=sync_cycles.owner_id AND m.upstream_id=sync_cycles.upstream_id AND m.generation=sync_cycles.generation));`); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, "DROP INDEX IF EXISTS sync_cycle_active_owner;"+syncCycleActiveIndex); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -94,16 +118,22 @@ func (s *Store) SyncCycle(ctx context.Context, owner int64) (*SyncCycle, error) 
 	if err != nil || !exists {
 		return nil, err
 	}
-	return scanSyncCycle(s.DB.QueryRowContext(ctx, "SELECT "+syncCycleColumns+" FROM sync_cycles WHERE owner_id=? ORDER BY started_at_ms DESC,id DESC LIMIT 1", owner))
+	columns, err := s.syncCycleSelectColumns(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return scanSyncCycle(s.DB.QueryRowContext(ctx, "SELECT "+columns+" FROM sync_cycles WHERE owner_id=? ORDER BY started_at_ms DESC,id DESC LIMIT 1", owner))
 }
 
-// Publishers fail closed while the source branch and finite compatibility frontier run.
-func (s *Store) SyncPublicationAllowed(ctx context.Context, owner int64) (bool, error) {
-	c, err := s.SyncCycle(ctx, owner)
-	if err != nil {
-		return false, err
+func (s *Store) syncCycleSelectColumns(ctx context.Context) (string, error) {
+	var hasCutoff bool
+	if err := s.DB.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sync_cycles') WHERE name='collected_at_ms')").Scan(&hasCutoff); err != nil {
+		return "", err
 	}
-	return c != nil && (c.Stage == "publishing" || c.Stage == "complete"), nil
+	if !hasCutoff {
+		return syncCycleLegacyColumns + ",0,0,0", nil
+	}
+	return syncCycleColumns, nil
 }
 
 func syncCycleBindingTx(ctx context.Context, tx *sql.Tx, s *Store, c SyncCycle) error {
@@ -162,17 +192,6 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 		return false, nil
 	}
 	defer mu.Unlock()
-	if s.Archiver != nil {
-		if !s.Archiver.mu.TryLock() {
-			return false, nil
-		}
-		defer s.Archiver.mu.Unlock()
-	}
-	unlockPublication, acquired, err := s.Store.trySyncPublicationLock()
-	if err != nil || !acquired {
-		return false, err
-	}
-	defer unlockPublication()
 	sessionMu := s.Store.SessionMutex(owner)
 	sessionMu.Lock()
 	defer sessionMu.Unlock()
@@ -199,7 +218,9 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 		if now.UnixMilli() < previous.NextCycle {
 			return false, nil
 		}
-		if previous.Stage != "complete" {
+		collected := previous.CollectedAt > 0 && (previous.Stage == "draining" || previous.Stage == "publishing") &&
+			previous.UserID == ss.UserID && previous.Generation == ss.Generation
+		if previous.Stage != "complete" && !collected {
 			if previous.Stage != "blocked" || previous.Reason != syncCycleBindingChanged ||
 				previous.UserID != ss.UserID || previous.Generation == ss.Generation {
 				return false, nil
@@ -214,34 +235,21 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 			if !supersede {
 				return false, nil
 			}
-		}
-	}
-	j, err := s.Store.CrawlStatus(ctx, owner)
-	if err != nil {
-		return false, err
-	}
-	// A stopped job is an operator decision or unresolved failure, never permission to restart it.
-	if j != nil && !j.active() && !(j.State == "done" && j.Reason == "empty_page") {
-		return false, nil
-	}
-	adopt := false
-	if syncBroadRun(j, ss) && (!supersede || j.StartedAt >= previous.NextCycle) {
-		recent := j.StartedAt <= now.UnixMilli() && now.UnixMilli() < j.StartedAt+(24*time.Hour).Milliseconds()
-		// A retry can adopt a fresh run that finished before the replacement cycle was committed.
-		adopt = j.active() || (recent && (previous == nil || supersede))
-	}
-	if j != nil && j.active() && !adopt {
-		return false, nil
-	}
-	if !adopt {
-		j, err = s.Crawler.requestLocked(context.WithValue(ctx, dailyCrawlRequestKey{}, dailyCrawlIdentity{UserID: ss.UserID, Generation: ss.Generation}), owner, true, true)
-		if err != nil {
-			var lifecycle *crawlLifecycleError
-			if errors.As(err, &lifecycle) {
-				return false, nil
+			if s.Archiver != nil {
+				if !s.Archiver.mu.TryLock() {
+					return false, nil
+				}
+				defer s.Archiver.mu.Unlock()
 			}
-			return false, err
+			unlockPublication, acquired, err := s.Store.trySyncPublicationLock()
+			if err != nil || !acquired {
+				return false, err
+			}
+			defer unlockPublication()
 		}
+	}
+	if err = s.Crawler.init(ctx); err != nil {
+		return false, err
 	}
 	id, err := filterNonce()
 	if err != nil {
@@ -271,18 +279,40 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 		}
 	}
 	var exists bool
-	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sync_cycles WHERE owner_id=? AND (stage NOT IN ('complete', 'superseded') OR next_cycle_ms>?))", owner, now.UnixMilli()).Scan(&exists); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_cycles WHERE owner_id=?
+ AND ((collected_at_ms=0 AND stage NOT IN ('complete','superseded')) OR next_cycle_ms>?))`, owner, now.UnixMilli()).Scan(&exists); err != nil {
 		return false, err
 	}
 	if exists {
 		return false, nil
 	}
-	var sameRun bool
-	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM feed_crawls WHERE owner_id=? AND run_id=? AND upstream_id=? AND generation=? AND state IN ('queued','running','done'))", owner, j.RunID, ss.UserID, ss.Generation).Scan(&sameRun); err != nil {
+	j, err := scanCrawl(tx.QueryRowContext(ctx, "SELECT "+crawlColumns+" FROM feed_crawls WHERE owner_id=?", owner))
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	if !sameRun {
-		return false, errors.New("sync search run changed")
+	// A stopped job is an operator decision or unresolved failure.
+	if j != nil && !j.active() && !(j.State == "done" && j.Reason == "empty_page") {
+		return false, nil
+	}
+	adopt := false
+	if syncBroadRun(j, ss) && (!supersede || j.StartedAt >= previous.NextCycle) {
+		recent := j.StartedAt <= now.UnixMilli() && now.UnixMilli() < j.StartedAt+(24*time.Hour).Milliseconds()
+		// Keep a compatible cursor, including a fresh first pass finished before adoption.
+		adopt = j.active() || (recent && (previous == nil || supersede))
+	}
+	if j != nil && j.active() && !adopt {
+		return false, nil
+	}
+	if !adopt {
+		requestCtx := context.WithValue(ctx, dailyCrawlRequestKey{}, dailyCrawlIdentity{UserID: ss.UserID, Generation: ss.Generation})
+		j, err = s.Crawler.requestRunTx(requestCtx, tx, owner, true, true, nil)
+		if err != nil {
+			var lifecycle *crawlLifecycleError
+			if errors.As(err, &lifecycle) {
+				return false, nil
+			}
+			return false, err
+		}
 	}
 	if err = insertSyncSearchTx(ctx, tx, &cycle, j, now); err != nil {
 		return false, err
@@ -508,7 +538,11 @@ func (s *Service) SyncCycleStep(ctx context.Context) (bool, error) {
 			return false, err
 		}
 	}
-	c, err := scanSyncCycle(s.Store.DB.QueryRowContext(ctx, "SELECT "+syncCycleColumns+" FROM sync_cycles WHERE stage IN ('search','refresh','draining','publishing') ORDER BY last_tick_ms,owner_id LIMIT 1"))
+	c, err := scanSyncCycle(s.Store.DB.QueryRowContext(ctx, `SELECT `+syncCycleColumns+` FROM sync_cycles current
+ WHERE stage IN ('search','refresh') OR (stage IN ('draining','publishing') AND id=(
+ SELECT pending.id FROM sync_cycles pending WHERE pending.owner_id=current.owner_id AND pending.stage IN ('draining','publishing')
+ ORDER BY pending.started_at_ms,pending.id LIMIT 1))
+ ORDER BY last_tick_ms,owner_id,started_at_ms,id LIMIT 1`))
 	if err != nil || c == nil {
 		return false, err
 	}
@@ -537,8 +571,9 @@ func (s *Service) SyncCycleStep(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	if s.Config.CompatibilityEnabled && (c.Stage == "search" || c.Stage == "refresh") {
-		if _, err = s.PlanSyncCompatibility(ctx, *c, false); err != nil && !errors.Is(err, ErrCompatibilityUnavailable) {
-			return false, err
+		// Early planning can be retried without delaying source checkpoints.
+		if _, planErr := s.PlanSyncCompatibility(ctx, *c, false); planErr != nil && ctx.Err() == nil && !errors.Is(planErr, ErrCompatibilityUnavailable) {
+			slog.WarnContext(ctx, "sync cycle compatibility planning deferred", "stage", c.Stage, "kind", safeError(planErr))
 		}
 	}
 	switch c.Stage {

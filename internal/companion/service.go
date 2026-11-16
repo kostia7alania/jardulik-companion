@@ -57,37 +57,67 @@ func (s *Service) RunBotParser(ctx context.Context) error {
 	return s.runBot(ctx, RuntimeBotParser)
 }
 
+func (s *Service) prepareTelegramBot(ctx context.Context) (TGUser, error) {
+	var me TGUser
+	if err := s.TG.Call(ctx, "getMe", map[string]any{}, &me); err != nil {
+		return TGUser{}, err
+	}
+	if !me.IsBot {
+		return TGUser{}, errors.New("configured Telegram identity is not a bot")
+	}
+	var wh struct {
+		URL string `json:"url"`
+	}
+	if err := s.TG.Call(ctx, "getWebhookInfo", map[string]any{}, &wh); err != nil {
+		return TGUser{}, err
+	}
+	if wh.URL != "" {
+		return TGUser{}, errors.New("existing webhook configured; refusing simultaneous long polling")
+	}
+	commands := []map[string]string{{"command": "menu", "description": "Главное меню"}, {"command": "next", "description": "Следующая анкета"}, {"command": "status", "description": "Аккаунт и архив"}, {"command": "connect", "description": "Подключить свой Jardulik"}, {"command": "favorites", "description": "Избранные анкеты"}, {"command": "likes", "description": "Входящие лайки"}, {"command": "matches", "description": "Взаимности"}, {"command": "filters", "description": "Фильтры Jardulik"}, {"command": "history", "description": "История анкет"}, {"command": "pause", "description": "Остановить действия"}, {"command": "disconnect", "description": "Отключить сессию Jardulik"}, {"command": "delete", "description": "Удалить свои данные"}, {"command": "help", "description": "Подключение и команды"}}
+	commands = append(commands, map[string]string{"command": "settings", "description": "Настройки и автолайки"}, map[string]string{"command": "autolike", "description": "Управление автолайками"})
+	if err := s.TG.Call(ctx, "setMyCommands", map[string]any{"commands": commands}, nil); err != nil {
+		return TGUser{}, err
+	}
+	return me, nil
+}
+
 func (s *Service) runBot(ctx context.Context, role RuntimeRole) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if s.Config.Token == "" {
 		return errors.New("TELEGRAM_BOT_TOKEN is required")
 	}
-	var me TGUser
-	if err := s.TG.Call(ctx, "getMe", map[string]any{}, &me); err != nil {
-		return err
-	}
-	if !me.IsBot {
-		return errors.New("configured Telegram identity is not a bot")
-	}
-	var wh struct {
-		URL string `json:"url"`
-	}
-	if err := s.TG.Call(ctx, "getWebhookInfo", map[string]any{}, &wh); err != nil {
-		return err
-	}
-	if wh.URL != "" {
-		return errors.New("existing webhook configured; refusing simultaneous long polling")
-	}
-	commands := []map[string]string{{"command": "next", "description": "Следующая анкета"}, {"command": "status", "description": "Аккаунт и архив"}, {"command": "connect", "description": "Подключить свой Jardulik"}, {"command": "favorites", "description": "Избранные анкеты"}, {"command": "likes", "description": "Входящие лайки"}, {"command": "matches", "description": "Взаимности"}, {"command": "filters", "description": "Фильтры Jardulik"}, {"command": "history", "description": "История анкет"}, {"command": "pause", "description": "Остановить действия"}, {"command": "disconnect", "description": "Отключить сессию Jardulik"}, {"command": "delete", "description": "Удалить свои данные"}, {"command": "help", "description": "Подключение и команды"}}
-	commands = append(commands, map[string]string{"command": "settings", "description": "Настройки и автолайки"}, map[string]string{"command": "autolike", "description": "Управление автолайками"})
-	if err := s.TG.Call(ctx, "setMyCommands", map[string]any{"commands": commands}, nil); err != nil {
-		return err
-	}
-	waitBackground, err := s.RunBackground(ctx, role)
+	botReady := make(chan struct{})
+	waitBackground, err := s.runBackground(ctx, role, botReady)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		cancel()
+		waitBackground()
+	}()
+	var me TGUser
+	for {
+		me, err = s.prepareTelegramBot(ctx)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		slog.Warn("Telegram setup unavailable", "kind", safeError(err))
+		delay := 30 * time.Second
+		var telegramErr *TelegramError
+		if errors.As(err, &telegramErr) && telegramErr.RetryAfter > int(delay/time.Second) &&
+			int64(telegramErr.RetryAfter) <= int64(1<<63-1)/int64(time.Second) {
+			delay = time.Duration(telegramErr.RetryAfter) * time.Second
+		}
+		if !sleep(ctx, delay) {
+			return nil
+		}
+	}
+	close(botReady)
 	if err := s.bootstrapKeyboards(ctx); err != nil {
 		slog.Warn("keyboard installation incomplete", "kind", safeError(err))
 	}
@@ -120,7 +150,6 @@ func (s *Service) runBot(ctx context.Context, role RuntimeRole) error {
 		for _, q := range queues {
 			s.discardQueuedUpdates(q)
 		}
-		waitBackground()
 	}()
 	offset, _ := strconv.ParseInt(s.Store.Meta(ctx, "telegram_offset"), 10, 64)
 	slog.Info("bot started", "username", me.Username, "version", Version, "reactions_enabled", s.Config.AllowReactions)
@@ -321,8 +350,11 @@ func (s *Service) handle(ctx context.Context, u Update) {
 			case "h":
 				s.history(ctx, owner, id)
 			case "p":
-				if p, err := s.Store.Profile(ctx, owner, id); err == nil {
-					_ = s.Deliver(ctx, owner, p)
+				p, err := s.Store.Profile(ctx, owner, id)
+				if err != nil {
+					_ = s.say(ctx, owner, "Анкета недоступна.", nil)
+				} else if err = s.Deliver(ctx, owner, p); err != nil {
+					_ = s.say(ctx, owner, "Не удалось открыть анкету полностью. Проверь чат перед повтором.", nil)
 				}
 			case "t":
 				if p, err := s.Store.Profile(ctx, owner, id); err == nil {
@@ -335,6 +367,8 @@ func (s *Service) handle(ctx context.Context, u Update) {
 			}
 		} else {
 			switch u.Callback.Data {
+			case "menu":
+				_ = s.showMainMenu(ctx, owner, m.ID, "")
 			case "next":
 				s.next(ctx, owner)
 			case "favorites":
@@ -414,6 +448,8 @@ func (s *Service) handle(ctx context.Context, u Update) {
 		_, _ = s.Store.DB.ExecContext(ctx, "UPDATE users SET source=CASE WHEN source='' THEN ? ELSE source END WHERE id=?", source, owner)
 		s.Store.Event(ctx, owner, "start")
 		_ = s.say(ctx, owner, welcomeText, keyboardReplyMarkup())
+		s.showKeyboardMenuLocked(ctx, owner)
+	case "/menu":
 		s.showKeyboardMenuLocked(ctx, owner)
 	case "/ageindex":
 		s.showAgeIndex(ctx, owner, 0)

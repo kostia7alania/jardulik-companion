@@ -39,6 +39,20 @@ func (s *Service) initProfileIndexes(ctx context.Context) error {
 // The current source fields are paired with the latest confirmed archived card.
 // A pending/duplicate new version or unavailable source does not hide its backup.
 func (s *Service) profileIndexEntries(ctx context.Context, owner, upstream int64, now time.Time) ([]profileIndexEntry, error) {
+	return s.profileIndexEntriesAt(ctx, owner, upstream, now, nil)
+}
+
+func (s *Service) profileIndexEntriesAt(ctx context.Context, owner, upstream int64, now time.Time, cycle *SyncCycle) ([]profileIndexEntry, error) {
+	version, archiveBound := "q.version_id", ""
+	args := []any{s.Config.BackupChatID}
+	if cycle != nil && cycle.CollectedAt > 0 {
+		archiveBound = " AND mine.version_id<=? AND published.version_id<=?"
+		version = `COALESCE(
+ (SELECT MAX(i.item_id) FROM sync_publication_items i WHERE i.cycle_id=? AND i.kind='version' AND i.profile_id=q.profile_id),
+ (SELECT MAX(saved.id) FROM versions saved WHERE saved.owner_id=q.owner_id AND saved.profile_id=q.profile_id AND saved.id<=?))`
+		args = append(args, cycle.CollectedVersionID, cycle.CollectedVersionID, cycle.ID, cycle.CollectedVersionID)
+	}
+	args = append(args, s.Config.BackupThreadID, owner)
 	rows, err := s.Store.DB.QueryContext(ctx, `SELECT q.profile_id,v.raw_json,t.thread_id,(
  SELECT CAST(json_extract(published.message_ids,'$[0]') AS INTEGER)
  FROM archive_versions mine
@@ -51,13 +65,13 @@ func (s *Service) profileIndexEntries(ctx context.Context, owner, upstream int64
  JOIN archive_receipts r ON r.source_sha=published.source_sha AND r.kind='profile_version' AND r.chat_id=? AND r.thread_id=published.thread_id AND r.message_id>0 AND r.file_id<>''
  LEFT JOIN archive_zip_repairs replacement ON replacement.version_id=published.version_id AND replacement.old_message_id=r.message_id
  LEFT JOIN archive_receipts original ON original.source_sha=replacement.old_source_sha AND original.kind='profile_version' AND original.chat_id=r.chat_id AND original.thread_id=r.thread_id AND original.message_id=r.message_id AND original.file_id<>''
- WHERE mine.owner_id=q.owner_id AND mine.profile_id=q.profile_id AND mine.thread_id=t.thread_id
+ WHERE mine.owner_id=q.owner_id AND mine.profile_id=q.profile_id AND mine.thread_id=t.thread_id`+archiveBound+`
  AND julianday(COALESCE(original.sent_at,r.sent_at)) IS NOT NULL
  AND CASE WHEN json_valid(published.message_ids) THEN json_type(published.message_ids)='array' AND json_type(published.message_ids,'$[0]')='integer' AND json_extract(published.message_ids,'$[0]')>0 AND json_extract(published.message_ids,'$[0]')<>r.message_id ELSE 0 END
  ORDER BY julianday(COALESCE(original.sent_at,r.sent_at)) DESC,published.version_id DESC LIMIT 1)
- FROM queue q JOIN versions v ON v.id=q.version_id AND v.owner_id=q.owner_id AND v.profile_id=q.profile_id
+ FROM queue q JOIN versions v ON v.id=(`+version+`) AND v.owner_id=q.owner_id AND v.profile_id=q.profile_id
  JOIN mirror_topics t ON t.profile_id=q.profile_id AND t.thread_id>0 AND t.thread_id<>?
- WHERE q.owner_id=?`, s.Config.BackupChatID, s.Config.BackupThreadID, owner)
+ WHERE q.owner_id=?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +106,7 @@ func (s *Service) profileIndexEntries(ctx context.Context, owner, upstream int64
 	if err != nil {
 		return nil, err
 	}
-	scores, err := s.profileIndexScores(ctx, owner, upstream)
+	scores, err := s.profileIndexScoresAt(ctx, owner, upstream, cycle)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +120,10 @@ func (s *Service) profileIndexEntries(ctx context.Context, owner, upstream int64
 }
 
 func (s *Service) profileIndexScores(ctx context.Context, owner, upstream int64) (map[int64]int, error) {
+	return s.profileIndexScoresAt(ctx, owner, upstream, nil)
+}
+
+func (s *Service) profileIndexScoresAt(ctx context.Context, owner, upstream int64, cycle *SyncCycle) (map[int64]int, error) {
 	scores := map[int64]int{}
 	unavailable := map[int64]bool{}
 	hasPresence, err := snapshotHasTable(ctx, s.Store.DB, "profile_presence")
@@ -122,11 +140,17 @@ func (s *Service) profileIndexScores(ctx context.Context, owner, upstream int64)
 			return nil, err
 		}
 		// Legacy presence has no source identity; require a current-source direct-check receipt.
+		presenceJoin := "JOIN profile_presence p ON p.owner_id=sc.owner_id AND p.profile_id=r.profile_id AND p.availability='unavailable'"
+		cycleID := `(SELECT latest.id FROM sync_cycles latest WHERE latest.owner_id=sc.owner_id AND latest.upstream_id=sc.upstream_id AND latest.generation=sc.generation ORDER BY latest.started_at_ms DESC,latest.id DESC LIMIT 1)`
+		args := []any{owner, upstream, session.UserID, session.Generation}
+		if cycle != nil {
+			presenceJoin, cycleID = "", "?"
+			args = append(args, cycle.ID)
+		}
 		rows, err := s.Store.DB.QueryContext(ctx, `SELECT r.profile_id FROM sync_refresh_items r
- JOIN sync_cycles sc ON sc.id=r.cycle_id
- JOIN profile_presence p ON p.owner_id=sc.owner_id AND p.profile_id=r.profile_id AND p.availability='unavailable'
+ JOIN sync_cycles sc ON sc.id=r.cycle_id `+presenceJoin+`
  WHERE sc.owner_id=? AND sc.upstream_id=? AND sc.upstream_id=? AND sc.generation=? AND r.state='unavailable' AND r.observed_at_ms>0 AND r.observed_at_ms>=sc.started_at_ms
- AND sc.id=(SELECT latest.id FROM sync_cycles latest WHERE latest.owner_id=sc.owner_id AND latest.upstream_id=sc.upstream_id AND latest.generation=sc.generation ORDER BY latest.started_at_ms DESC,latest.id DESC LIMIT 1)`, owner, upstream, session.UserID, session.Generation)
+ AND sc.id=`+cycleID, args...)
 		if err != nil {
 			return nil, err
 		}
@@ -144,8 +168,15 @@ func (s *Service) profileIndexScores(ctx context.Context, owner, upstream int64)
 			return nil, err
 		}
 	}
+	scoreBound := ""
+	args := []any{owner, upstream}
+	if cycle != nil && cycle.CollectedAt > 0 {
+		scoreBound = ` AND (a.observed_at_ms<=? OR EXISTS(SELECT 1 FROM sync_publication_items i
+ WHERE i.cycle_id=? AND i.kind='analysis' AND i.item_id=a.id AND i.disposition='required'))`
+		args = append(args, cycle.CollectedAt, cycle.ID)
+	}
 	rows, err := s.Store.DB.QueryContext(ctx, `SELECT a.profile_id,a.response_body,a.own_profile,a.target_profile FROM profile_analyses a
- WHERE a.owner_id=? AND a.upstream_id=? AND `+analysisPostSuccessSQL("a")+` ORDER BY a.observed_at_ms DESC,a.id DESC`, owner, upstream)
+ WHERE a.owner_id=? AND a.upstream_id=? AND `+analysisPostSuccessSQL("a")+scoreBound+` ORDER BY a.observed_at_ms DESC,a.id DESC`, args...)
 	if err != nil {
 		return nil, err
 	}

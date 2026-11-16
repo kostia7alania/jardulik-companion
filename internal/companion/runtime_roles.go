@@ -23,6 +23,10 @@ const (
 
 // RunBackground holds role locks until the caller cancels ctx and invokes wait.
 func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait func(), err error) {
+	return s.runBackground(ctx, role, nil)
+}
+
+func (s *Service) runBackground(ctx context.Context, role RuntimeRole, botReady <-chan struct{}) (wait func(), err error) {
 	var names []string
 	switch role {
 	case RuntimeAll:
@@ -63,7 +67,7 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 		}
 	}
 	var debugRun func(context.Context)
-	if role == RuntimeAll || role == RuntimeBotParser {
+	if botReady == nil && (role == RuntimeAll || role == RuntimeBotParser) {
 		debugRun, err = s.prepareDebugHTTP()
 		if err != nil {
 			unlock()
@@ -87,12 +91,38 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 			}
 		}()
 	}
+	// Collection uses an existing source session. Bot work waits for a verified Telegram identity.
+	startAfterBot := func(name string, run func(context.Context)) {
+		if botReady == nil {
+			start(name, run)
+			return
+		}
+		start(name, func(ctx context.Context) {
+			select {
+			case <-ctx.Done():
+				return
+			case <-botReady:
+				if ctx.Err() == nil {
+					run(ctx)
+				}
+			}
+		})
+	}
 	if s.operationsAllowed() && s.Config.Token != "" {
-		start("operations-heartbeat", func(ctx context.Context) { s.runOperationsHeartbeat(ctx, role) })
+		startAfterBot("operations-heartbeat", func(ctx context.Context) { s.runOperationsHeartbeat(ctx, role) })
 	}
 	if role == RuntimeAll || role == RuntimeBotParser {
 		if debugRun != nil {
 			start("debug-http", debugRun)
+		} else if botReady != nil && s.Config.DebugListen != "" {
+			startAfterBot("debug-http", func(ctx context.Context) {
+				run, err := s.prepareDebugHTTP()
+				if err != nil {
+					slog.Warn("debug HTTP startup failed", "kind", safeError(err))
+				} else if run != nil {
+					run(ctx)
+				}
+			})
 		}
 		start("media", s.Media.Run)
 		if s.Config.SyncCycleEnabled {
@@ -101,36 +131,36 @@ func (s *Service) RunBackground(ctx context.Context, role RuntimeRole) (wait fun
 			start("profile-checks", s.Watcher.RunChecks)
 		}
 		start("crawler", s.Crawler.Run)
-		start("autoliker", s.Autoliker.Run)
-		start("contacts", s.runContacts)
+		startAfterBot("autoliker", s.Autoliker.Run)
+		startAfterBot("contacts", s.runContacts)
 		if s.Config.RelationNoticesEnabled {
-			start("relation-notice-poll", s.RunRelationNoticePoll)
+			startAfterBot("relation-notice-poll", s.RunRelationNoticePoll)
 		}
 		if s.Config.CompatibilityEnabled {
-			start("compatibility-executor", s.runCompatibilityExecutor)
+			startAfterBot("compatibility-executor", s.runCompatibilityExecutor)
 		}
-		start("private-card-repair", s.runPrivateCardRepair)
+		startAfterBot("private-card-repair", s.runPrivateCardRepair)
 	}
 	if role == RuntimeAll || role == RuntimePoster {
-		start("operations", s.RunOperations)
-		start("opening-timeline", s.RunOpeningTimeline)
+		startAfterBot("operations", s.RunOperations)
+		startAfterBot("opening-timeline", s.RunOpeningTimeline)
 		if !s.Config.ArchivePaused {
 			if s.Config.RelationNoticesEnabled {
-				start("relation-notice-delivery", s.RunRelationNoticesDelivery)
+				startAfterBot("relation-notice-delivery", s.RunRelationNoticesDelivery)
 			}
-			start("archiver", s.Archiver.Run)
-			start("caption-maintenance", s.RunCaptionMaintenance)
-			start("profile-indexes", s.RunProfileIndexes)
+			startAfterBot("archiver", s.Archiver.Run)
+			startAfterBot("caption-maintenance", s.RunCaptionMaintenance)
+			startAfterBot("profile-indexes", s.RunProfileIndexes)
 		}
-		start("profile-presence", s.Watcher.RunPresence)
-		start("analysis-posts", s.RunAnalysisPosts)
-		start("archive-changes", s.RunArchiveChangePosts)
+		startAfterBot("profile-presence", s.Watcher.RunPresence)
+		startAfterBot("analysis-posts", s.RunAnalysisPosts)
+		startAfterBot("archive-changes", s.RunArchiveChangePosts)
 		if !s.Config.ArchivePaused {
-			start("opening-posts", s.RunOpeningPosts)
+			startAfterBot("opening-posts", s.RunOpeningPosts)
 		}
 	}
 	if s.Config.CompatibilityEnabled && (role == RuntimeAll || role == RuntimeCompatibility) {
-		start("compatibility-planner", s.runCompatibilityPlanner)
+		startAfterBot("compatibility-planner", s.runCompatibilityPlanner)
 	}
 	var once sync.Once
 	return func() { once.Do(func() { background.Wait(); unlock() }) }, nil

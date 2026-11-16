@@ -169,6 +169,18 @@ func (s *Service) handleReplyKeyboardLocked(ctx context.Context, owner int64, m 
 }
 
 func (s *Service) showKeyboardMenuLocked(ctx context.Context, owner int64) {
+	_ = s.showMainMenu(ctx, owner, 0, "")
+}
+
+func (s *Service) showMainMenu(ctx context.Context, owner, messageID int64, notice string) error {
+	state, err := s.Store.filterState(ctx, owner)
+	if err == nil && state.Draft != nil && state.Draft.Input != "" {
+		state.Draft.Input, state.Draft.Cities = "", nil
+		err = s.Store.saveFilterDraft(ctx, owner, state.Draft)
+	}
+	if err != nil {
+		notice = "Не удалось закрыть ввод фильтра."
+	}
 	b := func(text, data string) map[string]string {
 		return map[string]string{"text": text, "callback_data": data}
 	}
@@ -189,7 +201,11 @@ func (s *Service) showKeyboardMenuLocked(ctx context.Context, owner int64) {
 	if owner == s.Config.OwnerID {
 		rows = append(rows, []map[string]string{b("📅 По возрасту", "ai:0")})
 	}
-	_ = s.say(ctx, owner, "📋 Меню", map[string]any{"inline_keyboard": rows})
+	text := "📋 Меню"
+	if notice != "" {
+		text += "\n\n" + notice
+	}
+	return s.editMenuMessage(ctx, owner, messageID, text, map[string]any{"inline_keyboard": rows})
 }
 
 // Claim before sending: an interrupted installation is never blindly replayed.

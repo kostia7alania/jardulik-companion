@@ -208,17 +208,19 @@ func TestSyncPublicationSharedBarrierAcrossStoreHandles(t *testing.T) {
 	if err != nil || !locked {
 		t.Fatal(locked, err)
 	}
-	if started, err := s.startSyncCycle(ctx, 1, *now); err != nil || started {
-		release()
-		t.Fatal("source cycle crossed in-flight poster barrier", started, err)
-	}
-	if syncPublicationCount(t, s.Store, "SELECT COUNT(*) FROM sync_cycles") != 0 {
-		release()
-		t.Fatal("cycle state changed while other role held barrier")
-	}
-	release()
+	defer release()
 	if started, err := s.startSyncCycle(ctx, 1, *now); err != nil || !started {
-		t.Fatal("source did not progress after poster persisted outcome", started, err)
+		t.Fatal("poster barrier blocked the source", started, err)
+	}
+	unlock, locked, err := s.Store.trySyncPublicationLock()
+	if locked {
+		unlock()
+	}
+	if err != nil || locked {
+		t.Fatal("poster barrier admitted a second sender", locked, err)
+	}
+	if err := s.Store.requireSyncPublication(ctx, 1); !errors.Is(err, errSyncPublicationDeferred) {
+		t.Fatal("new source cycle opened publication before freezing", err)
 	}
 }
 
@@ -773,5 +775,89 @@ func TestSyncPublicationCaptionClaimKeepsPausedTenantsIndependent(t *testing.T) 
 	}
 	if n := syncPublicationCount(t, s.Store, "SELECT COUNT(*) FROM caption_maintenance_jobs WHERE owner_id=123 AND state='pending' AND attempts=0"); n != 1 {
 		t.Fatal("paused tenant was claimed")
+	}
+}
+
+func TestSyncPublicationContinuesOldestFrozenCycleDuringNewCollection(t *testing.T) {
+	f := newProfileIndexesFixture(t)
+	s := f.s
+	ctx := context.Background()
+	old := syncPublicationCycle(t, s, 123)
+	first := f.add(t, 7, 24, "Frozen name", "")
+	syncPublicationCohort(t, s, old, first)
+	cutoff := time.Now().UnixMilli()
+	if _, err := s.Store.DB.Exec("UPDATE sync_cycles SET collected_at_ms=?,collected_version_id=? WHERE id=?", cutoff, first.VersionID, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	newStart := old.StartedAt + 1
+	if _, err := s.Store.DB.Exec(`INSERT INTO sync_cycles(id,owner_id,upstream_id,generation,stage,search_run_id,started_at_ms,updated_at_ms,next_cycle_ms)
+ VALUES('next-source',?,?,?,'search','next-fixture',?,?,?)`, old.OwnerID, old.UserID, old.Generation, newStart, newStart, old.NextCycle); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := s.Store.Archive(ctx, 123, []Profile{{"userId": first.ID, "name": "Later name", "age": 27}}, "next-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	late := ids[0]
+	f.analysis(t, first, "Итоговая оценка совместимости: 95%", time.UnixMilli(cutoff+1000))
+	syncPublicationPublish(t, s, &old)
+	if got := syncPublicationCount(t, s.Store, "SELECT COUNT(*) FROM sync_publication_items WHERE kind='version' AND cycle_id=? AND item_id=?", old.ID, late); got != 0 {
+		t.Fatal("later source version entered older manifest")
+	}
+	if err := s.Store.requireSyncPublication(ctx, 123); err != nil {
+		t.Fatal("newer source cycle blocked publication", err)
+	}
+	if _, err := s.Store.DB.Exec("UPDATE users SET paused=1 WHERE id=123"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.requireSyncPublication(ctx, 123); !errors.Is(err, errSyncPublicationDeferred) {
+		t.Fatal("older publication bypassed owner pause", err)
+	}
+	if _, err := s.Store.DB.Exec("UPDATE users SET paused=0 WHERE id=123"); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := s.Store.syncPublicationCycle(ctx, 123)
+	if err != nil || selected == nil || selected.ID != old.ID {
+		t.Fatal("wrong publication cycle", selected, err)
+	}
+	from := "SELECT id FROM versions WHERE owner_id=?"
+	query := "SELECT COUNT(*) FROM (" + from + s.Store.syncPublicationCandidates("versions.owner_id", "versions.id", "version") + ") WHERE id=?"
+	if syncPublicationCount(t, s.Store, query, 123, first.VersionID) != 1 || syncPublicationCount(t, s.Store, query, 123, late) != 0 {
+		t.Fatal("poster inventory crossed between cycles")
+	}
+	entries, err := s.profileIndexEntriesAt(ctx, old.OwnerID, old.UserID, f.now, selected)
+	if err != nil || len(entries) != 1 || entries[0].Name != "Frozen name" || entries[0].PercentKnown {
+		t.Fatal("index used newer profile content or score", entries, err)
+	}
+	if ready, err := s.syncCyclePublicationComplete(ctx, old); ready || err != nil {
+		t.Fatal("index frontier did not begin", ready, err)
+	}
+	if got := syncPublicationCount(t, s.Store, "SELECT indexes_frozen FROM sync_publication_manifests WHERE cycle_id=?", old.ID); got != 1 {
+		t.Fatal("older cycle never froze its index frontier")
+	}
+	for range 3 {
+		f.step(t)
+	}
+	if ready, err := s.syncCyclePublicationComplete(ctx, old); !ready || err != nil {
+		t.Fatal("newer source blocked completion of the older publication", ready, err)
+	}
+	if _, err := s.Store.DB.Exec("UPDATE sync_cycles SET stage='complete' WHERE id=?", old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Store.requireSyncPublication(ctx, 123); !errors.Is(err, errSyncPublicationDeferred) {
+		t.Fatal("unfrozen new collection inherited completed publication permission", err)
+	}
+	if _, err := s.Store.DB.Exec("UPDATE profile_index_topics SET next_refresh=0"); err != nil {
+		t.Fatal(err)
+	}
+	ss, err := s.Store.Session(ctx, old.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.refreshProfileIndexPlan(ctx, ss); err != nil {
+		t.Fatal(err)
+	}
+	if n := syncPublicationCount(t, s.Store, "SELECT COUNT(*) FROM profile_index_pages WHERE instr(payload_json,'Later name')>0 OR instr(payload_json,'95%')>0"); n != 0 {
+		t.Fatal("known index refresh exposed contents of uncollected cycle")
 	}
 }

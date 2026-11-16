@@ -137,13 +137,34 @@ func scanProfileIndexTopic(row interface{ Scan(...any) error }) (profileIndexTop
 const profileIndexTopicColumns = "id,owner_id,upstream_id,generation,kind,chat_id,thread_id,state,next_refresh"
 
 func (s *Service) refreshProfileIndexPlan(ctx context.Context, expected Session) error {
+	var snapshot *SyncCycle
 	if s.Store.cfg.SyncCycleEnabled {
-		var frozen bool
-		if err := s.Store.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_publication_manifests pm JOIN sync_cycles sc ON sc.id=pm.cycle_id WHERE sc.owner_id=? AND sc.upstream_id=? AND sc.generation=? AND sc.stage='publishing' AND pm.indexes_frozen=1)`, s.Config.OwnerID, expected.UserID, expected.Generation).Scan(&frozen); err != nil {
+		cycle, err := s.Store.syncPublicationCycle(ctx, s.Config.OwnerID)
+		if err != nil {
 			return err
 		}
-		if frozen {
-			return nil
+		if cycle != nil && cycle.Stage == "publishing" && cycle.UserID == expected.UserID && cycle.Generation == expected.Generation {
+			var frozen bool
+			if err = s.Store.DB.QueryRowContext(ctx, "SELECT indexes_frozen FROM sync_publication_manifests WHERE cycle_id=?", cycle.ID).Scan(&frozen); err != nil {
+				return err
+			}
+			if frozen {
+				return nil
+			}
+			snapshot = cycle
+		} else if cycle != nil && cycle.Stage != "complete" {
+			// Known-page formatting during collection may use the previous completed
+			// cohort. It must not reveal freshly collected rows before publication.
+			columns, err := s.Store.syncCycleSelectColumns(ctx)
+			if err != nil {
+				return err
+			}
+			snapshot, err = scanSyncCycle(s.Store.DB.QueryRowContext(ctx, "SELECT "+columns+`
+ FROM sync_cycles WHERE owner_id=? AND upstream_id=? AND generation=? AND stage='complete'
+ ORDER BY started_at_ms DESC,id DESC LIMIT 1`, s.Config.OwnerID, expected.UserID, expected.Generation))
+			if err != nil {
+				return err
+			}
 		}
 	}
 	var due bool
@@ -154,7 +175,7 @@ func (s *Service) refreshProfileIndexPlan(ctx context.Context, expected Session)
 	if !due {
 		return nil
 	}
-	entries, err := s.profileIndexEntries(ctx, s.Config.OwnerID, expected.UserID, now)
+	entries, err := s.profileIndexEntriesAt(ctx, s.Config.OwnerID, expected.UserID, now, snapshot)
 	if err != nil {
 		return err
 	}
@@ -264,7 +285,8 @@ func (s *Service) claimProfileIndexOperationMode(ctx context.Context, expected S
  JOIN sync_publication_manifests pm ON pm.cycle_id=i.cycle_id
  JOIN sync_cycles sc ON sc.id=i.cycle_id
  WHERE i.topic_id=t.id AND pm.indexes_frozen=1 AND sc.stage='publishing'
- AND sc.owner_id=t.owner_id AND sc.upstream_id=t.upstream_id AND sc.generation=t.generation)`
+ AND sc.owner_id=t.owner_id AND sc.upstream_id=t.upstream_id AND sc.generation=t.generation
+ AND sc.id=` + syncPublicationCycleID("t.owner_id") + `)`
 	}
 	op.Topic, err = scanProfileIndexTopic(tx.QueryRowContext(ctx, "SELECT "+profileIndexTopicColumns+` FROM profile_index_topics t WHERE owner_id=? AND upstream_id=? AND generation=? AND chat_id=? AND (`+createKind+`) AND state='pending' AND thread_id=0 AND next_attempt<=? AND ?=0 ORDER BY id LIMIT 1`, s.Config.OwnerID, expected.UserID, expected.Generation, s.Config.BackupChatID, s.Archiver.now().UnixMilli(), knownOnly))
 	if err == nil {

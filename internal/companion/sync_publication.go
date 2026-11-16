@@ -58,18 +58,39 @@ func (s *Store) trySyncPublicationLock() (func(), bool, error) {
 	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }, true, nil
 }
 
+// A publishing cycle stays selected while a newer source pass runs. Without
+// an active publication, only the latest cycle can reopen normal posting.
+func syncPublicationCycleID(owner string) string {
+	return fmt.Sprintf(`COALESCE(
+ (SELECT pending.id FROM sync_cycles pending WHERE pending.owner_id=%[1]s AND pending.stage='publishing'
+  ORDER BY pending.started_at_ms,pending.id LIMIT 1),
+ (SELECT latest.id FROM sync_cycles latest WHERE latest.owner_id=%[1]s
+  ORDER BY latest.started_at_ms DESC,latest.id DESC LIMIT 1))`, owner)
+}
+
+func (s *Store) syncPublicationCycle(ctx context.Context, owner int64) (*SyncCycle, error) {
+	exists, err := snapshotHasTable(ctx, s.DB, "sync_cycles")
+	if err != nil || !exists {
+		return nil, err
+	}
+	columns, err := s.syncCycleSelectColumns(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return scanSyncCycle(s.DB.QueryRowContext(ctx, "SELECT "+columns+" FROM sync_cycles WHERE owner_id=? AND id="+syncPublicationCycleID("?1"), owner))
+}
+
+// SyncPublicationAllowed reports the selected posting phase without changing the cycle.
+func (s *Store) SyncPublicationAllowed(ctx context.Context, owner int64) (bool, error) {
+	c, err := s.syncPublicationCycle(ctx, owner)
+	return c != nil && (c.Stage == "publishing" || c.Stage == "complete"), err
+}
+
 func (s *Store) requireSyncPublication(ctx context.Context, owner int64) error {
 	if !s.cfg.SyncCycleEnabled {
 		return nil
 	}
-	allowed, err := s.SyncPublicationAllowed(ctx, owner)
-	if err != nil {
-		return err
-	}
-	if !allowed {
-		return errSyncPublicationDeferred
-	}
-	c, err := s.SyncCycle(ctx, owner)
+	c, err := s.syncPublicationCycle(ctx, owner)
 	if err != nil {
 		return err
 	}
@@ -83,14 +104,16 @@ func (s *Store) requireSyncPublication(ctx context.Context, owner int64) error {
 	if err != nil {
 		return err
 	}
-	if ss.UserID != c.UserID || ss.Generation != c.Generation {
+	if ss.State != "connected" || ss.UserID != c.UserID || ss.Generation != c.Generation {
 		return errSyncPublicationDeferred
 	}
-	var frozen bool
-	if err = s.DB.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sync_publication_manifests WHERE cycle_id=? AND owner_id=? AND upstream_id=? AND generation=?)", c.ID, c.OwnerID, c.UserID, c.Generation).Scan(&frozen); err != nil {
+	var allowed bool
+	if err = s.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sync_publication_manifests pm JOIN users u ON u.id=pm.owner_id
+ WHERE pm.cycle_id=? AND pm.owner_id=? AND pm.upstream_id=? AND pm.generation=? AND u.paused=0
+ AND NOT EXISTS(SELECT 1 FROM meta WHERE key=? AND value='1'))`, c.ID, c.OwnerID, c.UserID, c.Generation, dailyCrawlBlockKey(owner)).Scan(&allowed); err != nil {
 		return err
 	}
-	if !frozen {
+	if !allowed {
 		return errSyncPublicationDeferred
 	}
 	return nil
@@ -102,10 +125,10 @@ func (s *Store) syncPublicationCandidates(owner, item, kind string) string {
 		return ""
 	}
 	return fmt.Sprintf(` AND EXISTS(SELECT 1 FROM sync_cycles sc
- WHERE sc.owner_id=%s AND sc.id=(SELECT latest.id FROM sync_cycles latest WHERE latest.owner_id=sc.owner_id ORDER BY latest.started_at_ms DESC,latest.id DESC LIMIT 1)
+ JOIN sync_publication_manifests pm ON pm.cycle_id=sc.id AND pm.owner_id=sc.owner_id AND pm.upstream_id=sc.upstream_id AND pm.generation=sc.generation
+ WHERE sc.owner_id=%s AND sc.id=%s
  AND (sc.stage='complete' OR (sc.stage='publishing' AND EXISTS(SELECT 1 FROM sync_publication_items pi
- JOIN sync_publication_manifests pm ON pm.cycle_id=pi.cycle_id AND pm.owner_id=sc.owner_id AND pm.upstream_id=sc.upstream_id AND pm.generation=sc.generation
- WHERE pi.cycle_id=sc.id AND pi.kind='%s' AND pi.item_id=%s AND pi.disposition='required')))) `, owner, kind, item)
+ WHERE pi.cycle_id=sc.id AND pi.kind='%s' AND pi.item_id=%s AND pi.disposition='required')))) `, owner, syncPublicationCycleID("sc.owner_id"), kind, item)
 }
 
 func (s *Store) syncPublicationPhaseCandidates(owner string) string {
@@ -114,8 +137,7 @@ func (s *Store) syncPublicationPhaseCandidates(owner string) string {
 	}
 	return fmt.Sprintf(` AND EXISTS(SELECT 1 FROM sync_cycles sc JOIN sync_publication_manifests pm ON pm.cycle_id=sc.id
  WHERE sc.owner_id=%s AND pm.owner_id=sc.owner_id AND pm.upstream_id=sc.upstream_id AND pm.generation=sc.generation
- AND sc.id=(SELECT latest.id FROM sync_cycles latest WHERE latest.owner_id=sc.owner_id ORDER BY latest.started_at_ms DESC,latest.id DESC LIMIT 1)
- AND sc.stage IN ('publishing','complete')) `, owner)
+ AND sc.id=%s AND sc.stage IN ('publishing','complete')) `, owner, syncPublicationCycleID("sc.owner_id"))
 }
 
 // Readiness must use the frozen snapshot, not a later foreground queue pointer.
@@ -128,9 +150,9 @@ func (s *Store) syncAnalysisPostReadyAt(thread string) string {
 	if !s.cfg.SyncCycleEnabled {
 		return strings.ReplaceAll(analysisPostReady, "t.thread_id", thread)
 	}
-	version := `CASE WHEN EXISTS(SELECT 1 FROM sync_cycles sc WHERE sc.owner_id=q.owner_id AND sc.stage='publishing') THEN
- (SELECT MAX(pi.item_id) FROM sync_publication_items pi JOIN sync_cycles sc ON sc.id=pi.cycle_id
- WHERE sc.owner_id=q.owner_id AND sc.stage='publishing' AND pi.kind='version' AND pi.profile_id=q.profile_id)
+	cycle := syncPublicationCycleID("q.owner_id")
+	version := `CASE WHEN EXISTS(SELECT 1 FROM sync_cycles sc WHERE sc.id=` + cycle + ` AND sc.stage='publishing') THEN
+ (SELECT MAX(pi.item_id) FROM sync_publication_items pi WHERE pi.cycle_id=` + cycle + ` AND pi.kind='version' AND pi.profile_id=q.profile_id)
  ELSE q.version_id END`
 	chat, backupThread := fmt.Sprint(s.cfg.BackupChatID), fmt.Sprint(s.cfg.BackupThreadID)
 	published := archiveChangePublishedSQL("p.owner_id", chat, backupThread)
@@ -147,7 +169,7 @@ func (s *Store) syncAnalysisPostReadyAt(thread string) string {
  AND NOT EXISTS(SELECT 1 FROM sync_publication_items pi JOIN sync_cycles sc ON sc.id=pi.cycle_id
  JOIN sync_publication_manifests pm ON pm.cycle_id=sc.id AND pm.owner_id=sc.owner_id AND pm.upstream_id=sc.upstream_id AND pm.generation=sc.generation
  JOIN archive_change_posts n ON n.version_id=pi.item_id
- WHERE sc.owner_id=p.owner_id AND sc.upstream_id=p.upstream_id AND sc.stage='publishing'
+ WHERE sc.owner_id=p.owner_id AND sc.upstream_id=p.upstream_id AND sc.stage='publishing' AND sc.id=` + syncPublicationCycleID("p.owner_id") + `
  AND pi.kind='change' AND pi.disposition='required' AND pi.profile_id=p.profile_id
  AND (n.owner_id<>p.owner_id OR n.profile_id<>p.profile_id OR n.thread_id<>` + thread + `
  OR NOT ((n.state='sent' AND n.message_id>0) OR (n.state='skipped' AND n.message_id=0 AND n.error IN ('initial_published_version','no_profile_changes')))))`
@@ -170,7 +192,8 @@ func (s *Store) FreezeSyncPublication(ctx context.Context, cycle SyncCycle) erro
 		return err
 	}
 	var stage string
-	if err = tx.QueryRowContext(ctx, "SELECT stage FROM sync_cycles WHERE id=? AND owner_id=? AND upstream_id=? AND generation=?", cycle.ID, cycle.OwnerID, cycle.UserID, cycle.Generation).Scan(&stage); err != nil {
+	var collectedAt, versionCutoff, presenceCutoff int64
+	if err = tx.QueryRowContext(ctx, "SELECT stage,collected_at_ms,collected_version_id,collected_presence_event_id FROM sync_cycles WHERE id=? AND owner_id=? AND upstream_id=? AND generation=?", cycle.ID, cycle.OwnerID, cycle.UserID, cycle.Generation).Scan(&stage, &collectedAt, &versionCutoff, &presenceCutoff); err != nil {
 		return err
 	}
 	if stage != "draining" && stage != "publishing" && stage != "complete" {
@@ -209,7 +232,8 @@ func (s *Store) FreezeSyncPublication(ctx context.Context, cycle SyncCycle) erro
 		return err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT v.id,v.profile_id,v.raw_json FROM versions v JOIN sync_refresh_items r ON r.profile_id=v.profile_id AND r.cycle_id=?
- WHERE v.owner_id=? AND (v.id=r.version_id OR julianday(v.first_seen)>=julianday(?)) ORDER BY v.id`, cycle.ID, cycle.OwnerID, time.UnixMilli(cycle.StartedAt).UTC().Format(time.RFC3339Nano))
+ WHERE v.owner_id=? AND (?=0 OR v.id<=?) AND (v.id=r.version_id OR julianday(v.first_seen)>=julianday(?)) ORDER BY v.id`,
+		cycle.ID, cycle.OwnerID, collectedAt, versionCutoff, time.UnixMilli(cycle.StartedAt).UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return err
 	}
@@ -241,14 +265,14 @@ func (s *Store) FreezeSyncPublication(ctx context.Context, cycle SyncCycle) erro
 		}
 		if cycle.OwnerID == s.cfg.OwnerID {
 			if _, err = tx.ExecContext(ctx, `INSERT INTO sync_publication_items(cycle_id,kind,item_id,profile_id,source_sha,disposition)
- VALUES(?,'change',?,?,?,CASE WHEN EXISTS(SELECT 1 FROM profile_presence WHERE owner_id=? AND profile_id=? AND availability='unavailable') THEN 'ignored' ELSE 'required' END)`, cycle.ID, v.id, v.profile, digest([]byte(v.raw)), cycle.OwnerID, v.profile); err != nil {
+ VALUES(?,'change',?,?,?,CASE WHEN EXISTS(SELECT 1 FROM sync_refresh_items WHERE cycle_id=? AND profile_id=? AND state='unavailable') THEN 'ignored' ELSE 'required' END)`, cycle.ID, v.id, v.profile, digest([]byte(v.raw)), cycle.ID, v.profile); err != nil {
 				return err
 			}
 		}
 	}
 	rows, err = tx.QueryContext(ctx, `SELECT e.id,e.profile_id,`+syncPresenceSource+` FROM profile_presence_events e JOIN sync_refresh_items r ON r.cycle_id=? AND r.profile_id=e.profile_id
- WHERE e.owner_id=? AND (e.state<>'sent' OR julianday(e.observed_at)>=julianday(?))
- AND (EXISTS(SELECT 1 FROM mirror_topics t WHERE t.profile_id=e.profile_id AND t.thread_id>0) OR EXISTS(SELECT 1 FROM sync_publication_items v WHERE v.cycle_id=? AND v.kind='version' AND v.profile_id=e.profile_id))`, cycle.ID, cycle.OwnerID, time.UnixMilli(cycle.StartedAt).UTC().Format(time.RFC3339Nano), cycle.ID)
+ WHERE e.owner_id=? AND (?=0 OR e.id<=?) AND (e.state<>'sent' OR julianday(e.observed_at)>=julianday(?))
+ AND (EXISTS(SELECT 1 FROM mirror_topics t WHERE t.profile_id=e.profile_id AND t.thread_id>0) OR EXISTS(SELECT 1 FROM sync_publication_items v WHERE v.cycle_id=? AND v.kind='version' AND v.profile_id=e.profile_id))`, cycle.ID, cycle.OwnerID, collectedAt, presenceCutoff, time.UnixMilli(cycle.StartedAt).UTC().Format(time.RFC3339Nano), cycle.ID)
 	if err != nil {
 		return err
 	}
@@ -288,7 +312,7 @@ func (s *Store) FreezeSyncPublication(ctx context.Context, cycle SyncCycle) erro
  JOIN sync_refresh_items cohort ON cohort.cycle_id=ct.cycle_id AND cohort.profile_id=ct.profile_id
  WHERE ct.cycle_id=? AND cs.owner_id=? AND cs.upstream_id=? AND cs.generation=? AND ct.final_member=1 AND ct.state='succeeded'
  AND a.owner_id=cs.owner_id AND a.upstream_id=cs.upstream_id AND a.profile_id=ct.profile_id AND `+analysisPostSuccessSQL("a")+`
- AND NOT EXISTS(SELECT 1 FROM profile_presence pp WHERE pp.owner_id=a.owner_id AND pp.profile_id=a.profile_id AND pp.availability='unavailable')`, cycle.ID, cycle.OwnerID, cycle.UserID, cycle.Generation)
+ AND cohort.state='available'`, cycle.ID, cycle.OwnerID, cycle.UserID, cycle.Generation)
 			if err != nil {
 				return err
 			}
@@ -444,7 +468,7 @@ func (s *Service) syncCyclePublicationComplete(ctx context.Context, cycle SyncCy
 		}
 		return false, err
 	}
-	current, err := s.Store.SyncCycle(ctx, cycle.OwnerID)
+	current, err := s.Store.syncPublicationCycle(ctx, cycle.OwnerID)
 	if err != nil {
 		return false, err
 	}

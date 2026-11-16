@@ -329,6 +329,43 @@ func TestOperationsStatusReadsSearchProgressWithoutMovingCursor(t *testing.T) {
 	}
 }
 
+func TestOperationsStatusShowsBlockedCycleAndDeliveredBackupSeparately(t *testing.T) {
+	f := newOperationsFixture(t)
+	db := f.s.Store.DB
+	if _, err := db.Exec(syncCycleSchema + fullTransferSchema); err != nil {
+		t.Fatal(err)
+	}
+	completed := f.now.Add(-48 * time.Hour)
+	blocked := f.now.Add(-24 * time.Hour)
+	if _, err := db.Exec(`INSERT INTO sync_cycles(id,owner_id,upstream_id,generation,stage,
+		search_run_id,started_at_ms,updated_at_ms,next_cycle_ms,reason)
+		VALUES ('complete',123,5696,'source','complete','previous',?,?,?,''),
+		       ('blocked',123,5696,'source','blocked','latest',?,?,?,'search_incomplete')`,
+		completed.UnixMilli(), completed.UnixMilli(), blocked.UnixMilli(),
+		blocked.UnixMilli(), blocked.UnixMilli(), f.now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO full_backup_jobs(requested_at,if_changed,state,updated_at)
+		VALUES ('2026-11-09',1,'sent','2026-11-09 00:25:00'),
+		       ('2026-11-10',1,'skipped','2026-11-10 00:20:00'),
+		       ('2026-11-11',1,'pending','2026-11-11 00:20:00')`); err != nil {
+		t.Fatal(err)
+	}
+	text, err := f.s.OperationsStatus(context.Background())
+	if err != nil || len(f.calls) != 0 {
+		t.Fatal(text, err, f.calls)
+	}
+	for _, want := range []string{
+		"Суточный цикл остановлен · " + displayTime(blocked.Format(time.RFC3339)),
+		"Последний полный цикл: " + displayTime(completed.Format(time.RFC3339)),
+		"отправлено 1 · без изменений 1 · в очереди 1 · последний 🕒 9.11.26, 03:25",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q in %q", want, text)
+		}
+	}
+}
+
 func TestOperationsStatusIncludesOpeningTimelineWhileArchivePaused(t *testing.T) {
 	f := newOperationsFixture(t)
 	if _, err := f.s.Store.DB.Exec(openingTimelineSchema); err != nil {

@@ -1318,7 +1318,7 @@ func fullDurableStateRecords(ctx context.Context, db *sql.DB) ([]string, error) 
 		}
 		if q.table == "reaction_message_settings" {
 			q.query = "SELECT owner_id,mode,templates_json,telegram_username"
-			for _, column := range []string{"prefer_drafts", "iron_mix", "super_before_age"} {
+			for _, column := range []string{"prefer_drafts", "iron_mix", "super_before_age", "ordinary_when_no_fire"} {
 				var present int
 				if err = db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info('reaction_message_settings') WHERE name=?", column).Scan(&present); err != nil {
 					return nil, err

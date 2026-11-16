@@ -375,3 +375,30 @@ func TestSyncCompatibilityDisabledAndHardPauseCannotDispatch(t *testing.T) {
 		t.Fatal("hard pause dispatched", j, err)
 	}
 }
+
+func TestCompatibilityCycleKeepsOldSnapshotWhenNewCollectionStarts(t *testing.T) {
+	s, now := compatibilityFixture(t)
+	ctx := context.Background()
+	initial := compatibilityAdd(t, s, 1, 7, 30)
+	old := compatibilityCycle(t, s, 1, now)
+	compatibilityRefreshCohort(t, s, old)
+	if _, err := s.Store.DB.Exec("UPDATE sync_cycles SET collected_at_ms=? WHERE id=?", now.UnixMilli(), old.ID); err != nil {
+		t.Fatal(err)
+	}
+	newer := compatibilityCycle(t, s, 1, now.Add(time.Hour))
+	compatibilityAdd(t, s, 1, 7, 32)
+	if _, err := s.PlanSyncCompatibility(ctx, newer, false); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := s.PlanSyncCompatibility(ctx, old, true); err != nil || !ready {
+		t.Fatalf("earlier batch not finalized: %v, %v", ready, err)
+	}
+	var version, jobs int64
+	var state string
+	if err := s.Store.DB.QueryRow("SELECT version_id,state FROM compatibility_cycle_targets WHERE cycle_id=? AND profile_id=7", old.ID).Scan(&version, &state); err != nil || version != initial.VersionID || state != "excluded" {
+		t.Fatalf("old version not preserved: %v, %q, %v", version, state, err)
+	}
+	if err := s.Store.DB.QueryRow("SELECT COUNT(*) FROM compatibility_jobs").Scan(&jobs); err != nil || jobs != 0 {
+		t.Fatalf("outdated or early compatibility was queued: %v, %v", jobs, err)
+	}
+}

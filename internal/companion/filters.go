@@ -104,6 +104,7 @@ func (f FeedFilters) query(user int64, page int, others bool) url.Values {
 
 type filterDraft struct {
 	MessageID  int64        `json:"messageId,omitempty"`
+	ReturnTo   string       `json:"returnTo,omitempty"`
 	ID         string       `json:"id"`
 	Generation string       `json:"generation"`
 	UserID     int64        `json:"userId"`
@@ -482,13 +483,13 @@ func (s *Service) OpenFilters(ctx context.Context, owner int64) error {
 
 // OpenFiltersMessage uses only a message from the checked private-owner callback.
 func (s *Service) OpenFiltersMessage(ctx context.Context, owner, messageID int64) error {
-	return s.openFiltersMessage(ctx, owner, messageID, "")
+	return s.openFiltersMessage(ctx, owner, messageID, "menu")
 }
 
-func (s *Service) openFiltersMessage(ctx context.Context, owner, messageID int64, notice string) error {
+func (s *Service) openFiltersMessage(ctx context.Context, owner, messageID int64, returnTo string) error {
 	account, session, err := s.filterPremium(ctx, owner)
 	if err != nil {
-		s.filterMenuError(ctx, owner, messageID, "Не удалось открыть фильтры: "+err.Error())
+		s.filterMenuError(ctx, owner, messageID, "Не удалось открыть фильтры: "+err.Error(), returnTo)
 		return err
 	}
 	state, err := s.Store.filterState(ctx, owner)
@@ -499,20 +500,33 @@ func (s *Service) openFiltersMessage(ctx context.Context, owner, messageID int64
 	if state.Applied != nil {
 		values = *state.Applied
 	}
-	draft := &filterDraft{MessageID: messageID, Generation: session.Generation, UserID: session.UserID, Values: values}
-	return s.showFilters(ctx, owner, draft, "", notice)
+	draft := &filterDraft{MessageID: messageID, ReturnTo: returnTo, Generation: session.Generation, UserID: session.UserID, Values: values}
+	return s.showFilters(ctx, owner, draft, "", "")
 }
 
-func (s *Service) filterMenuError(ctx context.Context, owner, messageID int64, text string) {
-	var keyboard any
-	if messageID > 0 {
-		back := filterButton{"text": "← Автолайкер", "callback_data": "settings"}
-		if state, err := s.Store.filterState(ctx, owner); err == nil && state.Draft != nil {
-			back = filterButtonFor(state.Draft.ID, "← Автолайкер", "settings")
-		}
-		keyboard = map[string]any{"inline_keyboard": [][]filterButton{{back}}}
+// Drafts created before returnTo was stored opened back into settings.
+func filterReturnButton(returnTo string) filterButton {
+	if returnTo == "menu" {
+		return filterButton{"text": "← Меню", "callback_data": "menu"}
 	}
-	_ = s.editMenuMessage(ctx, owner, messageID, text, keyboard)
+	return filterButton{"text": "← Автолайкер", "callback_data": "settings"}
+}
+
+func (s *Service) filterMenuError(ctx context.Context, owner, messageID int64, text string, returnTo ...string) {
+	back := filterReturnButton("menu")
+	if len(returnTo) > 0 {
+		back = filterReturnButton(returnTo[0])
+	} else if state, err := s.Store.filterState(ctx, owner); err == nil && state.Draft != nil && state.Draft.MessageID == messageID {
+		back = filterButtonFor(state.Draft.ID, filterReturnButton(state.Draft.ReturnTo)["text"], "leave")
+	}
+	_ = s.editMenuMessage(ctx, owner, messageID, text, map[string]any{"inline_keyboard": [][]filterButton{{back}}})
+}
+
+func (s *Service) returnFromFilters(ctx context.Context, owner, messageID int64, draft *filterDraft, notice string) error {
+	if draft.ReturnTo == "menu" {
+		return s.showMainMenu(ctx, owner, messageID, notice)
+	}
+	return s.showSettings(ctx, owner, messageID, "", notice)
 }
 
 func filterChoiceLabel(field, value string) string {
@@ -613,7 +627,7 @@ func (s *Service) showFilters(ctx context.Context, owner int64, draft *filterDra
 	if field != "" {
 		rows = append(rows, []filterButton{button("← Фильтры", "back"), button("Отмена", "cancel")})
 	}
-	rows = append(rows, []filterButton{button("← Автолайкер", "settings")})
+	rows = append(rows, []filterButton{button(filterReturnButton(draft.ReturnTo)["text"], "leave")})
 	if notice != "" {
 		text += "\n\n" + notice
 	}
@@ -647,10 +661,9 @@ func (s *Service) FilterMessageCallback(ctx context.Context, owner, messageID in
 			if parts[2] == "apply" {
 				notice = "Черновик изменился. Проверь фильтры и нажми Применить ещё раз."
 			}
-			if state.Draft == nil {
-				return s.openFiltersMessage(ctx, owner, messageID, notice)
+			if state.Draft == nil || state.Draft.MessageID != messageID {
+				return errors.New("эта панель устарела; открой фильтры заново")
 			}
-			state.Draft.MessageID = messageID
 			state.Draft.Input, state.Draft.Cities = "", nil
 			return s.showFilters(ctx, owner, state.Draft, "", notice)
 		}
@@ -658,17 +671,14 @@ func (s *Service) FilterMessageCallback(ctx context.Context, owner, messageID in
 		// A callback's checked message is authoritative; stored IDs are only for text continuation.
 		draft.MessageID = messageID
 		switch parts[2] {
-		case "cancel", "settings":
+		case "cancel", "leave", "settings":
 			if len(parts) != 3 {
 				return errors.New("неверная кнопка фильтра")
 			}
 			if err := s.Store.saveFilterDraft(ctx, owner, nil); err != nil {
 				return err
 			}
-			if messageID > 0 || parts[2] == "settings" {
-				return s.showSettings(ctx, owner, messageID, "", "Изменения фильтров отменены.")
-			}
-			return s.say(ctx, owner, "Изменения фильтров отменены.", nil)
+			return s.returnFromFilters(ctx, owner, messageID, draft, "Изменения фильтров отменены.")
 		case "apply":
 			if len(parts) != 3 {
 				return errors.New("неверная кнопка фильтра")
@@ -691,10 +701,7 @@ func (s *Service) FilterMessageCallback(ctx context.Context, owner, messageID in
 			if err != nil {
 				return err
 			}
-			if messageID > 0 {
-				return s.showSettings(ctx, owner, messageID, "", "Фильтры применены.")
-			}
-			return s.say(ctx, owner, "Фильтры применены. /next покажет новую выдачу. История и избранное сохранены.", nil)
+			return s.returnFromFilters(ctx, owner, messageID, draft, "Фильтры применены.")
 		case "reset":
 			draft.Values = DefaultFeedFilters()
 			draft.Input, draft.Cities = "", nil

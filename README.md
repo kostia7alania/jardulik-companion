@@ -8,6 +8,7 @@
 - Лендинг: [Jardulik Companion](https://kostia7alania.ru/jardulik-companion-site/).
 - Личный API-клиент: [запуск и работа через SSH](docs/owner-debug-client.md).
 - Совместимость: [отдельная служба и таблица связей](docs/compatibility-worker.md).
+- Целевой дизайн: [независимый сбор и правила реакций](docs/collection-and-reaction-policy.md).
 - Отправленные открывалки: [точный текст и хронология в треде анкеты](docs/opening-timeline.md).
 - Тестовые Mini App: [просмотр архива и интерфейс Jardulik через Go-прокси](docs/miniapp-prototype.md).
 - Регистрация через `/start`, работа в личном чате, данные разделены по владельцам.
