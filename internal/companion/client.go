@@ -24,6 +24,8 @@ import (
 
 var ErrProfileUnavailable = errors.New("Jardulik profile unavailable")
 
+const sourceTransportInterrupted = "transport_interrupted"
+
 type UpstreamError struct {
 	Status        int
 	Kind          string
@@ -35,6 +37,9 @@ type UpstreamError struct {
 }
 
 func (e *UpstreamError) Error() string {
+	if e.Status == 0 {
+		return "Jardulik: " + e.Kind
+	}
 	return fmt.Sprintf("Jardulik: %s (HTTP %d)", e.Kind, e.Status)
 }
 
@@ -124,13 +129,12 @@ func (c *Client) exchange(ctx context.Context, method, path, token string, paylo
 	}
 	res, err := c.HTTP.Do(r)
 	if err != nil {
+		if interrupted := interruptedSourceRead(r, path, err); interrupted != nil {
+			return nil, interrupted
+		}
 		return nil, fmt.Errorf("Jardulik transport: %w", redactedTransportError(err))
 	}
 	defer res.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(res.Body, 16<<20))
-	if err != nil {
-		return nil, errors.New("Jardulik response interrupted")
-	}
 	failure := func(kind string, retryAfter time.Duration) *UpstreamError {
 		requestURL, filtered := operationsUpstreamURL(r.URL.String())
 		return &UpstreamError{Status: res.StatusCode, Kind: kind, RetryAfter: retryAfter, Endpoint: strings.SplitN(path, "?", 2)[0], Method: r.Method, RequestURL: requestURL, QueryFiltered: filtered}
@@ -152,6 +156,13 @@ func (c *Client) exchange(ctx context.Context, method, path, token string, paylo
 		}
 		return nil, failure(kind, d)
 	}
+	b, err := io.ReadAll(io.LimitReader(res.Body, 16<<20))
+	if err != nil {
+		if interrupted := interruptedSourceRead(r, path, err); interrupted != nil {
+			return nil, interrupted
+		}
+		return nil, errors.New("Jardulik response interrupted")
+	}
 	if profileNoContent(method, path, res.StatusCode, res.Header.Get("Content-Type"), b) {
 		return nil, ErrProfileUnavailable
 	}
@@ -159,6 +170,19 @@ func (c *Client) exchange(ctx context.Context, method, path, token string, paylo
 		return nil, failure("unexpected_response_or_challenge", 0)
 	}
 	return b, nil
+}
+
+func interruptedSourceRead(request *http.Request, path string, err error) *UpstreamError {
+	if request.Method != http.MethodGet || request.Context().Err() != nil {
+		return nil
+	}
+	var timeout interface{ Timeout() bool }
+	if !(errors.As(err, &timeout) && timeout.Timeout()) && !errors.Is(err, io.EOF) &&
+		!errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE) {
+		return nil
+	}
+	requestURL, filtered := operationsUpstreamURL(request.URL.String())
+	return &UpstreamError{Kind: sourceTransportInterrupted, Endpoint: strings.SplitN(path, "?", 2)[0], Method: request.Method, RequestURL: requestURL, QueryFiltered: filtered}
 }
 
 func profileNoContent(method, path string, status int, contentType string, body []byte) bool {

@@ -83,6 +83,9 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 	if search != "" {
 		lines = append(lines, search)
 	}
+	if s.Watcher != nil {
+		lines = append(lines, s.Watcher.Status(ctx, s.Config.OwnerID))
+	}
 	cycle, err := s.Store.SyncCycle(ctx, s.Config.OwnerID)
 	if err != nil {
 		return "", err

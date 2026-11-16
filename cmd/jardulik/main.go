@@ -210,15 +210,19 @@ func run() error {
 		}
 		out := map[string]any{"connected": true, "tenant": owner, "user_id": account.ID(), "type": account["type"], "order_end_date": account["orderEndDate"]}
 		return json.NewEncoder(os.Stdout).Encode(out)
-	case "sync-recover-auth":
+	case "sync-recover-auth", "sync-resume-crawl":
 		if len(os.Args) != 5 {
-			return errors.New("usage: jardulik sync-recover-auth <cycle-id> <crawl-run-id> <operations-event-id>")
+			return errors.New("usage: jardulik " + command + " <cycle-id> <crawl-run-id> <operations-event-id>")
 		}
 		receiptID, err := strconv.ParseInt(os.Args[4], 10, 64)
 		if err != nil || receiptID <= 0 {
 			return errors.New("invalid operations event ID")
 		}
-		cycle, err := s.RecoverAuthStoppedCycle(ctx, owner, os.Args[2], os.Args[3], receiptID)
+		recover := s.RecoverAuthStoppedCycle
+		if command == "sync-resume-crawl" {
+			recover = s.ResumeStoppedCrawl
+		}
+		cycle, err := recover(ctx, owner, os.Args[2], os.Args[3], receiptID)
 		if err != nil {
 			return err
 		}
@@ -342,7 +346,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, serve-miniapp, miniapp-test-card, sync-status, sync-recover-auth, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, refresh-archive-viewer-control, version")
+		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, serve-miniapp, miniapp-test-card, sync-status, sync-recover-auth, sync-resume-crawl, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, refresh-archive-viewer-control, version")
 	}
 }
 func main() {

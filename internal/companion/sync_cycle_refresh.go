@@ -135,6 +135,10 @@ func (s *Service) claimSyncRefresh(ctx context.Context, c SyncCycle, now time.Ti
 	if err = syncCycleBindingTx(ctx, tx, s.Store, c); err != nil {
 		return 0, err
 	}
+	ready, err := collectionSlotReady(ctx, tx, now)
+	if err != nil || !ready {
+		return 0, err
+	}
 	var active bool
 	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sync_cycles WHERE id=? AND owner_id=? AND upstream_id=? AND generation=? AND stage='refresh')", c.ID, c.OwnerID, c.UserID, c.Generation).Scan(&active); err != nil {
 		return 0, err
@@ -166,6 +170,9 @@ func (s *Service) claimSyncRefresh(ctx context.Context, c SyncCycle, now time.Ti
 	if _, err = tx.ExecContext(ctx, "UPDATE profile_watch_budget SET day=?,used=?,next_request=? WHERE id=1", today, used+1, now.Add(gap).UnixMilli()); err != nil {
 		return 0, err
 	}
+	if _, err = tx.ExecContext(ctx, holdCollectionSlot, now.Add(crawlGap).UnixMilli()); err != nil {
+		return 0, err
+	}
 	if _, err = tx.ExecContext(ctx, "UPDATE sync_refresh_items SET next_attempt_ms=? WHERE cycle_id=? AND profile_id=? AND state='pending'", now.Add(gap).UnixMilli(), c.ID, profile); err != nil {
 		return 0, err
 	}
@@ -193,6 +200,12 @@ func (s *Service) syncRefreshOne(ctx context.Context, c SyncCycle, ss Session, n
 	if s.foregroundPending() {
 		return false, nil
 	}
+	if s.Crawler != nil {
+		if !s.Crawler.mu.TryLock() {
+			return false, nil
+		}
+		defer s.Crawler.mu.Unlock()
+	}
 	free, err := FreeBytes(s.Config.DataDir)
 	if err != nil || free < s.Config.MinFreeBytes {
 		return false, err
@@ -208,6 +221,9 @@ func (s *Service) syncRefreshOne(ctx context.Context, c SyncCycle, ss Session, n
 		gap = s.Watcher.Config.WatchGap
 	}
 	if _, err = s.Store.DB.ExecContext(ctx, "UPDATE profile_watch_budget SET next_request=MAX(next_request,?) WHERE id=1", finished.Add(gap).UnixMilli()); err != nil {
+		return true, errors.Join(requestErr, err)
+	}
+	if _, err = s.Store.DB.ExecContext(ctx, holdCollectionSlot, finished.Add(crawlGap).UnixMilli()); err != nil {
 		return true, errors.Join(requestErr, err)
 	}
 	if err = ctx.Err(); err != nil {

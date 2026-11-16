@@ -328,7 +328,11 @@ func TestBotParserCollectsWhileTelegramSetupIsUnavailable(t *testing.T) {
 		}
 	}()
 	runtimeAwait(t, setupCalled)
-	runtimeAwait(t, sourceCalled)
+	select {
+	case <-sourceCalled:
+	case <-time.After(8 * time.Second):
+		t.Fatalf("saved-profile checks did not start: last error %q", s.Store.Meta(ctx, "watch_last_error"))
+	}
 	if unexpected.Load() != 0 || s.Store.Meta(ctx, "private_card_repair") != "processing" {
 		t.Fatal("Telegram-dependent work started before bot setup")
 	}
@@ -368,6 +372,65 @@ func TestBotParserDailySearchCheckpointsWhileTelegramIsUnavailable(t *testing.T)
 			t.Error("bot and daily collector did not stop")
 		}
 	}()
+	deadline := time.NewTimer(8 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			job, err := s.Store.CrawlStatus(ctx, 1)
+			t.Fatalf("daily search did not save the next page: job=%+v err=%v", job, err)
+		case <-tick.C:
+			j, err := s.Store.CrawlStatus(ctx, 1)
+			if err == nil && j != nil && j.Page == 2 && j.Pages == 1 {
+				return
+			}
+		}
+	}
+}
+
+func TestBotParserChecksSavedProfileDuringBlockedSearchAndTelegramFailure(t *testing.T) {
+	s, now := syncFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Config.Token = "fixture"
+	ids, err := s.Store.ArchiveViewed(ctx, 1, []Profile{{"userId": 90, "name": "fixture"}}, "fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncAuthRecoveryExec(t, s, "UPDATE versions SET last_seen=? WHERE id=?", now.Add(-48*time.Hour).Format(time.DateTime), ids[0])
+	if started, err := s.startSyncCycle(ctx, 1, *now); err != nil || !started {
+		t.Fatalf("start=%v err=%v", started, err)
+	}
+	syncAuthRecoveryExec(t, s, "UPDATE feed_crawls SET state='stopped',reason='request_failed' WHERE owner_id=1")
+	if _, err := s.SyncCycleStep(ctx); err != nil || syncStatus(t, s).Stage != "blocked" {
+		t.Fatalf("blocked search err=%v", err)
+	}
+	s.TG.HTTP.Transport = archiveRoundTripper(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("fixture: Telegram unreachable")
+	})
+	s.Client.HTTP.Transport = handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/user/getUser" || r.Method != http.MethodGet || r.URL.Query().Get("targetUserId") != "90" {
+			t.Errorf("unexpected source request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"userId":90,"name":"fixture","description":"current"}`))
+	})}
+	done := make(chan error, 1)
+	go func() { done <- s.RunBotParser(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("bot and source workers did not stop")
+		}
+	}()
 	deadline := time.NewTimer(4 * time.Second)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
@@ -375,12 +438,23 @@ func TestBotParserDailySearchCheckpointsWhileTelegramIsUnavailable(t *testing.T)
 	for {
 		select {
 		case <-deadline.C:
-			t.Fatal("daily search did not save the next page")
+			t.Fatal("watcher did not save a full read while search was blocked")
 		case <-tick.C:
-			j, err := s.Store.CrawlStatus(ctx, 1)
-			if err == nil && j != nil && j.Page == 2 && j.Pages == 1 {
-				return
+			var version, checked int64
+			err := s.Store.DB.QueryRowContext(ctx, `SELECT r.version_id,w.last_checked FROM sync_full_reads r
+ JOIN profile_watch w ON w.owner_id=r.owner_id AND w.profile_id=r.profile_id
+ WHERE r.owner_id=1 AND r.upstream_id=101 AND r.generation='source-one' AND r.profile_id=90 AND w.last_result='available'`).Scan(&version, &checked)
+			if err != nil {
+				continue
 			}
+			if version == ids[0] || checked != now.UnixMilli() || syncStatus(t, s).Stage != "blocked" {
+				t.Fatalf("watcher did not preserve independent progress: version=%d checked=%d", version, checked)
+			}
+			ready, err := collectionSlotReady(ctx, s.Store.DB, *now)
+			if err != nil || ready {
+				t.Fatalf("watch did not reserve the shared collection gap: ready=%v err=%v", ready, err)
+			}
+			return
 		}
 	}
 }

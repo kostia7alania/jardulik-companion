@@ -37,7 +37,9 @@ func logOperationsFailure(ctx context.Context, source, method, path string, owne
 		attrs = append(attrs, "http_status", te.Code, "retry_after", te.RetryAfter, "description", operationsSafeText(te.Description, 240))
 	}
 	if upstream != nil {
-		attrs = append(attrs, "http_status", upstream.Status, "retry_after", int64(upstream.RetryAfter.Seconds()))
+		if upstream.Status > 0 {
+			attrs = append(attrs, "http_status", upstream.Status, "retry_after", int64(upstream.RetryAfter.Seconds()))
+		}
 		if requestedStage != path {
 			attrs = append(attrs, "requested_stage", operationsSafeText(requestedStage, 120))
 		}

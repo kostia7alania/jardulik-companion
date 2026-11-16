@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -112,9 +113,10 @@ func (s *Store) StopCrawl(ctx context.Context, owner int64, reason string) error
 }
 
 type FeedCrawler struct {
-	Service *Service
-	mu      sync.Mutex
-	now     func() time.Time
+	Service        *Service
+	mu             sync.Mutex
+	now            func() time.Time
+	watchScanAfter time.Time
 }
 
 func NewFeedCrawler(s *Service) *FeedCrawler {
@@ -341,12 +343,22 @@ func (c *FeedCrawler) Run(ctx context.Context) {
 		return
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	var watchFirst, crawlStopped bool
 	for ctx.Err() == nil {
 		delay, stage := time.Second, "schedule"
-		_, err = c.ScheduleDaily(ctx)
-		if err == nil {
-			stage = "step"
-			_, err = c.Step(ctx)
+		watchTried := watchFirst && c.Service.Config.SyncCycleEnabled
+		if watchTried && c.watchStep(ctx) {
+			watchFirst = false
+			continue
+		}
+		var worked bool
+		err = nil
+		if !crawlStopped {
+			_, err = c.ScheduleDaily(ctx)
+			if err == nil {
+				stage = "step"
+				worked, err = c.Step(ctx)
+			}
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -365,15 +377,54 @@ func (c *FeedCrawler) Run(ctx context.Context) {
 			slog.Warn(message, "kind", safeError(err), "stage", stage,
 				"sqlite_code", code, "error_type", fmt.Sprintf("%T", err))
 			if stopFailed {
-				return
+				if !c.Service.Config.SyncCycleEnabled {
+					return
+				}
+				crawlStopped = true
 			}
 			delay = 5 * time.Second
+		}
+		if worked {
+			watchFirst = true
+		} else if c.Service.Config.SyncCycleEnabled && !watchTried {
+			c.watchStep(ctx)
 		}
 		if !sleep(ctx, delay) {
 			return
 		}
 	}
 }
+
+func (c *FeedCrawler) watchStep(ctx context.Context) bool {
+	s := c.Service
+	if s.Watcher == nil || s.foregroundPending() || !c.mu.TryLock() {
+		return false
+	}
+	defer c.mu.Unlock()
+	now := s.Watcher.now()
+	if now.Before(c.watchScanAfter) {
+		return false
+	}
+	ready, err := collectionSlotReady(ctx, s.Store.DB, now)
+	if err != nil || !ready {
+		return false
+	}
+	c.watchScanAfter = now.Add(5 * time.Second)
+	worked, err := s.Watcher.checkOne(withCrawlPriority(ctx, s), s)
+	if err != nil && ctx.Err() == nil {
+		_ = s.Store.SetMeta(ctx, "watch_last_error", watchErrorCode(err))
+	}
+	return worked
+}
+
+func collectionSlotReady(ctx context.Context, q reactionQuerier, now time.Time) (bool, error) {
+	var next int64
+	err := q.QueryRowContext(ctx, `SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='feed_crawl_next'),0)`).Scan(&next)
+	return next <= now.UnixMilli(), err
+}
+
+const holdCollectionSlot = `INSERT INTO meta(key,value) VALUES('feed_crawl_next',?)
+ ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER))`
 
 var errCrawlStopPersistence = errors.New("crawl stop not committed")
 
@@ -445,6 +496,9 @@ func crawlErrorReason(err error) string {
 		if upstream.Kind == "unexpected_response_or_challenge" {
 			return "challenge"
 		}
+		if upstream.Kind == sourceTransportInterrupted {
+			return sourceTransportInterrupted
+		}
 		return fmt.Sprintf("http_%d", upstream.Status)
 	}
 	return "request_failed"
@@ -464,19 +518,32 @@ func crawlRetryKey(owner int64) string { return "feed_crawl_retry:" + strconv.Fo
 
 func crawlRetryableGET(err error) (*UpstreamError, bool) {
 	var upstream *UpstreamError
-	if !errors.As(err, &upstream) || upstream.Kind != "request_rejected" {
+	if !errors.As(err, &upstream) || (upstream.Method != "" && upstream.Method != http.MethodGet) || !crawlReadEndpoint(upstream.Endpoint) {
 		return nil, false
 	}
-	switch upstream.Status {
-	case 500, 502, 503, 504:
+	switch upstream.Kind {
+	case sourceTransportInterrupted:
+		if upstream.Status != 0 {
+			return nil, false
+		}
+	case "request_rejected":
+		switch upstream.Status {
+		case 500, 502, 503, 504:
+		default:
+			return nil, false
+		}
 	default:
 		return nil, false
 	}
-	switch upstream.Endpoint {
+	return upstream, true
+}
+
+func crawlReadEndpoint(endpoint string) bool {
+	switch endpoint {
 	case "/user/getMe", "/user/getUsers", "/user/getUsersLocations", "/user/getUser":
-		return upstream, true
+		return true
 	default:
-		return nil, false
+		return false
 	}
 }
 
@@ -537,17 +604,20 @@ func (c *FeedCrawler) retryGET(ctx context.Context, j *CrawlJob, target int64, u
 	if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", crawlRetryKey(j.Owner), string(encoded)); err != nil {
 		return err
 	}
-	if retry.Failures == 3 {
+	if retry.Failures == 3 && !c.Service.Config.SyncCycleEnabled {
 		_, err = tx.ExecContext(ctx, "UPDATE feed_crawls SET state='stopped',reason=?,updated_at=? WHERE owner_id=? AND run_id=?", crawlErrorReason(upstream), c.now().UnixMilli(), j.Owner, j.RunID)
 	} else {
 		delay := time.Minute
-		if retry.Failures == 2 {
+		switch retry.Failures {
+		case 2:
 			delay = 5 * time.Minute
+		case 3:
+			delay = time.Hour
 		}
 		if upstream.RetryAfter > delay {
 			delay = upstream.RetryAfter
 		}
-		_, err = tx.ExecContext(ctx, "UPDATE feed_crawls SET state='queued',reason=?,next_request=MAX(next_request,?),updated_at=? WHERE owner_id=? AND run_id=?", fmt.Sprintf("retry_http_%d", upstream.Status), c.now().Add(delay).UnixMilli(), c.now().UnixMilli(), j.Owner, j.RunID)
+		_, err = tx.ExecContext(ctx, "UPDATE feed_crawls SET state='queued',reason=?,next_request=MAX(next_request,?),updated_at=? WHERE owner_id=? AND run_id=?", "retry_"+crawlErrorReason(upstream), c.now().Add(delay).UnixMilli(), c.now().UnixMilli(), j.Owner, j.RunID)
 	}
 	if err != nil {
 		return err

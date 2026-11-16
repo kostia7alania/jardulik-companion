@@ -533,10 +533,17 @@ func (s *Service) SyncCycleStep(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	var queued bool
 	for _, owner := range owners {
-		if _, err = s.startSyncCycle(ctx, owner, s.Client.Now()); err != nil {
+		started, err := s.startSyncCycle(ctx, owner, s.Client.Now())
+		if err != nil {
 			return false, err
 		}
+		queued = queued || started
+	}
+	if queued {
+		// Yield the new cursors to the collector before processing another stage.
+		return true, nil
 	}
 	c, err := scanSyncCycle(s.Store.DB.QueryRowContext(ctx, `SELECT `+syncCycleColumns+` FROM sync_cycles current
  WHERE stage IN ('search','refresh') OR (stage IN ('draining','publishing') AND id=(
