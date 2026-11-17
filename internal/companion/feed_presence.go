@@ -102,25 +102,28 @@ func finishFeedAbsencesTx(ctx context.Context, tx *sql.Tx, job *CrawlJob, upstre
 	if err != nil {
 		return err
 	}
+	at := observed.UTC().Format(time.RFC3339Nano)
 	rows, err := tx.QueryContext(ctx, `WITH observed AS (
- SELECT p.profile_id,p.baseline_version_id,p.is_baseline,(`+seen+`) AS seen
+ SELECT p.owner_id,p.profile_id,p.baseline_version_id,p.is_baseline,(`+seen+`) AS seen
  FROM crawl_presence_profiles p JOIN feed_crawls j ON j.owner_id=p.owner_id AND j.run_id=p.run_id
  WHERE p.owner_id=? AND p.run_id=?)
- SELECT p.profile_id,COALESCE(a.baseline_version_id,p.baseline_version_id),p.seen
- FROM observed p LEFT JOIN profile_feed_absences a ON a.owner_id=? AND a.upstream_id=? AND a.profile_id=p.profile_id
+ SELECT p.profile_id,COALESCE(a.baseline_version_id,p.baseline_version_id),p.seen,
+ COALESCE(pp.availability='unavailable' AND pp.reason='direct_unavailable' AND julianday(pp.changed_at)<=julianday(?),0)
+ FROM observed p LEFT JOIN profile_feed_absences a ON a.owner_id=p.owner_id AND a.upstream_id=? AND a.profile_id=p.profile_id
+ LEFT JOIN profile_presence pp ON pp.owner_id=p.owner_id AND pp.profile_id=p.profile_id
  WHERE (p.seen AND a.profile_id IS NOT NULL) OR (NOT p.seen AND p.is_baseline=1 AND a.profile_id IS NULL)
- ORDER BY p.profile_id`, job.Owner, job.RunID, job.Owner, upstream)
+ ORDER BY p.profile_id`, job.Owner, job.RunID, at, upstream)
 	if err != nil {
 		return err
 	}
 	type change struct {
-		profile, baseline int64
-		returned          bool
+		profile, baseline             int64
+		returned, directlyUnavailable bool
 	}
 	var changes []change
 	for rows.Next() {
 		var c change
-		if err = rows.Scan(&c.profile, &c.baseline, &c.returned); err != nil {
+		if err = rows.Scan(&c.profile, &c.baseline, &c.returned, &c.directlyUnavailable); err != nil {
 			rows.Close()
 			return err
 		}
@@ -131,7 +134,6 @@ func finishFeedAbsencesTx(ctx context.Context, tx *sql.Tx, job *CrawlJob, upstre
 	if err != nil {
 		return err
 	}
-	at := observed.UTC().Format(time.RFC3339Nano)
 	for _, c := range changes {
 		current, err := presenceVersionTx(ctx, tx, job.Owner, c.profile)
 		if err != nil {
@@ -153,6 +155,10 @@ func finishFeedAbsencesTx(ctx context.Context, tx *sql.Tx, job *CrawlJob, upstre
 		}
 		if err != nil {
 			return err
+		}
+		// Keep the feed baseline for detecting a return after a stronger notice.
+		if !c.returned && c.directlyUnavailable {
+			continue
 		}
 		var transition int64
 		if err = tx.QueryRowContext(ctx, `UPDATE profile_presence SET transition=transition+1

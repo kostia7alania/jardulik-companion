@@ -115,6 +115,36 @@ func TestCrawlPresenceOnlyCompleteRunDeclaresAbsenceOnce(t *testing.T) {
 	}
 }
 
+func TestCrawlPresenceKeepsAbsenceWithoutRepeatingDirectUnavailable(t *testing.T) {
+	f := newPresenceFixture(t)
+	f.save(t, 1, 91, 48*time.Hour)
+	if !presenceObserve(t, f, false) {
+		t.Fatal("direct unavailability was not recorded")
+	}
+	f.now = f.now.Add(time.Hour)
+	j := presenceRun(t, f, 1, "missing-after-direct")
+	presenceFinish(t, f, j, "done")
+	var duplicate, ordinary int
+	err := f.store.DB.QueryRow(`SELECT
+ COALESCE(SUM(profile_id=90 AND reason='feed_absent'),0),
+ COALESCE(SUM(profile_id=91 AND reason='feed_absent'),0)
+ FROM profile_presence_events`).Scan(&duplicate, &ordinary)
+	if err != nil || duplicate != 0 || ordinary != 1 ||
+		watchCount(t, f.store, "profile_presence_events") != 2 ||
+		watchCount(t, f.store, "profile_feed_absences") != 2 {
+		t.Fatalf("wrong feed notices or missing baseline: duplicate=%d ordinary=%d err=%v", duplicate, ordinary, err)
+	}
+	f.now = f.now.Add(24 * time.Hour)
+	j = presenceRun(t, f, 1, "back-in-feed")
+	presenceSeen(t, f, j, watchProfile(90))
+	presenceFinish(t, f, j, "done")
+	var returned int
+	err = f.store.DB.QueryRow("SELECT COUNT(*) FROM profile_presence_events WHERE profile_id=90 AND reason='feed_returned'").Scan(&returned)
+	if err != nil || returned != 1 {
+		t.Fatalf("return to the feed was not recorded: %d %v", returned, err)
+	}
+}
+
 func TestCrawlPresenceReturnUsesDurableMissingBaseline(t *testing.T) {
 	for _, changed := range []bool{false, true} {
 		t.Run(fmt.Sprint(changed), func(t *testing.T) {
