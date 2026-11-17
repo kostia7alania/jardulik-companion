@@ -217,6 +217,25 @@ func operationsEventText(op operationsOperation, botToken string) (string, []Mes
 		}
 	}
 	heading := fmt.Sprintf("%s %s · %s", icon, operationsSafeText(redact(op.Role), 40), operationsSafeText(redact(op.Text), 180))
+	if fields["component"] == "media_jobs" {
+		reason, _ := fields["kind"].(string)
+		switch reason {
+		case mediaHTMLResponse:
+			reason = "сервер вернул HTML вместо изображения"
+		case "unexpected_content_type":
+			reason = "сервер вернул файл другого типа"
+		case "download_failed":
+			reason = "исчерпаны попытки загрузки"
+		case "oversize":
+			reason = "файл превышает лимит"
+		case "untrusted_media_origin":
+			reason = "недопустимый адрес источника"
+		}
+		heading = icon + " Ошибка загрузки фото"
+		if reason != "" {
+			heading += " · " + reason
+		}
+	}
 	var request string
 	var reconnect bool
 	if op.Text == "API operation failed" {
@@ -230,13 +249,19 @@ func operationsEventText(op operationsOperation, botToken string) (string, []Mes
 					label = "код"
 				}
 				heading += fmt.Sprintf(" · %s %d", label, status)
+			} else if fields["kind"] == "Jardulik: "+sourceTransportInterrupted {
+				heading += " · соединение прервалось"
 			}
 			method, _ := fields["method"].(string)
 			reconnect = source == "Jardulik" && method == "PUT" && fields["stage"] == "/appuser/refresh" && status == 400
 			switch method {
 			case "GET", "POST", "PUT", "PATCH", "DELETE":
-				if requestURL, ok := fields["request_url"].(string); ok && source == "Jardulik" {
-					request = fmt.Sprintf("%s: '%s'", method, requestURL)
+				if source == "Jardulik" {
+					if requestURL, ok := fields["request_url"].(string); ok {
+						request = fmt.Sprintf("%s: '%s'", method, requestURL)
+					} else if stage, _ := fields["stage"].(string); strings.HasPrefix(stage, "/") {
+						request = method + " " + stage
+					}
 				}
 			}
 		}

@@ -17,6 +17,8 @@ import (
 	"time"
 )
 
+const mediaHTMLResponse = "html_instead_of_image"
+
 type MediaManager struct {
 	Store  *Store
 	Config Config
@@ -115,9 +117,14 @@ func (m *MediaManager) ensure(ctx context.Context, j MediaJob, background bool) 
 		m.Store.MediaError(ctx, j.ID, fmt.Sprintf("HTTP_%d", res.StatusCode))
 		return errors.New("photo unavailable")
 	}
-	mime := strings.ToLower(strings.Split(res.Header.Get("Content-Type"), ";")[0])
+	mime, _, _ := strings.Cut(res.Header.Get("Content-Type"), ";")
+	mime = strings.ToLower(strings.TrimSpace(mime))
 	if !strings.HasPrefix(mime, "image/") {
-		m.Store.MediaError(ctx, j.ID, "unexpected_content_type")
+		reason := "unexpected_content_type"
+		if mime == "text/html" || mime == "application/xhtml+xml" {
+			reason = mediaHTMLResponse
+		}
+		m.Store.MediaError(ctx, j.ID, reason)
 		return errors.New("media response is not an image")
 	}
 	dir := filepath.Join(m.Config.DataDir, "media")

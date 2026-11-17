@@ -217,9 +217,12 @@ func (s *Service) appendOperationsRecordTx(ctx context.Context, tx *sql.Tx, reco
 	}
 	fingerprintFields := map[string]any{}
 	for key, value := range fields {
-		if key != "pid" {
-			fingerprintFields[key] = value
+		// Each failed photo job is still counted. Keep the latest job in the
+		// details and group its notification with other jobs of the same cause.
+		if key == "pid" || (key == "job_id" && fields["component"] == "media_jobs") {
+			continue
 		}
+		fingerprintFields[key] = value
 	}
 	identity, _ := json.Marshal([]any{record.Role, record.Level, operationsSafeText(record.Message, 300), fingerprintFields})
 	_, err = tx.ExecContext(ctx, `INSERT INTO operations_events(owner_id,chat_id,fingerprint,role,level,message,fields_json,first_at_ms,last_at_ms) VALUES(?,?,?,?,?,?,?,?,?)

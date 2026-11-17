@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -104,6 +105,69 @@ func (f *operationsFixture) addEvent(t *testing.T) {
  VALUES(123,-100123,'fixture','poster','ERROR','publication unavailable','{"kind":"operation_failed","target":7}',?,?,1)`, f.now.UnixMilli(), f.now.UnixMilli())
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOperationsMediaHTMLFailuresEditOneAlert(t *testing.T) {
+	f := newOperationsFixture(t)
+	f.ready(t)
+	ctx, s := context.Background(), f.s
+	owner := s.Config.OwnerID
+	if err := s.Store.SaveSession(ctx, owner, Session{Token: "test", Refresh: "test", UserID: 42}); err != nil {
+		t.Fatal(err)
+	}
+	versions, err := s.Store.Archive(ctx, owner, []Profile{{
+		"userId": 7, "photos": []string{"https://mini.jardulik.app/one.webp", "https://mini.jardulik.app/two.webp"},
+	}}, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := s.Store.MediaJobs(ctx, owner, versions[0])
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("want two photo jobs: %v", err)
+	}
+	media := NewMediaManager(s.Store, s.Config)
+	media.HTTP.Transport = archiveRoundTripper(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"text/html; charset=utf-8"}}, Body: io.NopCloser(strings.NewReader("<!doctype html>")), Request: r}, nil
+	})
+	var message int64
+	for _, job := range jobs {
+		if err = media.Ensure(ctx, job); err == nil {
+			t.Fatal("HTML accepted as a photo")
+		}
+		if err = s.collectOperationsLogs(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if did, err := f.step(t); !did || err != nil {
+			t.Fatalf("deliver photo alert: did=%v err=%v", did, err)
+		}
+		if message == 0 {
+			if err = s.Store.DB.QueryRow("SELECT message_id FROM operations_events").Scan(&message); err != nil || message <= 0 {
+				t.Fatalf("first alert did not get a receipt: %d %v", message, err)
+			}
+		}
+	}
+	last := f.bodies[len(f.bodies)-1]
+	var edited int64
+	var body string
+	var entities []MessageEntity
+	_ = json.Unmarshal(last["message_id"], &edited)
+	_ = json.Unmarshal(last["text"], &body)
+	_ = json.Unmarshal(last["entities"], &entities)
+	if f.calls[len(f.calls)-1] != "editMessageText" || edited != message ||
+		!strings.Contains(body, "сервер вернул HTML вместо изображения · ×2") ||
+		len(entities) != 1 || entities[0].Type != "expandable_blockquote" || validMessageEntities(body, entities) != nil {
+		t.Fatalf("duplicate did not update one readable alert: edited=%d body=%q entities=%v", edited, body, entities)
+	}
+	if err = s.collectOperationsLogs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if did, err := f.step(t); did || err != nil {
+		t.Fatalf("rescanning the failures produced another post: did=%v err=%v", did, err)
+	}
+	status, err := s.OperationsStatus(ctx)
+	if err != nil || !strings.Contains(status, "📷 Фото: 0/2 · ошибок 2") {
+		t.Fatalf("photo errors missing from status: %s %v", status, err)
 	}
 }
 

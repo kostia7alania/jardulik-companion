@@ -153,6 +153,7 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 		table, label, scope, done string
 		args                      []any
 	}{
+		{"media_jobs", "📷 Фото", "owner_id=?", "complete", []any{s.Config.OwnerID}},
 		{"archive_versions", "📦 Архив", "owner_id=?", "sent", []any{s.Config.OwnerID}},
 		{"analysis_posts", "📣 Совместимости", "owner_id=?", "sent", []any{s.Config.OwnerID}},
 		{"caption_maintenance_jobs", "🎨 Оформление", "owner_id=? AND revision=?", "done", []any{s.Config.OwnerID, captionDesignRevision}},
@@ -173,6 +174,16 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 			done += counts["duplicate"] + counts["partial"]
 		}
 		line := fmt.Sprintf("%s: %d/%d", item.label, done, operationsCountTotal(counts))
+		if item.table == "media_jobs" {
+			if n := counts["pending"]; n > 0 {
+				line += fmt.Sprintf(" · в очереди %d", n)
+			}
+			if n := counts["error"]; n > 0 {
+				line += fmt.Sprintf(" · ошибок %d", n)
+			}
+			lines = append(lines, line)
+			continue
+		}
 		if item.table == "full_backup_jobs" {
 			line = fmt.Sprintf("%s: отправлено %d · без изменений %d", item.label, done, counts["skipped"])
 			if n := counts["pending"] + counts["ready"]; n > 0 {
