@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 )
 
@@ -16,6 +17,17 @@ func (s *Service) ResumeStoppedCrawl(ctx context.Context, owner int64, cycleID, 
 	}
 	if err := s.Store.InitSyncCycles(ctx); err != nil {
 		return nil, err
+	}
+	return s.resumeStoppedCrawl(ctx, owner, cycleID, runID, eventID)
+}
+
+func (s *Service) resumeStoppedCrawl(ctx context.Context, owner int64, cycleID, runID string, eventID int64) (*SyncCycle, error) {
+	reason := "request_failed"
+	if eventID == 0 {
+		reason = "disk_reserve"
+		if err := s.Media.CheckDisk(); err != nil {
+			return nil, nil
+		}
 	}
 	now := s.Client.Now().UnixMilli()
 	tx, err := s.Store.DB.BeginTx(ctx, nil)
@@ -40,8 +52,8 @@ func (s *Service) ResumeStoppedCrawl(ctx context.Context, owner int64, cycleID, 
 	if err != nil {
 		return nil, err
 	}
-	if !syncBroadRun(job, Session{UserID: cycle.UserID, Generation: cycle.Generation}) || job.RunID != runID || job.State != "stopped" || job.Reason != "request_failed" {
-		return nil, errors.New("stopped crawl does not match a legacy read failure")
+	if !syncBroadRun(job, Session{UserID: cycle.UserID, Generation: cycle.Generation}) || job.RunID != runID || job.State != "stopped" || job.Reason != reason {
+		return nil, errors.New("stopped crawl does not match the recovery request")
 	}
 	var unfinished bool
 	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM crawl_presence_runs WHERE owner_id=? AND run_id=? AND finished_at IS NULL)
@@ -52,14 +64,19 @@ func (s *Service) ResumeStoppedCrawl(ctx context.Context, owner int64, cycleID, 
 	if !unfinished {
 		return nil, errors.New("crawl collection is already closed")
 	}
-	if err = verifyLegacyCrawlRead(ctx, tx, owner, eventID, job); err != nil {
-		return nil, err
+	receiptKey := "sync_crawl_resume:" + cycleID
+	if eventID > 0 {
+		if err = verifyLegacyCrawlRead(ctx, tx, owner, eventID, job); err != nil {
+			return nil, err
+		}
+	} else {
+		receiptKey = fmt.Sprintf("sync_crawl_disk_resume:%s:%d", cycleID, job.UpdatedAt)
 	}
-	log, err := json.Marshal(map[string]any{"event_id": eventID, "mode": job.Mode, "page": job.Page, "stopped_at_ms": job.UpdatedAt, "resumed_at_ms": now})
+	log, err := json.Marshal(map[string]any{"event_id": eventID, "reason": reason, "mode": job.Mode, "page": job.Page, "stopped_at_ms": job.UpdatedAt, "resumed_at_ms": now})
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?)", "sync_crawl_resume:"+cycleID, string(log)); err != nil {
+	if _, err = tx.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES(?,?)", receiptKey, string(log)); err != nil {
 		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE feed_crawls SET state='queued',reason='',updated_at=?,

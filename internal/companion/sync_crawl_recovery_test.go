@@ -55,6 +55,43 @@ func TestResumeStoppedCrawlKeepsHydrationAndPacing(t *testing.T) {
 	}
 }
 
+func TestSyncCrawlResumesSameCheckpointAfterFreeSpaceReturns(t *testing.T) {
+	s, now := syncFixture(t)
+	ctx := context.Background()
+	if started, err := s.startSyncCycle(ctx, 1, *now); err != nil || !started {
+		t.Fatalf("start=%v err=%v", started, err)
+	}
+	cycle := syncStatus(t, s)
+	syncAuthRecoveryExec(t, s, "UPDATE feed_crawls SET mode=3,page=499,hydrated=498 WHERE owner_id=1")
+	reserve := s.Media.Config.MinFreeBytes
+	s.Media.Config.MinFreeBytes = ^uint64(0)
+	if worked, err := s.Crawler.Step(ctx); !worked || err != nil {
+		t.Fatalf("disk stop: worked=%v err=%v", worked, err)
+	}
+	if _, err := s.SyncCycleStep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := syncStatus(t, s); got.Stage != "blocked" || got.Reason != "search_incomplete" {
+		t.Fatalf("stop was not recorded: %+v", got)
+	}
+	if worked, err := s.SyncCycleStep(ctx); worked || err != nil {
+		t.Fatalf("reserve still missing: worked=%v err=%v", worked, err)
+	}
+	s.Media.Config.MinFreeBytes = reserve
+	next := now.Add(time.Minute).UnixMilli()
+	syncAuthRecoveryExec(t, s, holdCollectionSlot, next)
+	if worked, err := s.SyncCycleStep(ctx); !worked || err != nil {
+		t.Fatalf("disk recovery: worked=%v err=%v", worked, err)
+	}
+	if got := syncStatus(t, s); got.ID != cycle.ID || got.Stage != "search" {
+		t.Fatalf("wrong cycle resumed: %+v", got)
+	}
+	job, err := s.Store.CrawlStatus(ctx, 1)
+	if err != nil || job.State != "queued" || job.RunID != cycle.SearchRunID || job.Mode != 3 || job.Page != 499 || job.Hydrated != 498 || job.NextRequest != next {
+		t.Fatalf("resumed checkpoint=%+v err=%v", job, err)
+	}
+}
+
 func TestSyncCrawlRetriesInterruptedGETWithoutLosingThePage(t *testing.T) {
 	s, now := syncFixture(t)
 	ctx := context.Background()

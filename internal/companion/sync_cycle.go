@@ -215,6 +215,17 @@ func (s *Service) startSyncCycle(ctx context.Context, owner int64, now time.Time
 	}
 	supersede := false
 	if previous != nil {
+		if previous.Stage == "blocked" && previous.Reason == "search_incomplete" && previous.CollectedAt == 0 &&
+			previous.UserID == ss.UserID && previous.Generation == ss.Generation {
+			job, err := s.Store.CrawlStatus(ctx, owner)
+			if err != nil {
+				return false, err
+			}
+			if syncBroadRun(job, ss) && job.RunID == previous.SearchRunID && job.State == "stopped" && job.Reason == "disk_reserve" {
+				resumed, err := s.resumeStoppedCrawl(ctx, owner, previous.ID, job.RunID, 0)
+				return resumed != nil, err
+			}
+		}
 		if now.UnixMilli() < previous.NextCycle {
 			return false, nil
 		}
