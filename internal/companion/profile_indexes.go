@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,6 +29,8 @@ type profileIndexOperation struct {
 
 var errProfileIndexBinding = errors.New("profile index source or receipt changed")
 var errProfileIndexReceipt = errors.New("profile index Telegram receipt unconfirmed")
+
+const profileIndexMessageMissing = "telegram_index_message_missing"
 
 func (s *Service) profileIndexesAllowed() bool {
 	return s.Archiver != nil && s.Archiver.TG != nil && s.Config.OwnerID > 0 && s.Config.OwnerID == s.Archiver.Config.OwnerID && s.Config.BackupChatID != 0 && s.Config.BackupChatID == s.Archiver.Config.BackupChatID && s.Config.BackupThreadID == s.Archiver.Config.BackupThreadID && !s.Config.ArchivePaused && !s.Archiver.Config.ArchivePaused
@@ -84,6 +87,12 @@ func (s *Service) recoverProfileIndexes(ctx context.Context) error {
 	if _, err = tx.ExecContext(ctx, `UPDATE profile_index_pages SET state=CASE WHEN state='sending' AND message_id=0 THEN 'uncertain' ELSE 'pending' END,
  error=CASE WHEN state='sending' AND message_id=0 THEN 'worker_restarted_during_request' ELSE '' END,updated_at=CURRENT_TIMESTAMP
  WHERE topic_id IN (SELECT id FROM profile_index_topics WHERE owner_id=?) AND state IN ('preparing','sending')`, s.Config.OwnerID); err != nil {
+		return err
+	}
+	// Older rows stored only the HTTP code. Verify the existing message with an idempotent edit.
+	if _, err = tx.ExecContext(ctx, `UPDATE profile_index_pages SET state='pending',next_attempt=0,updated_at=CURRENT_TIMESTAMP
+ WHERE topic_id IN (SELECT id FROM profile_index_topics WHERE owner_id=? AND kind='compatibility')
+ AND state='error' AND error='telegram_400' AND message_id>0 AND COALESCE(json_extract(payload_json,'$.legacy'),0)=0`, s.Config.OwnerID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -410,9 +419,11 @@ func (s *Service) finishProfileIndexOperation(ctx context.Context, op profileInd
 		r, err = s.Store.DB.ExecContext(write, `UPDATE profile_index_topics SET state=?,thread_id=CASE WHEN ?>0 THEN ? ELSE thread_id END,receipt_json=?,next_attempt=?,error=?,updated_at=CURRENT_TIMESTAMP
  WHERE id=? AND owner_id=? AND upstream_id=? AND generation=? AND state IN ('preparing','sending')`, state, thread, thread, receipt, next, detail, op.Topic.ID, op.Topic.Owner, op.Topic.Upstream, op.Topic.Generation)
 	} else {
-		r, err = s.Store.DB.ExecContext(write, `UPDATE profile_index_pages SET state=?,message_id=CASE WHEN ?>0 THEN ? ELSE message_id END,
- sent_sha=CASE WHEN ?='sent' THEN ? ELSE sent_sha END,receipt_json=?,next_attempt=?,error=?,updated_at=CURRENT_TIMESTAMP
- WHERE topic_id=? AND page_no=? AND desired_sha=? AND state IN ('preparing','sending')`, state, message, message, state, op.SHA, receipt, next, detail, op.Topic.ID, op.Page, op.SHA)
+		missing := detail == profileIndexMessageMissing
+		r, err = s.Store.DB.ExecContext(write, `UPDATE profile_index_pages SET state=?,message_id=CASE WHEN ? THEN 0 WHEN ?>0 THEN ? ELSE message_id END,
+ sent_sha=CASE WHEN ? THEN '' WHEN ?='sent' THEN ? ELSE sent_sha END,receipt_json=?,next_attempt=?,error=?,updated_at=CURRENT_TIMESTAMP
+ WHERE topic_id=? AND page_no=? AND desired_sha=? AND message_id=? AND state IN ('preparing','sending')`,
+			state, missing, message, message, missing, state, op.SHA, receipt, next, detail, op.Topic.ID, op.Page, op.SHA, op.Message)
 	}
 	if err != nil {
 		return err
@@ -589,12 +600,21 @@ func (s *Service) deliverProfileIndex(ctx context.Context) (bool, error) {
 		if op.Page == 0 {
 			thread = 0
 		}
-		if op.Message > 0 {
-			message = op.Message
-		} else {
-			message = 0
+		message = op.Message
+		var rejected *TelegramError
+		if attempted && op.Page > 0 && op.Message > 0 && errors.As(last, &rejected) && rejected.Code == 400 {
+			detail = "telegram_index_edit_rejected"
+			description := strings.ToLower(strings.TrimSpace(rejected.Description))
+			if strings.TrimPrefix(description, "bad request: ") == "message to edit not found" {
+				state, detail, next = "pending", profileIndexMessageMissing, 0
+				receipt, _ = json.Marshal(map[string]any{"missing_message_id": op.Message, "code": rejected.Code})
+				message, err = 0, nil
+			}
 		}
 	}
 	finish := s.finishProfileIndexOperation(ctx, op, state, next, detail, receipt, thread, message)
+	if detail == profileIndexMessageMissing && finish == nil {
+		slog.Warn("Страница каталога поставлена на восстановление", "kind", detail, "page", op.Page, "message_id", op.Message)
+	}
 	return true, errors.Join(err, finish)
 }

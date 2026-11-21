@@ -225,7 +225,7 @@ func operationsSafeAttr(fields map[string]any, attr slog.Attr) {
 	switch attr.Key {
 	case "kind", "stage", "requested_stage", "tenant", "owner", "owner_id", "upstream_id", "profile_id", "target_user_id", "run_id", "mode", "page", "sqlite_code", "fatal", "http_status", "retry_after", "component", "source", "job_id", "state", "pid", "method", "description",
 		"age_min", "age_max", "interval_seconds", "daily_cap", "series_count", "super_before_age", "sent", "next_attempt", "reaction_type", "action_id", "mutual",
-		"free_bytes", "reserve_bytes":
+		"free_bytes", "reserve_bytes", "message_id":
 	default:
 		return
 	}

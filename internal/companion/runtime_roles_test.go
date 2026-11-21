@@ -294,6 +294,9 @@ func TestBotParserCollectsWhileTelegramSetupIsUnavailable(t *testing.T) {
 	c.DebugListen = "0.0.0.0:0"
 	s := &Service{Config: c, Store: f.store, Client: f.watch.Client, TG: f.watch.Archiver.TG, Archiver: f.watch.Archiver, Watcher: f.watch}
 	s.Media = NewMediaManager(f.store, c)
+	s.Media.HTTP.Transport = archiveRoundTripper(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("fixture: photo unavailable")
+	})
 	s.Crawler = NewFeedCrawler(s)
 	s.Autoliker = NewAutoliker(s)
 	if err := s.Store.SetMeta(ctx, "private_card_repair", "processing"); err != nil {

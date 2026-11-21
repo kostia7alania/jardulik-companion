@@ -154,9 +154,7 @@ func (w *ProfileWatcher) checkOne(ctx context.Context, service *Service) (bool, 
 	}
 	now := w.now()
 	if service != nil {
-		if err := service.Media.CheckDisk(); errors.Is(err, errDiskReserve) {
-			return false, nil
-		} else if err != nil {
+		if err := service.Media.CheckDisk(); err != nil {
 			return false, err
 		}
 	}
@@ -341,6 +339,9 @@ func photoJobsFromProfileURLs(p Profile) []MediaJob {
 }
 
 func watchErrorCode(err error) string {
+	if errors.Is(err, errDiskReserve) {
+		return "disk_reserve"
+	}
 	var upstream *UpstreamError
 	if errors.As(err, &upstream) {
 		if upstream.Status == 0 {

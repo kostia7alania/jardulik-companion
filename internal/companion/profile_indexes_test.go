@@ -324,6 +324,41 @@ func TestProfileIndexesKnownEditRetryAndNotModified(t *testing.T) {
 	}
 }
 
+func TestProfileIndexesRestorePageAfterConfirmedMissingMessage(t *testing.T) {
+	f := newProfileIndexesFixture(t)
+	f.add(t, 10, 23, "Name", "2003-03-01")
+	for range 3 {
+		f.step(t)
+	}
+	var old int64
+	if err := f.s.Store.DB.QueryRow("SELECT message_id FROM profile_index_pages WHERE page_no=1").Scan(&old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.Store.DB.Exec("UPDATE profile_index_pages SET state='error',error='telegram_400',sent_sha='old' WHERE page_no=1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.recoverProfileIndexes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.respond = func(r *http.Request, method string, payload map[string]json.RawMessage) (*http.Response, error) {
+		var message int64
+		if method != "editMessageText" || json.Unmarshal(payload["message_id"], &message) != nil || message != old {
+			t.Fatal("missing-message repair did not verify the original message")
+		}
+		return albumTestResponse(r, 400, `{"ok":false,"error_code":400,"description":"Bad Request: message to edit not found"}`), nil
+	}
+	f.step(t)
+	if f.count(t, "SELECT COUNT(*) FROM profile_index_pages WHERE page_no=1 AND state='pending' AND message_id=0 AND json_extract(receipt_json,'$.missing_message_id')=?", old) != 1 {
+		t.Fatal("confirmed missing page was not queued for repair")
+	}
+	f.respond = nil
+	f.step(t)
+	if !reflect.DeepEqual(f.operations[3:], []string{"editMessageText", "sendMessage"}) ||
+		f.count(t, "SELECT COUNT(*) FROM profile_index_pages WHERE page_no=1 AND state='sent' AND message_id>0 AND message_id<>?", old) != 1 {
+		t.Fatal("missing page was not restored exactly once", f.operations)
+	}
+}
+
 func TestProfileIndexesSourceFenceAndReceiptValidation(t *testing.T) {
 	f := newProfileIndexesFixture(t)
 	f.add(t, 10, 23, "Name", "2003-03-01")
