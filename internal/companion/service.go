@@ -210,6 +210,9 @@ func (s *Service) runBot(ctx context.Context, role RuntimeRole) error {
 }
 
 func safeError(err error) string {
+	if errors.Is(err, errDiskReserve) {
+		return "disk_reserve"
+	}
 	var te *TelegramError
 	if errors.As(err, &te) {
 		return fmt.Sprintf("telegram_%d", te.Code)

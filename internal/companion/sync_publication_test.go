@@ -688,6 +688,46 @@ func TestSyncPublicationLatePresenceNeverDisposesUnknownAnalysis(t *testing.T) {
 	}
 }
 
+func TestSyncPublicationContinuesPastAnUnconfirmedAttempt(t *testing.T) {
+	f := newProfileIndexesFixture(t)
+	ctx := context.Background()
+	p := f.add(t, 7, 24, "First", "")
+	f.analysis(t, p, "Итоговая оценка совместимости: 95%", time.Now())
+	a, err := f.s.Store.LatestProfileAnalysis(ctx, 123, 7)
+	if err != nil || a == nil {
+		t.Fatal(err)
+	}
+	c := syncPublicationCycle(t, f.s, 123)
+	syncPublicationCohort(t, f.s, c, p)
+	syncPublicationAnalysisFrontier(t, f.s, c, *a)
+	syncPublicationPublish(t, f.s, &c)
+	if _, err = f.s.Store.DB.Exec(`UPDATE analysis_posts SET state='uncertain',response_sha=?,chat_id=?,
+ thread_id=(SELECT thread_id FROM mirror_topics WHERE profile_id=7),error='worker_restarted_during_send'
+ WHERE analysis_id=?`, digest(a.ResponseBody), f.s.Config.BackupChatID, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := f.s.syncCyclePublicationComplete(ctx, c); err != nil || ready {
+		t.Fatal("unpublished index pages were counted as delivered", ready, err)
+	}
+	var disposition, reason, state string
+	if err = f.s.Store.DB.QueryRow(`SELECT i.disposition,i.reason,p.state FROM sync_publication_items i
+ JOIN analysis_posts p ON p.analysis_id=i.item_id WHERE i.cycle_id=? AND i.kind='analysis'`, c.ID).Scan(&disposition, &reason, &state); err != nil {
+		t.Fatal(err)
+	}
+	if disposition != "ignored" || reason != "analysis_delivery_unconfirmed" || state != "uncertain" {
+		t.Fatalf("outbox state lost: %s %s %s", disposition, reason, state)
+	}
+	if worked, err := f.s.deliverAnalysisPost(ctx); err != nil || worked || len(f.operations) != 0 {
+		t.Fatal("unconfirmed send was repeated", worked, err, len(f.operations))
+	}
+	for range 3 {
+		f.step(t)
+	}
+	if ready, err := f.s.syncCyclePublicationComplete(ctx, c); err != nil || !ready {
+		t.Fatal("confirmed index pages did not complete", ready, err)
+	}
+}
+
 func TestSyncPublicationWaitsForScopedCurrentCaptionRevisionBeforeIndexFreeze(t *testing.T) {
 	f := newProfileIndexesFixture(t)
 	p := f.add(t, 7, 24, "First", "")

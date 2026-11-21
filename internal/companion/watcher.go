@@ -154,7 +154,9 @@ func (w *ProfileWatcher) checkOne(ctx context.Context, service *Service) (bool, 
 	}
 	now := w.now()
 	if service != nil {
-		if err := service.Media.CheckDisk(); err != nil {
+		if err := service.Media.CheckDisk(); errors.Is(err, errDiskReserve) {
+			return false, nil
+		} else if err != nil {
 			return false, err
 		}
 	}

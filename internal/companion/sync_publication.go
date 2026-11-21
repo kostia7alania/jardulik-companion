@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -585,7 +586,18 @@ func (s *Service) syncCyclePublicationComplete(ctx context.Context, cycle SyncCy
 			if err != nil {
 				return false, err
 			}
-			ready = state == "sent" && digest(response) == i.sha && sha == i.sha && chat == s.Config.BackupChatID && thread == topic && thread > 0 && thread != s.Config.BackupThreadID && message > 0 && json.Unmarshal(receipt, &ack) == nil && ack.ID == message && ack.Chat.ID == chat && ack.ThreadID == thread
+			bound := digest(response) == i.sha && sha == i.sha && chat == s.Config.BackupChatID && thread == topic && thread > 0 && thread != s.Config.BackupThreadID
+			if state == "uncertain" && bound {
+				// The outbox retains the uncertain send so it cannot be automatically retried.
+				_, err = s.Store.DB.ExecContext(ctx, `UPDATE sync_publication_items SET disposition='ignored',reason='analysis_delivery_unconfirmed'
+ WHERE cycle_id=? AND kind='analysis' AND item_id=? AND disposition='required'`, cycle.ID, i.id)
+				if err != nil {
+					return false, err
+				}
+				slog.Warn("Доставка отчёта GPT требует проверки", "kind", "analysis_delivery_unconfirmed", "job_id", i.id, "profile_id", i.profile)
+				continue
+			}
+			ready = state == "sent" && bound && message > 0 && json.Unmarshal(receipt, &ack) == nil && ack.ID == message && ack.Chat.ID == chat && ack.ThreadID == thread
 		case "presence":
 			var state, source string
 			var chat, thread, message, topic int64

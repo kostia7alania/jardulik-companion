@@ -63,7 +63,6 @@ func TestSyncCrawlResumesSameCheckpointAfterFreeSpaceReturns(t *testing.T) {
 	}
 	cycle := syncStatus(t, s)
 	syncAuthRecoveryExec(t, s, "UPDATE feed_crawls SET mode=3,page=499,hydrated=498 WHERE owner_id=1")
-	reserve := s.Media.Config.MinFreeBytes
 	s.Media.Config.MinFreeBytes = ^uint64(0)
 	if worked, err := s.Crawler.Step(ctx); !worked || err != nil {
 		t.Fatalf("disk stop: worked=%v err=%v", worked, err)
@@ -77,7 +76,7 @@ func TestSyncCrawlResumesSameCheckpointAfterFreeSpaceReturns(t *testing.T) {
 	if worked, err := s.SyncCycleStep(ctx); worked || err != nil {
 		t.Fatalf("reserve still missing: worked=%v err=%v", worked, err)
 	}
-	s.Media.Config.MinFreeBytes = reserve
+	s.Media.Config.CollectionMinFreeBytes = 1
 	next := now.Add(time.Minute).UnixMilli()
 	syncAuthRecoveryExec(t, s, holdCollectionSlot, next)
 	if worked, err := s.SyncCycleStep(ctx); !worked || err != nil {

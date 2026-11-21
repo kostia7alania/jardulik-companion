@@ -18,6 +18,16 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 		now = s.Archiver.now()
 	}
 	lines := []string{"🖥 Сервер", displayTime(now.UTC().Format(time.RFC3339))}
+	if free, err := FreeBytes(s.Config.DataDir); err == nil {
+		reserve := s.Config.collectionReserve()
+		line := fmt.Sprintf("💽 Свободно %d МиБ · сбор от %d МиБ · резерв бэкапа %d МиБ", free>>20, reserve>>20, s.Config.MinFreeBytes>>20)
+		if free < reserve {
+			line += " · сбор ждёт место"
+		}
+		lines = append(lines, line)
+	} else {
+		lines = append(lines, "🔴 Не удалось проверить свободное место")
+	}
 	var allBeat struct {
 		At int64 `json:"at_ms"`
 	}
@@ -206,7 +216,12 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 		if item.table == "archive_versions" && counts["partial"] > 0 {
 			line += fmt.Sprintf(" · частично %d", counts["partial"])
 		}
-		if n := counts["failed"] + counts["error"] + counts["uncertain"] + counts["unknown"]; n > 0 {
+		attention := counts["failed"] + counts["error"] + counts["uncertain"] + counts["unknown"]
+		if n := counts["uncertain"]; item.table == "analysis_posts" && n > 0 {
+			line += fmt.Sprintf(" · доставка не подтверждена %d", n)
+			attention -= n
+		}
+		if n := attention; n > 0 {
 			line += fmt.Sprintf(" · ⚠️ %d", n)
 		}
 		lines = append(lines, line)

@@ -467,9 +467,14 @@ if os.environ['DEPLOY_TEST_NO_START']=='1':sys.exit(99)
 
         result = validate(values)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "536870912")
+        result = validate(dict(values, COLLECTION_MIN_FREE_BYTES="805306368"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "805306368")
         for changes in ({"ALLOW_REACTIONS": "true"}, {"SESSION_KEY": "bad-key"},
                         {"JARDULIK_BOT_ID": "0"}, {"BACKUP_CHAT_ID": "12345"},
-                        {"MIN_FREE_BYTES": "1000"}, {"COMPATIBILITY_ENABLED": "yes"},
+                        {"MIN_FREE_BYTES": "1000"}, {"COLLECTION_MIN_FREE_BYTES": "0"},
+                        {"COLLECTION_MIN_FREE_BYTES": "9223372036854775808"}, {"COMPATIBILITY_ENABLED": "yes"},
                         {"COMPATIBILITY_INTERVAL_SECONDS": "0"}, {"COMPATIBILITY_INTERVAL_SECONDS": "-1"},
                         {"COMPATIBILITY_INTERVAL_SECONDS": "9223372037"}):
             with self.subTest(changes=changes):

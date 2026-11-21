@@ -79,6 +79,33 @@ func TestOperationsLoggingInsideSQLiteWriterKeepsStderrAndOmitsCredentials(t *te
 	}
 }
 
+func TestCollectionDiskReportsOnlyBlockedAndRecoveredTransitions(t *testing.T) {
+	var spool bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(&operationsLogHandler{
+		base: slog.NewJSONHandler(io.Discard, nil),
+		sink: &operationsLogSink{writer: &spool, role: RuntimeBotParser, boot: "disk"},
+	}))
+	defer slog.SetDefault(previous)
+	cfg := Config{DataDir: t.TempDir(), CollectionMinFreeBytes: 1 << 62}
+	state := reportCollectionDisk(cfg, "")
+	state = reportCollectionDisk(cfg, state)
+	cfg.CollectionMinFreeBytes = 1
+	state = reportCollectionDisk(cfg, state)
+	state = reportCollectionDisk(cfg, state)
+	var blocked, recovered operationsLogRecord
+	decoder := json.NewDecoder(&spool)
+	if state != "ready" || decoder.Decode(&blocked) != nil || decoder.Decode(&recovered) != nil {
+		t.Fatalf("expected two disk transitions, state=%s log=%s", state, spool.String())
+	}
+	if blocked.Level != "WARN" || blocked.Fields["kind"] != "disk_reserve" ||
+		blocked.Fields["reserve_bytes"] != float64(1<<62) || blocked.Fields["free_bytes"] == nil ||
+		recovered.Level != "INFO" || recovered.Message != collectionDiskRecovered ||
+		recovered.Fields["reserve_bytes"] != float64(1) || decoder.Decode(&operationsLogRecord{}) != io.EOF {
+		t.Fatal("invalid disk transition diagnostics", spool.String())
+	}
+}
+
 func TestOperationsAutoResultReachesCollapsedQuote(t *testing.T) {
 	var spool bytes.Buffer
 	logger := slog.New(&operationsLogHandler{base: slog.NewJSONHandler(io.Discard, nil), sink: &operationsLogSink{writer: &spool, role: RuntimeBotParser, boot: "auto"}})

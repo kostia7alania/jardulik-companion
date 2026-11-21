@@ -37,7 +37,7 @@ type Config struct {
 	RelationNoticesEnabled                             bool
 	DailyCrawl                                         bool
 	SyncCycleEnabled                                   bool
-	MinFreeBytes                                       uint64
+	MinFreeBytes, CollectionMinFreeBytes               uint64
 	InitMaxAge                                         time.Duration
 	WatchInterval, WatchGap                            time.Duration
 	WatchDailyLimit                                    int
@@ -45,6 +45,7 @@ type Config struct {
 
 func LoadConfig() (Config, error) {
 	c := Config{DataDir: os.Getenv("APP_DATA_DIR"), Token: os.Getenv("TELEGRAM_BOT_TOKEN"), APIBase: "https://api.jardulik.app/api", TelegramBase: "https://api.telegram.org", MinFreeBytes: 2 << 30, InitMaxAge: 24 * time.Hour, WatchInterval: 24 * time.Hour, WatchGap: 20 * time.Second, WatchDailyLimit: 2000}
+	c.CollectionMinFreeBytes = 512 << 20
 	c.CompatibilityGap = time.Minute
 	if raw := strings.TrimSpace(os.Getenv("COMPATIBILITY_ENABLED")); raw != "" {
 		if raw != "true" && raw != "false" {
@@ -157,7 +158,20 @@ func LoadConfig() (Config, error) {
 			return c, errors.New("invalid MIN_FREE_BYTES")
 		}
 	}
+	if raw := os.Getenv("COLLECTION_MIN_FREE_BYTES"); raw != "" {
+		c.CollectionMinFreeBytes, err = strconv.ParseUint(raw, 10, 63)
+		if err != nil || c.CollectionMinFreeBytes == 0 {
+			return c, errors.New("invalid COLLECTION_MIN_FREE_BYTES")
+		}
+	}
 	return c, nil
+}
+
+func (c Config) collectionReserve() uint64 {
+	if c.CollectionMinFreeBytes > 0 {
+		return c.CollectionMinFreeBytes
+	}
+	return c.MinFreeBytes
 }
 
 func validateMiniAppEndpoint(listen, origin string) error {

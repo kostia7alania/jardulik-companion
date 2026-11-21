@@ -44,15 +44,22 @@ func FreeBytes(path string) (uint64, error) {
 	}
 	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
-func (m *MediaManager) CheckDisk() error {
-	n, err := FreeBytes(m.Config.DataDir)
+
+var errDiskReserve = errors.New("сбор приостановлен: на сервере осталось меньше резервного места")
+
+func checkDiskReserve(path string, reserve uint64) error {
+	n, err := FreeBytes(path)
 	if err != nil {
 		return err
 	}
-	if n < m.Config.MinFreeBytes {
-		return errors.New("сбор приостановлен: на сервере осталось меньше резервного места")
+	if n < reserve {
+		return errDiskReserve
 	}
 	return nil
+}
+
+func (m *MediaManager) CheckDisk() error {
+	return checkDiskReserve(m.Config.DataDir, m.Config.collectionReserve())
 }
 func (m *MediaManager) Ensure(ctx context.Context, j MediaJob) error {
 	return m.ensure(ctx, j, false)

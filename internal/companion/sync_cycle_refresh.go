@@ -206,8 +206,9 @@ func (s *Service) syncRefreshOne(ctx context.Context, c SyncCycle, ss Session, n
 		}
 		defer s.Crawler.mu.Unlock()
 	}
-	free, err := FreeBytes(s.Config.DataDir)
-	if err != nil || free < s.Config.MinFreeBytes {
+	if err := s.Media.CheckDisk(); errors.Is(err, errDiskReserve) {
+		return false, nil
+	} else if err != nil {
 		return false, err
 	}
 	target, err := s.claimSyncRefresh(ctx, c, now)

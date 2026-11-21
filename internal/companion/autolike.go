@@ -493,7 +493,7 @@ func (a *Autoliker) Step(ctx context.Context) (bool, error) {
 	if uncertain > 0 {
 		return stop("uncertain")
 	}
-	if err = s.Media.CheckDisk(); err != nil {
+	if err = checkDiskReserve(s.Media.Config.DataDir, s.Media.Config.MinFreeBytes); err != nil {
 		return stop("disk")
 	}
 	f, err := a.filters(ctx, j.Owner)
@@ -687,7 +687,7 @@ func (a *Autoliker) loadPage(ctx context.Context, j *AutoSettings, session Sessi
 	if err = a.guard(ctx, j); err != nil {
 		return a.guardStopped(ctx, j, err, "settings_changed")
 	}
-	if err = s.Media.CheckDisk(); err != nil {
+	if err = checkDiskReserve(s.Media.Config.DataDir, s.Media.Config.MinFreeBytes); err != nil {
 		return stop("disk")
 	}
 	// Archive the whole response, including non-matches, before recording candidates/cursor.

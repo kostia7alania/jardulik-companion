@@ -36,8 +36,9 @@ func (s *Service) compatibilityStep(ctx context.Context) (bool, error) {
 	if !s.Config.CompatibilityEnabled || s.foregroundPending() {
 		return false, nil
 	}
-	free, err := FreeBytes(s.Config.DataDir)
-	if err != nil || free < s.Config.MinFreeBytes {
+	if err := checkDiskReserve(s.Config.DataDir, s.Config.collectionReserve()); errors.Is(err, errDiskReserve) {
+		return false, nil
+	} else if err != nil {
 		return false, err
 	}
 	job, err := s.Store.ClaimCompatibilityJob(ctx, s.Client.Now())

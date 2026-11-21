@@ -87,7 +87,7 @@ verify_running() {
 # Validate secrets and capacity before creating users, changing releases or restarting.
 [[ -f $env_file && ! -L $env_file ]] || die "create $env_file before deploying"
 [[ $(stat -c '%u:%a' "$env_file") == 0:600 ]] || die "$env_file must be root-owned with mode 0600"
-python3 - "$env_file" <<'PY'
+reserve_bytes=$(python3 - "$env_file" <<'PY'
 import base64, pathlib, re, sys
 values = {}
 for line in pathlib.Path(sys.argv[1]).read_text().splitlines():
@@ -135,13 +135,17 @@ if not re.fullmatch(r'[1-9][0-9]*', compatibility_interval) or int(compatibility
 reserve = values.get('MIN_FREE_BYTES', '2147483648')
 if not reserve.isdigit() or int(reserve) < 2147483648:
     raise SystemExit('install: MIN_FREE_BYTES must preserve at least 2 GiB')
+collection_reserve = values.get('COLLECTION_MIN_FREE_BYTES') or '536870912'
+if not re.fullmatch(r'[0-9]+', collection_reserve) or not 0 < int(collection_reserve) <= (1 << 63) - 1:
+    raise SystemExit('install: invalid COLLECTION_MIN_FREE_BYTES')
+print(int(collection_reserve))
 PY
+)
 
 available_bytes=$(df -PB1 /opt | awk 'NR == 2 { print $4 }')
 release_bytes=$(( $(stat -c '%s' "$source_dir/jardulik") + $(stat -c '%s' "$source_dir/telegram-transfer") ))
-reserve_bytes=$(awk -F= '/^[[:space:]]*MIN_FREE_BYTES=/ { value=$2; gsub(/[^0-9]/, "", value); found=1 } END { if (found) print value; else print "2147483648" }' "$env_file")
 [[ $available_bytes =~ ^[0-9]+$ ]] || die 'could not read available disk space'
-(( available_bytes >= reserve_bytes + release_bytes * 2 + 1048576 )) || die 'insufficient disk space to preserve the configured reserve'
+(( available_bytes >= reserve_bytes && available_bytes - reserve_bytes >= release_bytes * 2 + 1048576 )) || die 'insufficient disk space to preserve the collection reserve'
 printf '%s  %s\n' "$binary_sha" "$source_dir/jardulik" | sha256sum --check --status || die 'binary checksum mismatch'
 printf '%s  %s\n' "$helper_sha" "$source_dir/telegram-transfer" | sha256sum --check --status || die 'helper checksum mismatch'
 for unit in "${unit_names[@]}"; do

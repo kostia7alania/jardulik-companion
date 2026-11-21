@@ -62,7 +62,7 @@ func (s *Service) RunRelationNoticePoll(ctx context.Context) {
 	}
 	for ctx.Err() == nil {
 		_, err := s.relationNoticePollStep(ctx, s.Client.Now())
-		if err != nil && ctx.Err() == nil && !errors.Is(err, errCrawlYield) {
+		if err != nil && ctx.Err() == nil && !errors.Is(err, errCrawlYield) && !errors.Is(err, errDiskReserve) {
 			slog.Warn("relationship notice poll failed", "kind", safeError(err))
 		}
 		if !sleep(ctx, 10*time.Second) {
@@ -84,6 +84,9 @@ func (s *Service) relationNoticePollStep(ctx context.Context, now time.Time) (bo
 		return false, nil
 	}
 	if err != nil {
+		return false, err
+	}
+	if err = s.Media.CheckDisk(); err != nil {
 		return false, err
 	}
 	due := now.Add(relationNoticePollGap).UnixMilli()

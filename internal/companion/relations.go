@@ -141,12 +141,8 @@ func (c *Client) reactUsers(ctx context.Context, owner int64, expected *Session,
 	if page < 1 {
 		return result, errors.New("invalid relationship page")
 	}
-	free, err := FreeBytes(c.Store.cfg.DataDir)
-	if err != nil {
+	if err := checkDiskReserve(c.Store.cfg.DataDir, c.Store.cfg.collectionReserve()); err != nil {
 		return result, err
-	}
-	if free < c.Store.cfg.MinFreeBytes {
-		return result, errors.New("сбор приостановлен: недостаточно резервного места")
 	}
 	session, err := c.Store.Session(ctx, owner)
 	if err != nil {

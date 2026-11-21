@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 )
 
@@ -89,6 +90,7 @@ func (s *Service) resumeStoppedCrawl(ctx context.Context, owner int64, cycleID, 
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
+	slog.Info(collectionCrawlResumed, "kind", reason, "page", job.Page, "mode", job.Mode)
 	cycle.Stage, cycle.Reason, cycle.UpdatedAt = "search", "", now
 	return cycle, nil
 }
