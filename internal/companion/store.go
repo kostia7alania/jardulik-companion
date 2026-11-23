@@ -534,8 +534,8 @@ func (s *Store) MediaDone(ctx context.Context, j MediaJob, sha, path, mime strin
 func (s *Store) MediaError(ctx context.Context, id int64, reason string) {
 	_, _ = s.DB.ExecContext(ctx, "UPDATE media_jobs SET state='error',error=? WHERE id=?", reason, id)
 }
-func (s *Store) MediaFailure(ctx context.Context, id int64, reason string) {
-	_, _ = s.DB.ExecContext(ctx, `UPDATE media_jobs SET attempts=attempts+1,next_attempt=unixepoch()+20*(1<<attempts),state=CASE WHEN attempts+1>=3 THEN 'error' ELSE 'pending' END,error=? WHERE id=? AND state='pending'`, reason, id)
+func (s *Store) MediaFailure(ctx context.Context, id int64, reason string, retryAfterSeconds int64) {
+	_, _ = s.DB.ExecContext(ctx, `UPDATE media_jobs SET attempts=attempts+1,next_attempt=unixepoch()+MAX(20*(1<<attempts),?),state=CASE WHEN attempts+1>=3 THEN 'error' ELSE 'pending' END,error=? WHERE id=? AND state='pending'`, retryAfterSeconds, reason, id)
 }
 func (s *Store) ClaimUpdate(ctx context.Context, id int64) (bool, error) {
 	r, err := s.DB.ExecContext(ctx, "INSERT OR IGNORE INTO updates(id,state) VALUES(?,'started')", id)

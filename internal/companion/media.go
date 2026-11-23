@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -110,9 +111,11 @@ func (m *MediaManager) ensure(ctx context.Context, j MediaJob, background bool) 
 			return nil
 		}
 	}
+	failureReason := "download_failed"
+	var retryAfterSeconds int64
 	defer func() {
 		if resultErr != nil && ctx.Err() == nil {
-			m.Store.MediaFailure(ctx, j.ID, "download_failed")
+			m.Store.MediaFailure(ctx, j.ID, failureReason, retryAfterSeconds)
 		}
 	}()
 	res, err := m.HTTP.Do(r)
@@ -120,8 +123,16 @@ func (m *MediaManager) ensure(ctx context.Context, j MediaJob, background bool) 
 		return redactedTransportError(err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		m.Store.MediaError(ctx, j.ID, fmt.Sprintf("HTTP_%d", res.StatusCode))
+	if res.StatusCode != http.StatusOK {
+		failureReason = fmt.Sprintf("HTTP_%d", res.StatusCode)
+		if res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500 {
+			// An upstream failure is not evidence that this specific photo is missing.
+			if seconds, err := strconv.ParseInt(res.Header.Get("Retry-After"), 10, 32); err == nil {
+				retryAfterSeconds = max(0, seconds)
+			}
+		} else {
+			m.Store.MediaError(ctx, j.ID, failureReason)
+		}
 		return errors.New("photo unavailable")
 	}
 	mime, _, _ := strings.Cut(res.Header.Get("Content-Type"), ";")

@@ -2,8 +2,7 @@
 Description=Jardulik Companion compatibility planner
 Wants=network-online.target
 After=network-online.target jardulik-companion.service
-StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -17,6 +16,8 @@ Environment=GOMAXPROCS=1
 ExecStart=/usr/bin/env GOMEMLIMIT=32MiB GOMAXPROCS=1 /opt/jardulik-companion/current/jardulik serve-compatibility
 Restart=on-failure
 RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=2min
 TimeoutStopSec=30
 KillSignal=SIGTERM
 UMask=0077

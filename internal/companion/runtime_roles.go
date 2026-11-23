@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 )
 
 type RuntimeRole string
@@ -75,7 +76,7 @@ func (s *Service) runBackground(ctx context.Context, role RuntimeRole, botReady 
 		}
 	}
 	var background sync.WaitGroup
-	start := func(name string, run func(context.Context)) {
+	start := func(name string, run func(context.Context), restart bool) {
 		background.Add(1)
 		go func() {
 			defer background.Done()
@@ -85,16 +86,22 @@ func (s *Service) runBackground(ctx context.Context, role RuntimeRole, botReady 
 					panic(cause)
 				}
 			}()
-			run(ctx)
-			if ctx.Err() == nil {
-				slog.Warn("background worker stopped", "component", name)
+			for ctx.Err() == nil {
+				run(ctx)
+				if ctx.Err() != nil || !restart {
+					return
+				}
+				slog.Warn("background worker stopped; retry scheduled", "component", name)
+				if !sleep(ctx, 10*time.Second) {
+					return
+				}
 			}
 		}()
 	}
 	// Collection uses an existing source session. Bot work waits for a verified Telegram identity.
-	startAfterBot := func(name string, run func(context.Context)) {
+	startAfterBot := func(name string, run func(context.Context), restart bool) {
 		if botReady == nil {
-			start(name, run)
+			start(name, run, restart)
 			return
 		}
 		start(name, func(ctx context.Context) {
@@ -106,14 +113,14 @@ func (s *Service) runBackground(ctx context.Context, role RuntimeRole, botReady 
 					run(ctx)
 				}
 			}
-		})
+		}, restart)
 	}
 	if s.operationsAllowed() && s.Config.Token != "" {
-		startAfterBot("operations-heartbeat", func(ctx context.Context) { s.runOperationsHeartbeat(ctx, role) })
+		startAfterBot("operations-heartbeat", func(ctx context.Context) { s.runOperationsHeartbeat(ctx, role) }, true)
 	}
 	if role == RuntimeAll || role == RuntimeBotParser {
 		if debugRun != nil {
-			start("debug-http", debugRun)
+			start("debug-http", debugRun, false)
 		} else if botReady != nil && s.Config.DebugListen != "" {
 			startAfterBot("debug-http", func(ctx context.Context) {
 				run, err := s.prepareDebugHTTP()
@@ -122,45 +129,57 @@ func (s *Service) runBackground(ctx context.Context, role RuntimeRole, botReady 
 				} else if run != nil {
 					run(ctx)
 				}
-			})
+			}, true)
 		}
-		start("media", s.Media.Run)
+		start("media", s.Media.Run, true)
 		if s.Config.SyncCycleEnabled {
-			start("sync-cycles", s.RunSyncCycles)
+			start("sync-cycles", s.RunSyncCycles, true)
 		} else {
-			start("profile-checks", s.Watcher.RunChecks)
+			start("profile-checks", s.Watcher.RunChecks, true)
 		}
-		start("crawler", s.Crawler.Run)
-		startAfterBot("autoliker", s.Autoliker.Run)
-		startAfterBot("contacts", s.runContacts)
-		if s.Config.RelationNoticesEnabled {
-			startAfterBot("relation-notice-poll", s.RunRelationNoticePoll)
+		start("crawler", s.Crawler.Run, true)
+		startAfterBot("autoliker", s.Autoliker.Run, true)
+		startAfterBot("contacts", s.runContacts, true)
+		if s.Config.RelationNoticesEnabled && s.Config.OwnerID > 0 {
+			startAfterBot("relation-notice-poll", s.RunRelationNoticePoll, true)
 		}
 		if s.Config.CompatibilityEnabled {
-			startAfterBot("compatibility-executor", s.runCompatibilityExecutor)
+			startAfterBot("compatibility-executor", s.runCompatibilityExecutor, true)
 		}
-		startAfterBot("private-card-repair", s.runPrivateCardRepair)
+		startAfterBot("private-card-repair", s.runPrivateCardRepair, true)
 	}
 	if role == RuntimeAll || role == RuntimePoster {
-		startAfterBot("operations", s.RunOperations)
-		startAfterBot("opening-timeline", s.RunOpeningTimeline)
-		if !s.Config.ArchivePaused {
-			if s.Config.RelationNoticesEnabled {
-				startAfterBot("relation-notice-delivery", s.RunRelationNoticesDelivery)
-			}
-			startAfterBot("archiver", s.Archiver.Run)
-			startAfterBot("caption-maintenance", s.RunCaptionMaintenance)
-			startAfterBot("profile-indexes", s.RunProfileIndexes)
+		if s.operationsAllowed() {
+			startAfterBot("operations", s.RunOperations, true)
 		}
-		startAfterBot("profile-presence", s.Watcher.RunPresence)
-		startAfterBot("analysis-posts", s.RunAnalysisPosts)
-		startAfterBot("archive-changes", s.RunArchiveChangePosts)
+		if s.openingTimelineAllowed() {
+			startAfterBot("opening-timeline", s.RunOpeningTimeline, true)
+		}
 		if !s.Config.ArchivePaused {
-			startAfterBot("opening-posts", s.RunOpeningPosts)
+			if s.relationNoticeDeliveryAllowed() {
+				startAfterBot("relation-notice-delivery", s.RunRelationNoticesDelivery, true)
+			}
+			startAfterBot("archiver", s.Archiver.Run, true)
+			startAfterBot("caption-maintenance", s.RunCaptionMaintenance, true)
+			if s.profileIndexesAllowed() {
+				startAfterBot("profile-indexes", s.RunProfileIndexes, true)
+			}
+		}
+		startAfterBot("profile-presence", s.Watcher.RunPresence, true)
+		if s.Archiver != nil && s.Archiver.TG != nil && s.Config.OwnerID > 0 {
+			if s.Config.OwnerID == s.Archiver.Config.OwnerID {
+				startAfterBot("analysis-posts", s.RunAnalysisPosts, true)
+			}
+			if s.Config.BackupChatID != 0 {
+				startAfterBot("archive-changes", s.RunArchiveChangePosts, true)
+			}
+		}
+		if s.openingPostsAllowed() {
+			startAfterBot("opening-posts", s.RunOpeningPosts, true)
 		}
 	}
 	if s.Config.CompatibilityEnabled && (role == RuntimeAll || role == RuntimeCompatibility) {
-		startAfterBot("compatibility-planner", s.runCompatibilityPlanner)
+		startAfterBot("compatibility-planner", s.runCompatibilityPlanner, true)
 	}
 	var once sync.Once
 	return func() { once.Do(func() { background.Wait(); unlock() }) }, nil

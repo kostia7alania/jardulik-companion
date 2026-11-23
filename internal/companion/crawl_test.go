@@ -620,7 +620,7 @@ func TestCrawlRejectsNonArrayDiscoveryWithoutFalseCompletion(t *testing.T) {
 	}
 }
 
-func TestCrawlRunExitsWhenCheckpointAndStopCannotPersist(t *testing.T) {
+func TestCrawlRunRetriesStopWithoutRepeatingSourceRead(t *testing.T) {
 	c, _, calls, _ := crawlFixture(t, func(int, int) ([]Profile, int) { return crawlProfiles(11), 200 })
 	if _, err := c.Request(context.Background(), 1, false); err != nil {
 		t.Fatal(err)
@@ -635,18 +635,28 @@ func TestCrawlRunExitsWhenCheckpointAndStopCannotPersist(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() { c.Run(ctx); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		cancel()
-		<-done
-		t.Fatal("worker ignored an unpersistable failure instead of exiting")
+	// The failed stop was retried locally while the worker was still running.
+	time.Sleep(120 * time.Millisecond)
+	if _, err = c.Service.Store.DB.Exec("DROP TRIGGER fail_crawl_stop"); err != nil {
+		t.Fatal(err)
 	}
-	if ctx.Err() != nil || len(*calls) != 1 {
-		t.Fatal("worker exit depended on cancellation or repeated HTTP")
+	deadline := time.After(8 * time.Second)
+	for crawlJob(t, c).State != "stopped" {
+		select {
+		case <-done:
+			t.Fatal("worker exited after a write failure")
+		case <-deadline:
+			t.Fatal("stop was not saved after writes recovered")
+		case <-time.After(25 * time.Millisecond):
+		}
 	}
-	if j := crawlJob(t, c); j.Page != 1 || j.Pages != 0 {
-		t.Fatalf("failed persistence advanced job: %+v", j)
+	cancel()
+	<-done
+	if len(*calls) != 1 {
+		t.Fatalf("retried stop also repeated HTTP: %v", *calls)
+	}
+	if j := crawlJob(t, c); j.Page != 1 || j.Pages != 0 || j.Reason != "checkpoint_failed" {
+		t.Fatalf("failed persistence advanced or lost the stop: %+v", j)
 	}
 }
 

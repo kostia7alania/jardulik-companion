@@ -315,7 +315,7 @@ func TestDisconnectedMediaAndFailureBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobs, _ := s.MediaJobs(ctx, 1, ids[0])
-	s.MediaFailure(ctx, jobs[0].ID, "network")
+	s.MediaFailure(ctx, jobs[0].ID, "network", 0)
 	next, err := s.PendingMedia(ctx)
 	if err != nil || next.ID != jobs[1].ID {
 		t.Fatal("one failing URL blocked the queue", err)

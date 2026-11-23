@@ -507,3 +507,25 @@ func TestOperationsStatusOptionalMiniAppHeartbeatHasIndependentFreshness(t *test
 		})
 	}
 }
+
+func TestOperationsStatusShowsActivePublicationBehindNewerCycle(t *testing.T) {
+	f := newOperationsFixture(t)
+	db := f.s.Store.DB
+	if _, err := db.Exec(archiveSchema + syncCycleSchema + syncPublicationSchema); err != nil {
+		t.Fatal(err)
+	}
+	older := f.now.Add(-48 * time.Hour).UnixMilli()
+	newer := f.now.Add(-5 * time.Hour).UnixMilli()
+	if _, err := db.Exec(`INSERT INTO sync_cycles(id,owner_id,upstream_id,generation,stage,search_run_id,started_at_ms,updated_at_ms,next_cycle_ms,collected_at_ms)
+ VALUES ('publishing',123,12345,'source','publishing','old',?,?,?,1),
+        ('draining',123,12345,'source','draining','newer',?,?,?,1);
+ INSERT INTO sync_publication_manifests(cycle_id,owner_id,upstream_id,generation,frozen_at_ms) VALUES('publishing',123,12345,'source',1);
+ INSERT INTO archive_versions(version_id,owner_id,profile_id,fingerprint,state,error) VALUES(42,123,7,'fp','uncertain','source_zip_sent_card_unconfirmed');
+ INSERT INTO sync_publication_items(cycle_id,kind,item_id,profile_id,source_sha) VALUES('publishing','version',42,7,'sha')`, older, older, newer, newer, newer, f.now.UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	status, err := f.s.OperationsStatus(context.Background())
+	if err != nil || !strings.Contains(status, "Публикация ждёт карточку #42") || !strings.Contains(status, "source_zip_sent_card_unconfirmed") || len(f.calls) != 0 {
+		t.Fatalf("old blocker not visible in local status: %s, %v", status, err)
+	}
+}

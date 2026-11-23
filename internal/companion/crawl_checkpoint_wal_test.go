@@ -90,10 +90,10 @@ func TestCrawlCheckpointReservesWALWriterBeforeSnapshot(t *testing.T) {
 	}
 }
 
-type checkpointTestError struct{}
+type checkpointTestError struct{ code int }
 
 func (*checkpointTestError) Error() string { return "private-token-value must not be logged" }
-func (*checkpointTestError) Code() int     { return 517 }
+func (e *checkpointTestError) Code() int   { return e.code }
 
 func TestCrawlCheckpointFailureKeepsSafeOriginalDiagnostics(t *testing.T) {
 	crawler, _, _, httpCalls := crawlFixture(t, func(int, int) ([]Profile, int) { t.Fatal("checkpoint failure requested source HTTP"); return nil, 0 })
@@ -106,7 +106,7 @@ func TestCrawlCheckpointFailureKeepsSafeOriginalDiagnostics(t *testing.T) {
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&log, nil)))
 	defer slog.SetDefault(previous)
-	cause := &checkpointTestError{}
+	cause := &checkpointTestError{code: 1811}
 	if err = crawler.checkpointFailed(ctx, job, 16943, "hydrate_profile", cause); err != nil {
 		t.Fatal("persisted terminal job failure stopped the crawl worker", err)
 	}
@@ -118,7 +118,7 @@ func TestCrawlCheckpointFailureKeepsSafeOriginalDiagnostics(t *testing.T) {
 	if err = json.Unmarshal(bytes.TrimSpace(log.Bytes()), &record); err != nil {
 		t.Fatal(err)
 	}
-	if record["sqlite_code"] != float64(517) || record["run_id"] != job.RunID || record["target"] != float64(16943) || record["stage"] != "hydrate_profile" || strings.Contains(log.String(), "private-token-value") || *httpCalls != 0 {
+	if record["sqlite_code"] != float64(cause.Code()) || record["run_id"] != job.RunID || record["target"] != float64(16943) || record["stage"] != "hydrate_profile" || strings.Contains(log.String(), "private-token-value") || *httpCalls != 0 {
 		t.Fatal("unsafe or missing checkpoint diagnostics", record)
 	}
 	if _, err = crawler.Service.Store.DB.ExecContext(ctx, "UPDATE feed_crawls SET state='running',reason='' WHERE owner_id=1"); err != nil {
@@ -129,5 +129,25 @@ func TestCrawlCheckpointFailureKeepsSafeOriginalDiagnostics(t *testing.T) {
 	}
 	if err = crawler.checkpointFailed(ctx, job, 16943, "hydrate_profile", cause); !errors.Is(err, cause) {
 		t.Fatal("stop failure lost original cause", err)
+	}
+}
+
+func TestCrawlTransientCheckpointFailureCanResumeSameJob(t *testing.T) {
+	c, now, calls, _ := crawlFixture(t, func(int, int) ([]Profile, int) { return crawlProfiles(11), 200 })
+	ctx := context.Background()
+	j, err := c.Request(ctx, 1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := &checkpointTestError{code: 517} // SQLITE_BUSY_SNAPSHOT
+	if err = c.checkpointFailed(ctx, j, 0, "profile_page", busy); !errors.Is(err, busy) {
+		t.Fatalf("transient failure was swallowed: %v", err)
+	}
+	if got := crawlJob(t, c); got.RunID != j.RunID || got.Page != 1 || !got.active() || len(*calls) != 0 {
+		t.Fatalf("transient failure stopped or moved the cursor: %+v", got)
+	}
+	crawlStep(t, c, now)
+	if got := crawlJob(t, c); got.RunID != j.RunID || got.Page != 2 || len(*calls) != 1 {
+		t.Fatalf("same cursor did not resume: %+v, calls=%v", got, *calls)
 	}
 }

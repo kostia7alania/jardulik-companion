@@ -366,9 +366,9 @@ type syncPublicationItem struct {
 // syncConfirmedVersion requires an actual whole-ZIP receipt and exact confirmed layout.
 // A global duplicate is complete only through the matching original's receipts.
 func (s *Service) syncConfirmedVersion(ctx context.Context, version, owner, profile int64) (bool, error) {
-	var state, fp string
+	var state, fp, detail string
 	var thread int64
-	err := s.Store.DB.QueryRowContext(ctx, "SELECT state,fingerprint,thread_id FROM archive_versions WHERE version_id=? AND owner_id=? AND profile_id=?", version, owner, profile).Scan(&state, &fp, &thread)
+	err := s.Store.DB.QueryRowContext(ctx, "SELECT state,fingerprint,thread_id,error FROM archive_versions WHERE version_id=? AND owner_id=? AND profile_id=?", version, owner, profile).Scan(&state, &fp, &thread, &detail)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -426,6 +426,9 @@ func (s *Service) syncConfirmedVersion(ctx context.Context, version, owner, prof
 			return false, nil
 		}
 		seen[id] = true
+	}
+	if state == "partial" && detail == archiveCardTextOnly {
+		return len(ids) == 1, nil
 	}
 	var photos, mini int
 	if err = s.Store.DB.QueryRowContext(ctx, `SELECT COALESCE(SUM(role='photos'),0),COALESCE(SUM(role='miniPhotos'),0) FROM media_jobs WHERE owner_id=? AND version_id=? AND state='complete' AND sha IS NOT NULL AND sha<>''`, owner, version).Scan(&photos, &mini); err != nil {

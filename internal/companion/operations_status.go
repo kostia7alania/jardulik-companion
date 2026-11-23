@@ -118,14 +118,19 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 			line += " · " + operationsStatusValue(reason, 120)
 		}
 		lines = append(lines, line)
-		if cycle.Stage == "blocked" {
-			var completed int64
-			if err := s.Store.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated_at_ms),0) FROM sync_cycles WHERE owner_id=? AND upstream_id=? AND stage='complete'`, cycle.OwnerID, cycle.UserID).Scan(&completed); err != nil {
-				return "", err
-			}
-			if completed > 0 {
-				lines = append(lines, "Последний полный цикл: "+displayTime(time.UnixMilli(completed).UTC().Format(time.RFC3339)))
-			}
+		var completed int64
+		if err := s.Store.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated_at_ms),0) FROM sync_cycles WHERE owner_id=? AND upstream_id=? AND stage='complete'`, cycle.OwnerID, cycle.UserID).Scan(&completed); err != nil {
+			return "", err
+		}
+		if completed > 0 {
+			lines = append(lines, "Последний полный цикл: "+displayTime(time.UnixMilli(completed).UTC().Format(time.RFC3339)))
+		}
+		publication, err := s.operationsPublicationProgress(ctx)
+		if err != nil {
+			return "", err
+		}
+		if publication != "" {
+			lines = append(lines, publication)
 		}
 		var downstream int
 		if err := s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM sync_cycles
@@ -205,6 +210,16 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 			if n := counts["waiting_activation"] + counts["waiting_transport"]; n > 0 {
 				line += fmt.Sprintf(" · ждут настройки %d", n)
 			}
+			var backupState, backupError string
+			if err := s.Store.DB.QueryRowContext(ctx, "SELECT state,error FROM full_backup_jobs ORDER BY id DESC LIMIT 1").Scan(&backupState, &backupError); err != nil {
+				return "", err
+			}
+			if backupState == "error" && backupError != "" {
+				if backupError == "full_backup_insufficient_disk" {
+					backupError = "мало места"
+				}
+				line += " · ⚠️ " + operationsStatusValue(backupError, 120)
+			}
 			if done > 0 {
 				var deliveredAt string
 				if err := s.Store.DB.QueryRowContext(ctx, "SELECT updated_at FROM full_backup_jobs WHERE state='sent' ORDER BY updated_at DESC,id DESC LIMIT 1").Scan(&deliveredAt); err != nil {
@@ -266,6 +281,46 @@ func (s *Service) OperationsStatus(ctx context.Context) (string, error) {
 	}
 	text, _ := telegramPrefix(strings.Join(lines, "\n"), 3900)
 	return text, nil
+}
+
+func (s *Service) operationsPublicationProgress(ctx context.Context) (string, error) {
+	c, err := s.Store.syncPublicationCycle(ctx, s.Config.OwnerID)
+	if err != nil || c == nil || c.Stage != "publishing" {
+		return "", err
+	}
+	var last string
+	err = s.Store.DB.QueryRowContext(ctx, `SELECT COALESCE(MAX(updated_at),'') FROM archive_versions
+ WHERE owner_id=? AND state IN ('sent','partial')`, c.OwnerID).Scan(&last)
+	if err != nil {
+		return "", err
+	}
+	line := "📤 Публикация цикла от " + displayTime(time.UnixMilli(c.StartedAt).UTC().Format(time.RFC3339))
+	if last != "" {
+		line += " · карточка " + displayTime(last)
+	}
+	var version int64
+	var state, reason string
+	err = s.Store.DB.QueryRowContext(ctx, `SELECT v.version_id,v.state,v.error FROM sync_publication_items i
+ JOIN archive_versions v ON v.version_id=i.item_id AND v.profile_id=i.profile_id AND v.owner_id=?
+ WHERE i.cycle_id=? AND i.kind='version' AND i.disposition='required'
+ AND v.state IN ('error','oversize','uncertain','card_pending','card_sending')
+ ORDER BY CASE v.state WHEN 'card_pending' THEN 1 WHEN 'card_sending' THEN 1 ELSE 0 END,v.version_id LIMIT 1`, c.OwnerID, c.ID).Scan(&version, &state, &reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return line, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	switch state {
+	case "card_pending", "card_sending":
+		line += fmt.Sprintf("\n🔄 Карточка #%d в работе", version)
+	default:
+		line += fmt.Sprintf("\n🔴 Публикация ждёт карточку #%d", version)
+	}
+	if reason != "" {
+		line += " · " + operationsStatusValue(reason, 120)
+	}
+	return line, nil
 }
 
 func (s *Service) operationsCrawlProgress(ctx context.Context) (string, error) {

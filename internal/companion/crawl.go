@@ -16,6 +16,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const crawlGap = 20 * time.Second
@@ -343,7 +345,8 @@ func (c *FeedCrawler) Run(ctx context.Context) {
 		return
 	}
 	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
-	var watchFirst, crawlStopped bool
+	var watchFirst bool
+	var pendingStop *crawlStopWriteError
 	for ctx.Err() == nil {
 		delay, stage := time.Second, "schedule"
 		watchTried := watchFirst && c.Service.Config.SyncCycleEnabled
@@ -353,7 +356,14 @@ func (c *FeedCrawler) Run(ctx context.Context) {
 		}
 		var worked bool
 		err = nil
-		if !crawlStopped {
+		if pendingStop != nil {
+			stage = "persist_stop"
+			err = c.stop(ctx, &pendingStop.job, pendingStop.reason)
+			if err == nil {
+				slog.Info("feed crawl stop saved", "owner", pendingStop.job.Owner, "run_id", pendingStop.job.RunID, "kind", pendingStop.reason)
+				pendingStop = nil
+			}
+		} else {
 			_, err = c.ScheduleDaily(ctx)
 			if err == nil {
 				stage = "step"
@@ -370,18 +380,11 @@ func (c *FeedCrawler) Run(ctx context.Context) {
 				code = coded.Code()
 			}
 			message := "feed crawl worker deferred"
-			stopFailed := errors.Is(err, errCrawlStopPersistence)
-			if stopFailed {
-				message = "feed crawl worker stopped"
+			if errors.As(err, &pendingStop) {
+				message = "feed crawl stop deferred"
 			}
 			slog.Warn(message, "kind", safeError(err), "stage", stage,
 				"sqlite_code", code, "error_type", fmt.Sprintf("%T", err))
-			if stopFailed {
-				if !c.Service.Config.SyncCycleEnabled {
-					return
-				}
-				crawlStopped = true
-			}
 			delay = 5 * time.Second
 		}
 		if worked {
@@ -426,12 +429,19 @@ func collectionSlotReady(ctx context.Context, q reactionQuerier, now time.Time) 
 const holdCollectionSlot = `INSERT INTO meta(key,value) VALUES('feed_crawl_next',?)
  ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER))`
 
-var errCrawlStopPersistence = errors.New("crawl stop not committed")
+type crawlStopWriteError struct {
+	job    CrawlJob
+	reason string
+	err    error
+}
+
+func (e *crawlStopWriteError) Error() string { return "crawl stop not committed" }
+func (e *crawlStopWriteError) Unwrap() error { return e.err }
 
 func (c *FeedCrawler) stop(ctx context.Context, j *CrawlJob, reason string) error {
 	_, err := c.Service.Store.DB.ExecContext(ctx, "UPDATE feed_crawls SET state='stopped',reason=?,updated_at=? WHERE owner_id=? AND run_id=? AND state IN ('queued','running')", reason, c.now().UnixMilli(), j.Owner, j.RunID)
 	if err != nil {
-		return errors.Join(errCrawlStopPersistence, err)
+		return &crawlStopWriteError{job: *j, reason: reason, err: err}
 	}
 	return nil
 }
@@ -811,6 +821,9 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 			if ctx.Err() != nil {
 				return true, ctx.Err()
 			}
+			if retryableCrawlPersistence(err) {
+				return true, err
+			}
 			return true, c.stop(ctx, j, "archive_failed")
 		}
 		if err = c.checkpointLocations(ctx, j, locations); err != nil {
@@ -841,6 +854,9 @@ func (c *FeedCrawler) Step(ctx context.Context) (bool, error) {
 	if _, err = s.Store.ArchiveViewed(ctx, j.Owner, profiles, source); err != nil {
 		if ctx.Err() != nil {
 			return true, ctx.Err()
+		}
+		if retryableCrawlPersistence(err) {
+			return true, err
 		}
 		return true, c.stop(ctx, j, "archive_failed")
 	}
@@ -879,10 +895,27 @@ func (c *FeedCrawler) checkpointFailed(ctx context.Context, j *CrawlJob, target 
 	slog.Warn("feed crawl checkpoint failed", "kind", safeError(cause), "sqlite_code", code,
 		"error_type", fmt.Sprintf("%T", cause), "owner", j.Owner, "run_id", j.RunID,
 		"mode", j.Mode, "page", j.Page, "target", target, "stage", stage)
+	if retryableCrawlPersistence(cause) {
+		return cause
+	}
 	if err := c.stop(ctx, j, "checkpoint_failed"); err != nil {
 		return errors.Join(cause, err)
 	}
 	return nil
+}
+
+func retryableCrawlPersistence(err error) bool {
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
+		return true
+	}
+	var coded interface{ Code() int }
+	if errors.As(err, &coded) {
+		switch coded.Code() & 0xff {
+		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_FULL, sqlite3.SQLITE_IOERR:
+			return true
+		}
+	}
+	return false
 }
 
 func (c *FeedCrawler) checkpointTx(ctx context.Context, j *CrawlJob, advance func(*sql.Tx, *CrawlJob) error) error {

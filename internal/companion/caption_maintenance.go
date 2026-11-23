@@ -325,11 +325,12 @@ func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMainte
 	if j.kind == "change" || j.kind == "presence" {
 		return s.prepareThreadNoticeEdit(ctx, j, ids)
 	}
+	var archiveTextOnly bool
 	if j.kind == "archive" {
 		var owner, thread, chat, receiptThread, zip int64
-		var inventory, source, state, layout, kind, file string
-		err := s.Store.DB.QueryRowContext(ctx, `SELECT av.owner_id,av.thread_id,av.message_ids,av.source_sha,av.state,COALESCE(l.state,''),COALESCE(r.chat_id,0),COALESCE(r.thread_id,0),COALESCE(r.message_id,0),COALESCE(r.kind,''),COALESCE(r.file_id,'')
- FROM archive_versions av LEFT JOIN archive_profile_repairs l ON l.version_id=av.version_id LEFT JOIN archive_receipts r ON r.source_sha=av.source_sha WHERE av.version_id=?`, j.receipt).Scan(&owner, &thread, &inventory, &source, &state, &layout, &chat, &receiptThread, &zip, &kind, &file)
+		var inventory, source, state, layout, kind, file, detail string
+		err := s.Store.DB.QueryRowContext(ctx, `SELECT av.owner_id,av.thread_id,av.message_ids,av.source_sha,av.state,COALESCE(l.state,''),COALESCE(r.chat_id,0),COALESCE(r.thread_id,0),COALESCE(r.message_id,0),COALESCE(r.kind,''),COALESCE(r.file_id,''),av.error
+ FROM archive_versions av LEFT JOIN archive_profile_repairs l ON l.version_id=av.version_id LEFT JOIN archive_receipts r ON r.source_sha=av.source_sha WHERE av.version_id=?`, j.receipt).Scan(&owner, &thread, &inventory, &source, &state, &layout, &chat, &receiptThread, &zip, &kind, &file, &detail)
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", nil, errCaptionMaintenanceReceipt
 		}
@@ -339,6 +340,7 @@ func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMainte
 		if j.receipt != j.version || owner != j.owner || inventory != j.inventory || source != j.source || (state != "sent" && state != "partial") || layout != "sent" || j.chat == 0 || j.chat != s.Config.BackupChatID || chat != j.chat || thread != j.thread || thread <= 0 || thread == s.Config.BackupThreadID || receiptThread != thread || zip <= 0 || seen[zip] || kind != "profile_version" || file == "" {
 			return "", nil, errCaptionMaintenanceReceipt
 		}
+		archiveTextOnly = state == "partial" && detail == archiveCardTextOnly
 	} else if j.kind == "private" {
 		var owner, version int64
 		var inventory, state string
@@ -395,6 +397,9 @@ func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMainte
 		return "editMessageText", map[string]any{"chat_id": j.chat, "message_id": ids[0], "rich_message": rich}, nil
 	}
 	photos := selectedProfilePhotos(jobs)
+	if archiveTextOnly {
+		photos = nil
+	}
 	if (len(photos) == 0 && len(ids) != 1) || (len(photos) > 0 && len(ids) != len(photos)) {
 		return "", nil, errCaptionMaintenanceReceipt
 	}
@@ -406,7 +411,7 @@ func (w *captionMaintenanceWorker) prepare(ctx context.Context, j *captionMainte
 		if len(photos) == 0 {
 			limit = 4096
 		}
-		card, err = s.Archiver.profileCardContent(p, unavailableMediaCount(jobs), j.thread, limit, len(photos) == 0, photos)
+		card, err = s.Archiver.profileCardContent(p, unavailableMediaCount(jobs), j.thread, limit, len(photos) == 0 && !archiveTextOnly, photos)
 	}
 	if err != nil {
 		return "", nil, err

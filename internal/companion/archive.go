@@ -32,6 +32,9 @@ const serviceArchiveEntries = 10003
 const serviceBackupMagic = "JDCBK1\n"
 const serviceBackupPurpose = "jardulik-service-backup:v1"
 
+const archiveCardLegacy = "rich_card_image_rejected"
+const archiveCardTextOnly = "photo_card_image_rejected"
+
 var errArchiveBudget = errors.New("service archive exceeds restore budget")
 
 // Archiver is the sole sender to the private archive group. Topics do not
@@ -143,7 +146,9 @@ func (a *Archiver) Run(ctx context.Context) {
 	// Processing means an external effect might have happened before a crash.
 	// Only an operator can reconcile those records; never replay them blindly.
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_topic_jobs SET state='uncertain',error='worker_restarted_during_request' WHERE state='processing'")
-	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='uncertain',error='worker_restarted_during_request' WHERE state='processing'")
+	if _, err := a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='uncertain',error='worker_restarted_during_request' WHERE state IN ('processing','card_sending')"); err != nil {
+		return
+	}
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_backups SET state='uncertain',error='worker_restarted_during_request' WHERE state='processing'")
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE meta SET value='uncertain' WHERE key='archive_repair_requested' AND value='processing'")
 	_, _ = a.Store.DB.ExecContext(ctx, "UPDATE meta SET value='uncertain' WHERE key='archive_zip_repair_requested' AND value='processing'")
@@ -264,11 +269,12 @@ func (a *Archiver) processOne(ctx context.Context) error {
 		return err
 	}
 	var owner, version int64
-	err := a.Store.DB.QueryRowContext(ctx, `SELECT v.owner_id,v.id FROM versions v
+	var cardPending bool
+	err := a.Store.DB.QueryRowContext(ctx, `SELECT v.owner_id,v.id,COALESCE(av.state='card_pending',0) FROM versions v
  LEFT JOIN archive_versions av ON av.version_id=v.id
- WHERE (av.version_id IS NULL OR av.state='pending')
+ WHERE (av.version_id IS NULL OR av.state IN ('pending','card_pending'))
  AND NOT EXISTS(SELECT 1 FROM media_jobs j WHERE j.version_id=v.id AND j.state='pending') `+a.Store.syncPublicationCandidates("v.owner_id", "v.id", "version")+`
- ORDER BY v.id LIMIT 1`).Scan(&owner, &version)
+ ORDER BY v.id LIMIT 1`).Scan(&owner, &version, &cardPending)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -279,6 +285,17 @@ func (a *Archiver) processOne(ctx context.Context) error {
 		return nil
 	} else if err != nil {
 		return err
+	}
+	if cardPending {
+		p, err := a.Store.Version(ctx, owner, version)
+		if err != nil {
+			return err
+		}
+		jobs, err := a.Store.MediaJobs(ctx, owner, version)
+		if err != nil {
+			return err
+		}
+		return a.publishConfirmedArchiveCard(ctx, owner, p, jobs)
 	}
 	return a.mirrorVersion(ctx, owner, version)
 }
@@ -698,6 +715,10 @@ func fileDigest(path string) (string, int64, error) {
 }
 
 func (a *Archiver) receipt(ctx context.Context, sourceSHA, kind, path, encryptedSHA string, thread int64, m SentMessage) error {
+	return a.saveArchiveReceipt(ctx, sourceSHA, kind, path, encryptedSHA, thread, m, 0)
+}
+
+func (a *Archiver) saveArchiveReceipt(ctx context.Context, sourceSHA, kind, path, encryptedSHA string, thread int64, m SentMessage, pendingVersion int64) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -708,12 +729,30 @@ func (a *Archiver) receipt(ctx context.Context, sourceSHA, kind, path, encrypted
 	if m.Document.Size > 0 && m.Document.Size != info.Size() {
 		return errors.New("Telegram returned a different document size")
 	}
-	_, err = a.Store.DB.ExecContext(ctx, `INSERT OR REPLACE INTO archive_receipts(source_sha,kind,filename,byte_size,encrypted_sha,chat_id,thread_id,message_id,file_id,file_unique_id,returned_file_size) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, sourceSHA, kind, filepath.Base(path), info.Size(), encryptedSHA, a.Config.BackupChatID, thread, m.ID, m.Document.FileID, m.Document.UniqueID, m.Document.Size)
+	tx, err := a.Store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	_, err = a.Store.DB.ExecContext(ctx, `INSERT OR REPLACE INTO backup_files(source_sha,kind,filename,size,chat_id,thread_id,message_id,file_id,encrypted_sha) VALUES(?,?,?,?,?,?,?,?,?)`, sourceSHA, kind, filepath.Base(path), info.Size(), a.Config.BackupChatID, thread, m.ID, m.Document.FileID, encryptedSHA)
-	return err
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO archive_receipts(source_sha,kind,filename,byte_size,encrypted_sha,chat_id,thread_id,message_id,file_id,file_unique_id,returned_file_size) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, sourceSHA, kind, filepath.Base(path), info.Size(), encryptedSHA, a.Config.BackupChatID, thread, m.ID, m.Document.FileID, m.Document.UniqueID, m.Document.Size); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO backup_files(source_sha,kind,filename,size,chat_id,thread_id,message_id,file_id,encrypted_sha) VALUES(?,?,?,?,?,?,?,?,?)`, sourceSHA, kind, filepath.Base(path), info.Size(), a.Config.BackupChatID, thread, m.ID, m.Document.FileID, encryptedSHA); err != nil {
+		return err
+	}
+	if pendingVersion > 0 {
+		res, err := tx.ExecContext(ctx, `UPDATE archive_versions SET state='card_pending',error='',updated_at=CURRENT_TIMESTAMP
+ WHERE version_id=? AND source_sha=? AND thread_id=? AND state='processing' AND message_ids='[]'`, pendingVersion, sourceSHA, thread)
+		if err != nil {
+			return err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return err
+		} else if n != 1 {
+			return errors.New("archive ZIP no longer matches the pending card")
+		}
+	}
+	return tx.Commit()
 }
 
 func moderationText(p StoredProfile, _ string, missing int) string {
@@ -957,7 +996,9 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 		return e
 	})
 	if err == nil {
-		err = a.receipt(ctx, sha, "profile_version", path, "", thread, document)
+		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		err = a.saveArchiveReceipt(writeCtx, sha, "profile_version", path, "", thread, document, version)
+		cancelWrite()
 	}
 	if err != nil {
 		state := archiveFailureState(err)
@@ -967,35 +1008,81 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 		_, _ = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=?", state, archiveErrorCode(err), version)
 		return err
 	}
+	return a.publishConfirmedArchiveCard(ctx, owner, p, jobs)
+}
+
+// An acknowledged ZIP can be reused after a restart or a definite card rejection.
+func (a *Archiver) publishConfirmedArchiveCard(ctx context.Context, owner int64, p StoredProfile, jobs []MediaJob) error {
+	ctx = context.WithValue(ctx, syncPublicationOwnerKey{}, owner)
+	version := p.VersionID
+	var thread, zipID int64
+	var fp, sha, filename, mode string
+	err := a.Store.DB.QueryRowContext(ctx, `SELECT av.thread_id,r.message_id,av.fingerprint,av.source_sha,r.filename,av.error
+ FROM archive_versions av JOIN archive_receipts r ON r.source_sha=av.source_sha
+ JOIN mirror_topics t ON t.profile_id=av.profile_id AND t.thread_id=av.thread_id
+ JOIN backup_files b ON b.source_sha=r.source_sha AND b.chat_id=r.chat_id AND b.thread_id=r.thread_id
+   AND b.message_id=r.message_id AND b.file_id=r.file_id
+ WHERE av.version_id=? AND av.owner_id=? AND av.profile_id=? AND av.state='card_pending' AND av.message_ids='[]'
+ AND r.kind='profile_version' AND r.chat_id=? AND r.thread_id=av.thread_id AND r.file_id<>'' AND r.message_id>0
+ AND av.thread_id>0 AND av.thread_id<>? AND julianday(r.sent_at) IS NOT NULL
+ AND NOT EXISTS(SELECT 1 FROM archive_profile_repairs l WHERE l.version_id=av.version_id)`,
+		version, owner, p.ID, a.Config.BackupChatID, a.Config.BackupThreadID).Scan(&thread, &zipID, &fp, &sha, &filename, &mode)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='uncertain',error='card_source_receipt_mismatch',updated_at=CURRENT_TIMESTAMP WHERE version_id=? AND state='card_pending'", version)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if _, err = a.Store.DB.ExecContext(ctx, "UPDATE archive_versions SET state='card_sending',updated_at=CURRENT_TIMESTAMP WHERE version_id=? AND state='card_pending'", version); err != nil {
+		return err
+	}
 	saveIDs := func(ids []int64) error {
 		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancelWrite()
 		b, _ := json.Marshal(ids)
-		_, e := a.Store.DB.ExecContext(writeCtx, "UPDATE archive_versions SET message_ids=? WHERE version_id=?", string(b), version)
-		return e
-	}
-	ids, err := a.sendCurrentProfileCard(ctx, p, jobs, thread, saveIDs)
-	if err != nil {
-		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancelWrite()
-		_, _ = a.Store.DB.ExecContext(writeCtx, "UPDATE archive_versions SET state='uncertain',error='source_zip_sent_card_unconfirmed',updated_at=CURRENT_TIMESTAMP WHERE version_id=?", version)
+		_, err := a.Store.DB.ExecContext(writeCtx, "UPDATE archive_versions SET message_ids=? WHERE version_id=?", string(b), version)
 		return err
 	}
-	missing := 0
-	for _, j := range jobs {
-		if j.State != "complete" || j.SHA == "" {
-			missing++
-		}
+	missing := unavailableMediaCount(jobs)
+	var ids []int64
+	switch mode {
+	case archiveCardLegacy:
+		ids, err = a.sendProfileCard(ctx, p, jobs, thread, saveIDs)
+	case archiveCardTextOnly:
+		ids, err = a.sendArchiveTextCard(ctx, p, missing, thread, saveIDs)
+	default:
+		ids, err = a.sendCurrentProfileCard(ctx, p, jobs, thread, saveIDs)
 	}
-	state := "sent"
-	detail := ""
-	if missing > 0 {
-		state = "partial"
-		detail = "source_media_missing"
-	}
-	idsJSON, _ := json.Marshal(ids)
 	writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancelWrite()
+	if err != nil {
+		state, detail := "uncertain", "source_zip_sent_card_unconfirmed"
+		if len(ids) == 0 {
+			var rejected *TelegramError
+			switch {
+			case errors.As(err, &rejected) && rejected.Code == 429, errors.Is(err, errSyncPublicationDeferred):
+				state, detail = "card_pending", mode
+			case archiveImageRejected(err) && mode != archiveCardTextOnly:
+				state, detail = "card_pending", archiveCardTextOnly
+				if mode == "" && a.Config.RichCards {
+					detail = archiveCardLegacy
+				}
+			}
+		}
+		_, updateErr := a.Store.DB.ExecContext(writeCtx, "UPDATE archive_versions SET state=?,error=?,updated_at=CURRENT_TIMESTAMP WHERE version_id=? AND state='card_sending'", state, detail, version)
+		return errors.Join(err, updateErr)
+	}
+	state, detail := "sent", ""
+	if mode == archiveCardTextOnly {
+		state, detail = "partial", mode
+	} else if missing > 0 {
+		state, detail = "partial", "source_media_missing"
+	}
+	idsJSON, _ := json.Marshal(ids)
 	tx, err := a.Store.DB.BeginTx(writeCtx, nil)
 	if err != nil {
 		return err
@@ -1010,13 +1097,52 @@ func (a *Archiver) mirrorVersion(ctx context.Context, owner, version int64) erro
 	if _, err = tx.ExecContext(writeCtx, "INSERT INTO archive_profile_repairs(version_id,state,old_message_ids,new_message_ids) VALUES(?,'sent','[]',?)", version, string(idsJSON)); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(writeCtx, "INSERT INTO archive_zip_repairs(version_id,state,old_source_sha,old_filename,old_message_id,new_source_sha,new_filename,new_message_id) VALUES(?,'skipped',?,?,?,?,?,?)", version, sha, filepath.Base(path), document.ID, sha, filepath.Base(path), document.ID); err != nil {
+	if _, err = tx.ExecContext(writeCtx, "INSERT INTO archive_zip_repairs(version_id,state,old_source_sha,old_filename,old_message_id,new_source_sha,new_filename,new_message_id) VALUES(?,'skipped',?,?,?,?,?,?)", version, sha, filename, zipID, sha, filename, zipID); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	return os.Remove(path)
+	if filename == "" || filename == "." || filename == ".." || filepath.Base(filename) != filename {
+		return nil
+	}
+	err = os.Remove(filepath.Join(a.Config.DataDir, "archive-staging", filename))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func archiveImageRejected(err error) bool {
+	var rejected *TelegramError
+	if !errors.As(err, &rejected) || rejected.Code != 400 {
+		return false
+	}
+	reason := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(rejected.Description)), "bad request: ")
+	switch reason {
+	case "image_process_failed", "photo_invalid_dimensions", "photo_ext_invalid", "failed to process photo":
+		return true
+	}
+	return false
+}
+
+func (a *Archiver) sendArchiveTextCard(ctx context.Context, p StoredProfile, missing int, thread int64, save func([]int64) error) ([]int64, error) {
+	body, err := a.profileCardContent(p, missing, thread, 4096, false, nil)
+	if err != nil {
+		return nil, err
+	}
+	var m SentMessage
+	if err = a.groupCall(ctx, func() (err error) {
+		m, err = a.TG.SendText(ctx, a.Config.BackupChatID, thread, body.Text, legacyProfileCopyMarkup(p.ID), body.Entities)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	if m.ID <= 0 || m.Chat.ID != a.Config.BackupChatID || m.ThreadID != thread {
+		return nil, errors.New("archive text card delivery unconfirmed")
+	}
+	ids := []int64{m.ID}
+	return ids, save(ids)
 }
 
 // RequestProfileRepair queues one maintenance pass for the existing worker.
@@ -1680,7 +1806,8 @@ func (a *Archiver) retainOriginalZIP(ctx context.Context, r archiveReceipt) (str
 
 func (a *Archiver) refreshConfirmedProfileCaption(ctx context.Context, version, owner, thread int64) error {
 	var inventory string
-	err := a.Store.DB.QueryRowContext(ctx, `SELECT av.message_ids FROM archive_versions av JOIN archive_profile_repairs layout ON layout.version_id=av.version_id WHERE av.version_id=? AND layout.state='sent'`, version).Scan(&inventory)
+	var textOnly bool
+	err := a.Store.DB.QueryRowContext(ctx, `SELECT av.message_ids,av.state='partial' AND av.error=? FROM archive_versions av JOIN archive_profile_repairs layout ON layout.version_id=av.version_id WHERE av.version_id=? AND layout.state='sent'`, archiveCardTextOnly, version).Scan(&inventory, &textOnly)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -1735,11 +1862,11 @@ func (a *Archiver) refreshConfirmedProfileCaption(ctx context.Context, version, 
 			expected++
 		}
 	}
-	if expected == 0 {
+	if expected == 0 || textOnly {
 		if len(ids) != 1 {
 			return errors.New("confirmed text card inventory is invalid")
 		}
-		card, err := a.profileCardContent(p, missing, thread, 4096, true, nil)
+		card, err := a.profileCardContent(p, missing, thread, 4096, !textOnly, nil)
 		if err != nil {
 			return err
 		}

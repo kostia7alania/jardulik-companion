@@ -1975,3 +1975,91 @@ func TestUnknownTopicRenameDoesNotPersistTitleOrReplayVersion(t *testing.T) {
 		t.Fatalf("unknown title edit replayed: %v calls=%d", err, calls)
 	}
 }
+
+func TestArchiveResumesCardWithSameConfirmedZIP(t *testing.T) {
+	for _, outcome := range []string{"album", "text", "uncertain"} {
+		t.Run(outcome, func(t *testing.T) {
+			c, store, a, p, _ := archivePresentationFixture(t)
+			c.RichCards, a.Config.RichCards = true, true
+			ctx := context.Background()
+			var calls []string
+			rejectImage := `{"ok":false,"error_code":400,"description":"Bad Request: IMAGE_PROCESS_FAILED"}`
+			a.TG = archiveFixtureTelegram(c, func(call archiveTelegramCall) (string, error) {
+				calls = append(calls, call.method)
+				switch call.method {
+				case "sendDocument":
+					return fmt.Sprintf(`{"ok":true,"result":{"message_id":100,"document":{"file_id":"whole","file_size":%d}}}`, len(call.fields["document"])), nil
+				case "sendRichMessage":
+					if outcome == "uncertain" {
+						return "", errors.New("mock response lost")
+					}
+					return rejectImage, nil
+				case "sendMediaGroup":
+					if outcome == "text" {
+						return rejectImage, nil
+					}
+					return fmt.Sprintf(`{"ok":true,"result":[{"message_id":101,"chat":{"id":%d}},{"message_id":102,"chat":{"id":%d}}]}`, c.BackupChatID, c.BackupChatID), nil
+				case "sendMessage":
+					if outcome != "text" || call.json["message_thread_id"] != float64(55) || !strings.Contains(call.json["text"].(string), "Полное описание") {
+						t.Fatalf("bad text fallback: %+v", call)
+					}
+					return fmt.Sprintf(`{"ok":true,"result":{"message_id":103,"chat":{"id":%d},"message_thread_id":55}}`, c.BackupChatID), nil
+				case "editMessageText":
+					return fmt.Sprintf(`{"ok":true,"result":{"message_id":103,"chat":{"id":%d},"message_thread_id":55}}`, c.BackupChatID), nil
+				default:
+					t.Fatalf("unexpected send: %s", call.method)
+					return "", nil
+				}
+			})
+			if err := a.mirrorVersion(ctx, 123, p.VersionID); err == nil {
+				t.Fatal("the first send should fail")
+			}
+			// A new worker must use the existing receipt and never resend the ZIP.
+			restarted := NewArchiver(c, store, a.TG, a.Media)
+			restarted.now = a.now
+			if outcome == "text" {
+				if err := restarted.processOne(ctx); !archiveImageRejected(err) {
+					t.Fatalf("the rejected album must queue a text card: %v", err)
+				}
+			}
+			if err := restarted.processOne(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := restarted.processOne(ctx); err != nil {
+				t.Fatal(err)
+			}
+			svc := &Service{Config: c, Store: store}
+			ok, err := svc.syncConfirmedVersion(ctx, p.VersionID, 123, p.ID)
+			if err != nil || ok != (outcome != "uncertain") {
+				t.Fatalf("unexpected publication proof: %v, %v", ok, err)
+			}
+			var state, detail, ids string
+			if err = store.DB.QueryRow("SELECT state,error,message_ids FROM archive_versions WHERE version_id=?", p.VersionID).Scan(&state, &detail, &ids); err != nil {
+				t.Fatal(err)
+			}
+			want := "sendDocument,sendRichMessage"
+			switch outcome {
+			case "album":
+				want += ",sendMediaGroup"
+				if state != "sent" || ids != "[101,102]" {
+					t.Fatalf("album IDs were not saved: %s %s", state, ids)
+				}
+			case "text":
+				want += ",sendMediaGroup,sendMessage,editMessageText"
+				if state != "partial" || detail != archiveCardTextOnly || ids != "[103]" {
+					t.Fatalf("text fallback provenance lost: %s %s %s", state, detail, ids)
+				}
+				if err = restarted.refreshConfirmedProfileCaption(ctx, p.VersionID, 123, 55); err != nil {
+					t.Fatal(err)
+				}
+			case "uncertain":
+				if state != "uncertain" || ids != "[]" {
+					t.Fatalf("ambiguous delivery was changed: %s %s", state, ids)
+				}
+			}
+			if got := strings.Join(calls, ","); got != want {
+				t.Fatalf("unexpected Telegram sends: %s, wanted %s", got, want)
+			}
+		})
+	}
+}
