@@ -4,9 +4,16 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#151321">
-  <title>Как подключить Jardulik Companion | Jardulik Companion</title>
-  <meta name="description" content="Подключи свой аккаунт Jardulik и пользуйся помощником в Telegram.">
+  <title>Как подключить Jardulik Companion через Telegram Web</title>
+  <meta name="description" content="Как подключить свой аккаунт Жардулик через Telegram Web, проверить подключение и открыть первую анкету в боте.">
   <link rel="canonical" href="https://kostia7alania.ru/jardulik-companion/guide.html">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="Как подключить Jardulik Companion через Telegram Web">
+  <meta property="og:description" content="Как подключить свой аккаунт Жардулик через Telegram Web, проверить подключение и открыть первую анкету в боте.">
+  <meta property="og:url" content="https://kostia7alania.ru/jardulik-companion/guide.html">
+  <meta property="og:image" content="https://kostia7alania.ru/jardulik-companion/social.png">
+  <meta name="twitter:card" content="summary_large_image">
   <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
@@ -23,31 +30,46 @@
   <main id="main" tabindex="-1">
     <article class="shell legal">
       <h1>Как подключить Jardulik Companion</h1>
-      <p>Подключай только свой аккаунт Jardulik. Ссылка запуска даёт временный доступ к этому аккаунту. Передавай её только командой <code>/connect</code> в личном чате помощника.</p>
+      <p>Для первого подключения открой Telegram Web на компьютере. После подключения пользоваться ботом можно и с телефона.</p>
+      <p>Подключай только свой аккаунт Jardulik. Ссылка запуска даёт временный доступ к аккаунту. Отправляй её только командой <code>/connect</code> в личном чате помощника.</p>
       <ol>
         <li>
           <h2>Открой Jardulik</h2>
-          <p>Зайди в <a href="https://web.telegram.org/">Telegram Web</a>, открой <a href="https://t.me/jardulik_bot">@jardulik_bot</a> и запусти мини-приложение.</p>
+          <p>Зайди в <a href="https://web.telegram.org/">Telegram Web</a> с того же аккаунта, с которого будешь писать помощнику. Открой <a href="https://t.me/jardulik_bot">@jardulik_bot</a> и запусти мини-приложение.</p>
         </li>
         <li>
           <h2>Скопируй ссылку запуска</h2>
-          <p>В инструментах разработчика на вкладке <strong>Элементы</strong> найди iframe с адресом <code>mini.jardulik.app</code>. Скопируй значение <code>src</code> целиком, включая <code>tgWebAppData</code> после <code>#</code>.</p>
+          <p>Через меню браузера открой <strong>Инструменты разработчика</strong>. Выполни поиск по <code>mini.jardulik.app</code> во вкладке <strong>Элементы</strong> (<strong>Elements</strong>) и найди <code>iframe</code> с этим адресом.</p>
+          <p>Скопируй только значение <code>src</code> целиком, без наружных кавычек. Оно должно начинаться с <code>https://mini.jardulik.app/</code> и содержать <code>tgWebAppData</code> после <code>#</code>. Для этого шага достаточно поиска во вкладке <strong>Элементы</strong>.</p>
         </li>
         <li>
           <h2>Подключи помощника</h2>
-          <p><a href="https://t.me/dvachers_jardulik_bot?start=guide_connect">Открой бота</a> с того же Telegram-аккаунта. Прочитай <a href="./privacy.html">политику данных</a>, затем отправь <code>/connect</code> и полный адрес одним сообщением.</p>
+          <p><a href="https://t.me/dvachers_jardulik_bot?start=guide_connect">Открой бота</a> и нажми <strong>Запустить</strong>. Прочитай <a href="./privacy.html">политику данных</a>, затем отправь команду и адрес одним сообщением.</p>
+          <p><code>/connect &lt;полный URL запуска Jardulik&gt;</code></p>
+          <p>Дождись подтверждения и отправь <code>/next</code>, чтобы открыть первую анкету. Бот попробует удалить сообщение со ссылкой. Если оно осталось в чате, удали его вручную.</p>
         </li>
       </ol>
       <h2>Как пользоваться</h2>
       <ul>
         <li><code>/status</code> показывает состояние подключения.</li>
-        <li><code>/next</code> открывает следующую анкету.</li>
-        <li><code>/pause</code> ставит действия на паузу, <code>/disconnect</code> отключает аккаунт.</li>
-        <li><code>/delete</code> запрашивает удаление личных данных.</li>
+        <li><code>/menu</code> открывает меню. Автолайки включаются отдельно в настройках.</li>
+        <li><code>/pause</code> останавливает фоновые действия. <code>/disconnect</code> отключает сессию и сохраняет архив.</li>
+        <li><code>/delete</code> запрашивает удаление личных данных из рабочей базы с подтверждением.</li>
       </ul>
       <h2>Если подключение не получилось</h2>
-      <p>Перезапусти мини-приложение, скопируй свежую ссылку целиком и проверь Telegram-аккаунт. Для помощи напиши <code>/support</code> и опиши проблему без ссылки запуска и токенов.</p>
+      <details>
+        <summary>Причины ошибок и что делать</summary>
+        <ul>
+          <li><strong>Ссылка устарела.</strong> Закрой мини-приложение, снова запусти его из <code>@jardulik_bot</code> и скопируй свежий адрес.</li>
+          <li><strong>Ссылка принадлежит другому аккаунту.</strong> Проверь, что Telegram Web и чат с помощником открыты под одним Telegram-аккаунтом.</li>
+          <li><strong>В ссылке нет <code>tgWebAppData</code> или подпись не подтверждена.</strong> Проверь, что открыт официальный Jardulik, и заново скопируй весь <code>src</code> без ручных изменений. Если поля в адресе по-прежнему нет, используй официальный Jardulik и обратись за помощью.</li>
+          <li><strong>Jardulik отклонил вход или запросил дополнительную проверку.</strong> Открой официальное приложение и следуй его подсказкам.</li>
+        </ul>
+        <p>Помощник проверяет адрес, подпись Telegram, свежесть ссылки и совпадение аккаунта. <a href="https://core.telegram.org/bots/webapps#validating-data-for-third-party-use">Как Telegram подписывает данные запуска ↗</a></p>
+      </details>
+      <p><code>/help</code> показывает список команд. Чтобы написать оператору, отправь <code>/support</code> и описание проблемы одним сообщением, без ссылки запуска и токенов.</p>
       <p><a class="button button-secondary" href="https://t.me/dvachers_jardulik_bot?start=guide_connect">Открыть бота</a></p>
+      <p>Разворачиваешь свой экземпляр? <a href="https://github.com/kostia7alania/jardulik-companion/blob/main/docs/installation.md">Инструкция по установке и переносу ↗</a></p>
     </article>
   </main>
   <footer class="site-footer shell">

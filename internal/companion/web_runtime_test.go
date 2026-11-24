@@ -15,6 +15,7 @@ func TestPublicWebServesOnlyPresentationAndDemo(t *testing.T) {
 		status       int
 	}{
 		{http.MethodGet, "/", http.StatusOK},
+		{http.MethodGet, "/icon.svg", http.StatusOK},
 		{http.MethodHead, "/styles.css", http.StatusOK},
 		{http.MethodGet, "/api/demo", http.StatusOK},
 		{http.MethodGet, "/healthz", http.StatusNoContent},

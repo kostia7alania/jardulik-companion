@@ -5,7 +5,13 @@ const panel = document.querySelector("#demo-panel");
 const metrics = document.querySelector("#demo-metrics");
 const title = document.querySelector("#demo-view-title");
 const rows = document.querySelector("#demo-rows");
+const controls = document.querySelector("#demo-controls");
+const nextProfile = document.querySelector("#demo-next");
+const favorite = document.querySelector("#demo-favorite");
+const selection = document.querySelector("#demo-selection");
 const symbols = { done: "✓", score: "≈", wait: "⌛", neutral: "▤" };
+const favorites = new Set();
+let profileIndex = 0;
 
 function textNode(tag, className, text) {
   const node = document.createElement(tag);
@@ -16,6 +22,9 @@ function textNode(tag, className, text) {
 
 function showView(data, activeTab) {
   const view = data[activeTab.dataset.view];
+  const archive = activeTab.dataset.view === "archive";
+  controls.hidden = !archive;
+  if (archive) favorite.setAttribute("aria-pressed", String(favorites.has(profileIndex)));
   for (const tab of tabs) {
     const active = tab === activeTab;
     tab.setAttribute("aria-selected", String(active));
@@ -28,7 +37,8 @@ function showView(data, activeTab) {
     metric.append(textNode("dt", "", label), textNode("dd", "", value));
     return metric;
   }));
-  rows.replaceChildren(...view.rows.map(({ title, detail, status, tone }) => {
+  const visibleRows = archive ? [view.rows[profileIndex]] : view.rows;
+  rows.replaceChildren(...visibleRows.map(({ title, detail, status, tone }) => {
     const row = document.createElement("li");
     const icon = textNode("span", `row-icon row-icon-${tone}`, symbols[tone]);
     icon.setAttribute("aria-hidden", "true");
@@ -46,6 +56,17 @@ async function startDemo() {
     const response = await fetch("./demo.json");
     if (!response.ok) throw new Error("Demo data unavailable");
     const data = await response.json();
+    const archiveTab = document.querySelector("#tab-archive");
+    nextProfile.addEventListener("click", () => {
+      profileIndex = (profileIndex + 1) % data.archive.rows.length;
+      showView(data, archiveTab);
+      selection.textContent = data.archive.rows[profileIndex].title;
+    });
+    favorite.addEventListener("click", () => {
+      if (favorites.has(profileIndex)) favorites.delete(profileIndex);
+      else favorites.add(profileIndex);
+      favorite.setAttribute("aria-pressed", String(favorites.has(profileIndex)));
+    });
     tabs.forEach((tab, index) => {
       tab.disabled = false;
       tab.addEventListener("click", () => showView(data, tab));

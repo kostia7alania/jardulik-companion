@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'internal/companion/web/**'
+      - 'docs/images/landing-preview.png'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -32,7 +33,8 @@ jobs:
         working-directory: internal/companion/web
         run: |
           mkdir -p "$RUNNER_TEMP/jardulik-web"
-          cp index.html styles.css app.js demo.json privacy.html terms.html bot.html guide.html "$RUNNER_TEMP/jardulik-web/"
+          cp index.html styles.css app.js demo.json privacy.html terms.html bot.html guide.html 404.html sitemap.xml icon.svg "$RUNNER_TEMP/jardulik-web/"
+          cp ../../../docs/images/landing-preview.png "$RUNNER_TEMP/jardulik-web/social.png"
       - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
           path: ${{ runner.temp }}/jardulik-web

@@ -3,9 +3,19 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Независимый Telegram-помощник для Jardulik. История анкет, совместимость и очереди в одном месте.">
+  <meta name="description" content="Независимый Telegram-помощник для Жардулика. История анкет, совместимость и очередь задач в одном месте.">
   <meta name="theme-color" content="#151321">
-  <title>Jardulik Companion — Telegram-помощник для Jardulik</title>
+  <title>Jardulik Companion для Жардулика</title>
+  <link rel="canonical" href="https://kostia7alania.ru/jardulik-companion/">
+  <link rel="icon" type="image/svg+xml" href="./icon.svg">
+  <meta property="og:type" content="website">
+  <meta property="og:locale" content="ru_RU">
+  <meta property="og:title" content="Jardulik Companion для Жардулика">
+  <meta property="og:description" content="Независимый Telegram-помощник для Жардулика. История анкет, совместимость и очередь задач в одном месте.">
+  <meta property="og:url" content="https://kostia7alania.ru/jardulik-companion/">
+  <meta property="og:image" content="https://kostia7alania.ru/jardulik-companion/social.png">
+  <meta property="og:image:alt" content="Демонстрация интерфейса Jardulik Companion">
+  <meta name="twitter:card" content="summary_large_image">
   <link rel="stylesheet" href="./styles.css">
   <script src="./app.js" defer></script>
 </head>
@@ -20,7 +30,7 @@
       <a href="#demo">Демо</a>
       <a href="#start">Готовый сервис</a>
       <a href="#install">Свой сервер</a>
-      <a class="source-link" href="https://github.com/kostia7alania/jardulik-companion">GitHub <span aria-hidden="true">↗</span></a>
+      <a class="source-link" href="#developers">Разработчикам</a>
     </nav>
   </header>
   <main id="main">
@@ -64,6 +74,11 @@
               <li><span class="row-icon row-icon-score" aria-hidden="true">≈</span><span class="row-copy"><strong>Анкета 017</strong><span>Оценка совместимости</span></span><span class="row-status" data-tone="score">82%</span></li>
               <li><span class="row-icon row-icon-wait" aria-hidden="true">⌛</span><span class="row-copy"><strong>Проверка анкет</strong><span>Следующая задача цикла</span></span><span class="row-status" data-tone="wait">В очереди</span></li>
             </ul>
+            <div class="demo-controls" id="demo-controls" hidden>
+              <button class="button button-secondary" id="demo-next" type="button">Следующая анкета</button>
+              <button class="button button-secondary" id="demo-favorite" type="button" aria-pressed="false">Избранное</button>
+              <span class="visually-hidden" id="demo-selection" role="status"></span>
+            </div>
           </div>
           <p class="demo-caption" id="demo-caption">Вымышленные анкеты и события для знакомства с функциями.</p>
           <p class="demo-fallback" id="demo-fallback" role="status" hidden>Сейчас доступен сохранённый обзор. Обнови страницу, чтобы открыть остальные разделы.</p>
@@ -71,7 +86,7 @@
       </div>
     </section>
 
-    <section class="features shell" aria-labelledby="features-title">
+    <section class="features shell" id="possibilities" aria-labelledby="features-title">
       <h2 id="features-title" class="section-title">Что делает Companion</h2>
       <div class="feature-grid">
         <article class="feature">
@@ -93,7 +108,7 @@
     </section>
 
     <section class="onboard shell" id="start" aria-labelledby="onboard-title">
-      <div class="onboard-heading">
+      <div class="onboard-heading" id="connection">
         <h2 id="onboard-title" class="section-title">📲 Готовый сервис</h2>
         <p>Начни в личном чате с ботом.</p>
         <a class="text-link" href="./guide.html">Открыть инструкцию <span aria-hidden="true">↗</span></a>
@@ -127,10 +142,50 @@
         <p id="copy-status" class="visually-hidden" role="status"></p>
       </div>
     </section>
+
+    <section class="onboard shell" id="questions" aria-labelledby="questions-title">
+      <h2 id="questions-title" class="section-title">💬 Частые вопросы</h2>
+      <div class="faq">
+        <details name="faq">
+          <summary>Нужны аккаунт и Premium?</summary>
+          <p>Для готового сервиса нужна своя анкета в Жардулике. Companion работает с возможностями и лимитами твоего тарифа. Подписка оформляется в самом Жардулике.</p>
+        </details>
+        <details name="faq">
+          <summary>Как подключиться с телефона?</summary>
+          <p>Для первого подключения удобнее компьютер с Telegram Web. Дальше ботом можно пользоваться с телефона. Шаги есть <a href="./guide.html">в инструкции</a>.</p>
+        </details>
+        <details name="faq">
+          <summary>Что попадает в историю?</summary>
+          <p>Бот сохраняет анкеты, доступные твоему аккаунту, независимо от лайков. Когда описание или фото меняются, в истории появляется новая версия. Telegram может сжимать фото в альбоме. ZIP в архиве сохраняет файлы в том виде, в каком их отдал Jardulik.</p>
+        </details>
+        <details name="faq">
+          <summary>Когда бот отправляет автолайки?</summary>
+          <p>После отдельного включения в настройках и в пределах выбранных фильтров. Jardulik может менять условия доступа и лимиты.</p>
+        </details>
+        <details name="faq">
+          <summary>Как сделать паузу или удалить данные?</summary>
+          <p><code>/pause</code> останавливает фоновые действия. <code>/disconnect</code> отключает аккаунт и сохраняет архив. <code>/delete</code> запрашивает удаление данных из рабочей базы. Подробнее <a href="./privacy.html">в политике конфиденциальности</a>.</p>
+        </details>
+      </div>
+    </section>
+
+    <section class="onboard shell" id="developers" aria-labelledby="developers-title">
+      <h2 id="developers-title" class="section-title">🛠️ Разработчикам</h2>
+      <div>
+        <p>Независимый справочник по API Jardulik. В публичном Swagger можно смотреть методы, параметры и форматы ответов.</p>
+        <div class="install-links">
+          <a class="text-link" href="https://kostia7alania.ru/jardulik-companion-site/swagger/">Открыть Swagger UI <span aria-hidden="true">↗</span></a>
+          <a class="text-link" href="https://kostia7alania.ru/jardulik-companion-site/swagger/openapi.json">OpenAPI JSON <span aria-hidden="true">↗</span></a>
+          <a class="text-link" href="https://github.com/kostia7alania/jardulik-companion/blob/main/docs/owner-debug-client.md">Локальный API-клиент <span aria-hidden="true">↗</span></a>
+        </div>
+      </div>
+    </section>
   </main>
   <footer class="site-footer shell">
     <span>Jardulik Companion</span>
     <nav aria-label="Информация о проекте">
+      <a href="#developers">Разработчикам</a>
+      <a href="./bot.html">Бот</a>
       <a href="./privacy.html">Конфиденциальность</a>
       <a href="./terms.html">Условия</a>
       <a href="https://github.com/kostia7alania/jardulik-companion">Репозиторий</a>
