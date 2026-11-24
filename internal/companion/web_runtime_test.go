@@ -20,6 +20,8 @@ func TestPublicWebServesOnlyPresentationAndDemo(t *testing.T) {
 		{http.MethodGet, "/healthz", http.StatusNoContent},
 		{http.MethodGet, "/privacy.html", http.StatusOK},
 		{http.MethodGet, "/terms.html", http.StatusOK},
+		{http.MethodGet, "/bot.html", http.StatusOK},
+		{http.MethodGet, "/guide.html", http.StatusOK},
 		{http.MethodGet, "/miniapp/profile", http.StatusNotFound},
 		{http.MethodGet, "/.env", http.StatusNotFound},
 		{http.MethodPost, "/api/demo", http.StatusMethodNotAllowed},

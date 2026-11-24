@@ -12,7 +12,7 @@ import (
 
 // Only first-party presentation assets and synthetic demo data are embedded.
 //
-//go:embed web/index.html web/styles.css web/app.js web/demo.json web/privacy.html web/terms.html
+//go:embed web/index.html web/styles.css web/app.js web/demo.json web/privacy.html web/terms.html web/bot.html web/guide.html
 var publicWeb embed.FS
 
 func publicWebHandler() http.Handler {

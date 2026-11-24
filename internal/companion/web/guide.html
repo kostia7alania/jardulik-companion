@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#151321">
+  <title>Как подключить Jardulik Companion | Jardulik Companion</title>
+  <meta name="description" content="Подключи свой аккаунт Jardulik и пользуйся помощником в Telegram.">
+  <link rel="canonical" href="https://kostia7alania.ru/jardulik-companion/guide.html">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">К содержанию</a>
+  <header class="site-header shell">
+    <a class="brand" href="./" aria-label="Jardulik Companion, главная">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span></span>
+      <span>Jardulik<span class="brand-secondary"> Companion</span></span>
+    </a>
+    <nav aria-label="Навигация">
+      <a href="./">На главную</a>
+    </nav>
+  </header>
+  <main id="main" tabindex="-1">
+    <article class="shell legal">
+      <h1>Как подключить Jardulik Companion</h1>
+      <p>Подключай только свой аккаунт Jardulik. Ссылка запуска даёт временный доступ к этому аккаунту. Передавай её только командой <code>/connect</code> в личном чате помощника.</p>
+      <ol>
+        <li>
+          <h2>Открой Jardulik</h2>
+          <p>Зайди в <a href="https://web.telegram.org/">Telegram Web</a>, открой <a href="https://t.me/jardulik_bot">@jardulik_bot</a> и запусти мини-приложение.</p>
+        </li>
+        <li>
+          <h2>Скопируй ссылку запуска</h2>
+          <p>В инструментах разработчика на вкладке <strong>Элементы</strong> найди iframe с адресом <code>mini.jardulik.app</code>. Скопируй значение <code>src</code> целиком, включая <code>tgWebAppData</code> после <code>#</code>.</p>
+        </li>
+        <li>
+          <h2>Подключи помощника</h2>
+          <p><a href="https://t.me/dvachers_jardulik_bot?start=guide_connect">Открой бота</a> с того же Telegram-аккаунта. Прочитай <a href="./privacy.html">политику данных</a>, затем отправь <code>/connect</code> и полный адрес одним сообщением.</p>
+        </li>
+      </ol>
+      <h2>Как пользоваться</h2>
+      <ul>
+        <li><code>/status</code> показывает состояние подключения.</li>
+        <li><code>/next</code> открывает следующую анкету.</li>
+        <li><code>/pause</code> ставит действия на паузу, <code>/disconnect</code> отключает аккаунт.</li>
+        <li><code>/delete</code> запрашивает удаление личных данных.</li>
+      </ul>
+      <h2>Если подключение не получилось</h2>
+      <p>Перезапусти мини-приложение, скопируй свежую ссылку целиком и проверь Telegram-аккаунт. Для помощи напиши <code>/support</code> и опиши проблему без ссылки запуска и токенов.</p>
+      <p><a class="button button-secondary" href="https://t.me/dvachers_jardulik_bot?start=guide_connect">Открыть бота</a></p>
+    </article>
+  </main>
+  <footer class="site-footer shell">
+    <span>Jardulik Companion</span>
+    <nav aria-label="Информация о проекте">
+      <a href="./guide.html">Подключение</a>
+      <a href="./privacy.html">Конфиденциальность</a>
+      <a href="./terms.html">Условия</a>
+    </nav>
+  </footer>
+</body>
+</html>

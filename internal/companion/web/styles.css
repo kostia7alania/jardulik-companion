@@ -406,3 +406,10 @@ h1 {
 .legal p, .legal ul, .legal ol { margin-top: .8rem; color: var(--muted); }
 .legal li + li { margin-top: .4rem; }
 .legal a { color: var(--orchid); text-decoration: underline; overflow-wrap: anywhere; }
+
+
+#demo, #start, #install { scroll-margin-top: 1.5rem; }
+
+@media (prefers-reduced-motion: no-preference) {
+  html { scroll-behavior: smooth; }
+}

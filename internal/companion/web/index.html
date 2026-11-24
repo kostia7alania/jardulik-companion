@@ -18,7 +18,8 @@
     </a>
     <nav aria-label="Навигация">
       <a href="#demo">Демо</a>
-      <a href="#install">Установка</a>
+      <a href="#start">Готовый сервис</a>
+      <a href="#install">Свой сервер</a>
       <a class="source-link" href="https://github.com/kostia7alania/jardulik-companion">GitHub <span aria-hidden="true">↗</span></a>
     </nav>
   </header>
@@ -91,10 +92,11 @@
       </div>
     </section>
 
-    <section class="onboard shell" aria-labelledby="onboard-title">
+    <section class="onboard shell" id="start" aria-labelledby="onboard-title">
       <div class="onboard-heading">
-        <h2 id="onboard-title" class="section-title">Как начать</h2>
-        <p>Настройка начинается в личном чате с ботом.</p>
+        <h2 id="onboard-title" class="section-title">📲 Готовый сервис</h2>
+        <p>Начни в личном чате с ботом.</p>
+        <a class="text-link" href="./guide.html">Открыть инструкцию <span aria-hidden="true">↗</span></a>
       </div>
       <ol class="onboard-steps">
         <li><h3>Запусти бота</h3><p>Открой Jardulik Companion в Telegram и нажми «Старт».</p></li>
@@ -105,21 +107,21 @@
 
     <section class="installation shell" id="install" aria-labelledby="install-title">
       <div class="install-copy">
-        <h2 id="install-title" class="section-title">Запусти у себя</h2>
-        <p>Склонируй репозиторий и выполни одну из команд в его каталоге. Для просмотра демо токены не нужны.</p>
+        <h2 id="install-title" class="section-title">🖥️ Свой сервер</h2>
+        <p>Склонируй репозиторий. Для работы с ботом задай свой токен и ключи в файле .env.local.</p>
         <div class="install-links">
           <a class="text-link" href="https://github.com/kostia7alania/jardulik-companion/releases/latest">Готовые сборки <span aria-hidden="true">↗</span></a>
-          <a class="text-link" href="https://github.com/kostia7alania/jardulik-companion#readme">Инструкция <span aria-hidden="true">↗</span></a>
+          <a class="text-link" href="https://github.com/kostia7alania/jardulik-companion/blob/main/docs/installation.md">Инструкция по установке <span aria-hidden="true">↗</span></a>
         </div>
       </div>
       <div class="install-commands">
         <div class="command">
-          <div class="command-header"><h3>Docker Compose</h3><button type="button" data-copy="compose-command" hidden>Копировать</button></div>
+          <div class="command-header"><h3>🎮 Локальное демо</h3><button type="button" data-copy="compose-command" hidden>Копировать</button></div>
           <code id="compose-command">docker compose up --build</code>
         </div>
         <div class="command">
-          <div class="command-header"><h3>Go</h3><button type="button" data-copy="go-command" hidden>Копировать</button></div>
-          <code id="go-command">go run ./cmd/jardulik serve-web</code>
+          <div class="command-header"><h3>📲 Свой бот</h3><button type="button" data-copy="bot-command" hidden>Копировать</button></div>
+          <code id="bot-command">docker compose --profile live up --build -d</code>
         </div>
         <p class="install-address">Демо откроется на <code>localhost:8787</code>.</p>
         <p id="copy-status" class="visually-hidden" role="status"></p>
