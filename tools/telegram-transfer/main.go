@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,10 +31,12 @@ import (
 
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -40,6 +44,7 @@ const (
 	maxReceiptSize  = 64 << 10
 	maxSessionSize  = 1 << 20
 	partSize        = 512 << 10
+	uploadThreads   = 4
 	transferTimeout = 25 * time.Minute
 	sessionMagic    = "JDTGS1\n"
 )
@@ -52,6 +57,7 @@ type config struct {
 	ThreadID             int
 	SessionKey           []byte
 	DataDir, SessionFile string
+	SOCKS5               string
 }
 
 // IDs are signed integers from Telegram; document and random IDs are opaque longs.
@@ -136,6 +142,13 @@ func loadConfig(getenv func(string) string) (c config, err error) {
 		if err != nil || c.UploadBytesPerSecond < 0 || c.UploadBytesPerSecond > maxDocumentSize {
 			return c, fail("invalid_upload_rate")
 		}
+	}
+	if raw := strings.TrimSpace(getenv("TELEGRAM_TRANSFER_SOCKS5")); raw != "" {
+		endpoint, err := netip.ParseAddrPort(raw)
+		if err != nil || !endpoint.Addr().IsLoopback() || endpoint.Addr().Zone() != "" || endpoint.Port() == 0 {
+			return c, fail("invalid_transfer_socks5")
+		}
+		c.SOCKS5 = endpoint.String()
 	}
 	return c, nil
 }
@@ -340,8 +353,21 @@ func sessionLock(c config) (*os.File, error) {
 	return f, nil
 }
 
-func botOptions(storage session.Storage) telegram.Options {
-	return telegram.Options{NoUpdates: true, SessionStorage: storage}
+func botOptions(storage session.Storage, socks5 string) (telegram.Options, error) {
+	options := telegram.Options{NoUpdates: true, SessionStorage: storage}
+	if socks5 == "" {
+		return options, nil
+	}
+	dialer, err := proxy.SOCKS5("tcp", socks5, nil, &net.Dialer{Timeout: 10 * time.Second})
+	if err != nil {
+		return options, fail("invalid_transfer_socks5")
+	}
+	contextDialer, ok := dialer.(proxy.ContextDialer)
+	if !ok {
+		return options, fail("invalid_transfer_socks5")
+	}
+	options.Resolver = dcs.Plain(dcs.PlainOptions{Dial: contextDialer.DialContext})
+	return options, nil
 }
 
 func verifyBot(self *tg.User, c config) error {
@@ -591,7 +617,8 @@ func uploadFile(ctx context.Context, api uploader.Client, cmd command, bytesPerS
 	}
 	limited := &uploadRateReader{ctx: ctx, from: io.LimitReader(f, cmd.Size+1), bytesPerSecond: bytesPerSecond, started: time.Now(), now: time.Now, wait: waitUploadRate}
 	r := &hashReader{Reader: limited, info: info, hash: sha256.New()}
-	file, err := uploader.NewUploader(api).WithPartSize(partSize).WithThreads(1).FromFile(ctx, r)
+	// gotd reads the source in order and sends large-file parts concurrently.
+	file, err := uploader.NewUploader(api).WithPartSize(partSize).WithThreads(uploadThreads).FromFile(ctx, r)
 	if err != nil {
 		return nil, "", err
 	}
@@ -744,7 +771,12 @@ func transfer(ctx context.Context, c config, cmd command) receipt {
 	}
 	defer lock.Close()
 	storage := &encryptedSession{c: c}
-	client := telegram.NewClient(c.APIID, c.APIHash, botOptions(storage))
+	options, err := botOptions(storage, c.SOCKS5)
+	if err != nil {
+		diagnosticFailure(&result, err, "connect", false)
+		return result
+	}
+	client := telegram.NewClient(c.APIID, c.APIHash, options)
 	sendAttempted := false
 	phase := "connect"
 	err = client.Run(ctx, func(ctx context.Context) error {

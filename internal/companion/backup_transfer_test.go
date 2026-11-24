@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -430,7 +431,7 @@ func TestFullTransferRestartPreservesUnknownAndResumesBuild(t *testing.T) {
 }
 
 func TestFullTransferConfigDefaultsOffAndContainsSessionPath(t *testing.T) {
-	for name, value := range map[string]string{"APP_DATA_DIR": t.TempDir(), "TELEGRAM_BOT_TOKEN": "fixture-token", "OWNER_TELEGRAM_ID": "123", "JARDULIK_BOT_ID": "456", "BACKUP_CHAT_ID": "-100123", "BACKUP_THREAD_ID": "7", "SESSION_KEY": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)), "BACKUP_KEY": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)), "TELEGRAM_API_ID": "12345", "TELEGRAM_API_HASH": strings.Repeat("a", 32), "TELEGRAM_TRANSFER_HELPER": "", "TELEGRAM_TRANSFER_SESSION_FILE": "", "FULL_BACKUP_TRANSFER_ENABLED": "", "TELEGRAM_TRANSFER_BYTES_PER_SECOND": ""} {
+	for name, value := range map[string]string{"APP_DATA_DIR": t.TempDir(), "TELEGRAM_BOT_TOKEN": "fixture-token", "OWNER_TELEGRAM_ID": "123", "JARDULIK_BOT_ID": "456", "BACKUP_CHAT_ID": "-100123", "BACKUP_THREAD_ID": "7", "SESSION_KEY": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)), "BACKUP_KEY": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)), "TELEGRAM_API_ID": "12345", "TELEGRAM_API_HASH": strings.Repeat("a", 32), "TELEGRAM_TRANSFER_HELPER": "", "TELEGRAM_TRANSFER_SESSION_FILE": "", "FULL_BACKUP_TRANSFER_ENABLED": "", "TELEGRAM_TRANSFER_BYTES_PER_SECOND": "", "TELEGRAM_TRANSFER_SOCKS5": ""} {
 		t.Setenv(name, value)
 	}
 	c, err := LoadConfig()
@@ -450,6 +451,15 @@ func TestFullTransferConfigDefaultsOffAndContainsSessionPath(t *testing.T) {
 		t.Fatal("session outside private data directory accepted")
 	}
 	t.Setenv("TELEGRAM_TRANSFER_SESSION_FILE", "")
+	t.Setenv("TELEGRAM_TRANSFER_SOCKS5", "192.0.2.2:1080")
+	if _, err = LoadConfig(); err == nil {
+		t.Fatal("non-loopback transfer proxy accepted")
+	}
+	t.Setenv("TELEGRAM_TRANSFER_SOCKS5", "127.0.0.1:1080")
+	c, err = LoadConfig()
+	if err != nil || c.TransferSOCKS5 != "127.0.0.1:1080" || !slices.Contains(transferEnvironment(c), "TELEGRAM_TRANSFER_SOCKS5=127.0.0.1:1080") {
+		t.Fatal("loopback transfer proxy was not forwarded")
+	}
 	for _, tc := range []struct {
 		raw     string
 		want    int64

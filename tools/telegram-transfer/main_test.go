@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -69,6 +70,45 @@ func TestConfigKeepsCredentialsInEnvironmentAndTargetWhitelisted(t *testing.T) {
 			copy[key] = value
 			if _, err := loadConfig(func(k string) string { return copy[k] }); err == nil {
 				t.Fatal("unsafe config accepted")
+			}
+		})
+	}
+}
+
+func TestTransferSOCKS5RequiresNumericLoopback(t *testing.T) {
+	t.Setenv("ALL_PROXY", "socks5://192.0.2.1:1080")
+	for _, tt := range []struct {
+		name, address, want string
+		valid               bool
+	}{
+		{name: "unset", valid: true},
+		{name: "ipv4", address: " 127.0.0.1:1080 ", want: "127.0.0.1:1080", valid: true},
+		{name: "ipv6", address: "[::1]:1080", want: "[::1]:1080", valid: true},
+		{name: "external", address: "192.0.2.1:1080"},
+		{name: "hostname", address: "localhost:1080"},
+		{name: "scheme", address: "socks5://127.0.0.1:1080"},
+		{name: "userinfo", address: "user@127.0.0.1:1080"},
+		{name: "no port", address: "127.0.0.1"},
+		{name: "zero port", address: "127.0.0.1:0"},
+		{name: "invalid port", address: "127.0.0.1:65536"},
+		{name: "zone", address: "[::1%lo0]:1080"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			env := testEnvironment(t)
+			env["TELEGRAM_TRANSFER_SOCKS5"] = tt.address
+			c, err := loadConfig(func(key string) string { return env[key] })
+			if !tt.valid {
+				if err == nil || err.Error() != "invalid_transfer_socks5" {
+					t.Fatalf("invalid proxy address: %v", err)
+				}
+				return
+			}
+			if err != nil || c.SOCKS5 != tt.want {
+				t.Fatalf("valid proxy address rejected: %v", err)
+			}
+			options, err := botOptions(&encryptedSession{c: c}, c.SOCKS5)
+			if err != nil || (options.Resolver != nil) != (tt.want != "") {
+				t.Fatalf("unexpected resolver selection: %v", err)
 			}
 		})
 	}
@@ -218,7 +258,10 @@ func TestSessionRejectsSymlinksPublicPermissionsAndConcurrentUse(t *testing.T) {
 
 func TestBotIdentityAndNoUpdatesAreMandatory(t *testing.T) {
 	c := testConfig(t)
-	options := botOptions(&encryptedSession{c: c})
+	options, err := botOptions(&encryptedSession{c: c}, c.SOCKS5)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !options.NoUpdates || options.UpdateHandler != nil || options.SessionStorage == nil {
 		t.Fatal("helper can subscribe to updates")
 	}
@@ -332,12 +375,15 @@ func TestReceiptJSONIsBoundedAndWhitelisted(t *testing.T) {
 }
 
 type uploadSink struct {
+	mu   sync.Mutex
 	hash hash.Hash
 	size int64
 	call func() error
 }
 
 func (s *uploadSink) save(data []byte) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.call != nil {
 		fn := s.call
 		s.call = nil
@@ -356,6 +402,24 @@ func (s *uploadSink) UploadSaveBigFilePart(_ context.Context, r *tg.UploadSaveBi
 	return s.save(r.Bytes)
 }
 
+type parallelUploadSink struct {
+	*uploadSink
+	started atomic.Int32
+	ready   chan struct{}
+}
+
+func (s *parallelUploadSink) UploadSaveBigFilePart(ctx context.Context, r *tg.UploadSaveBigFilePartRequest) (bool, error) {
+	if s.started.Add(1) == 4 {
+		close(s.ready)
+	}
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-s.ready:
+		return s.uploadSink.UploadSaveBigFilePart(ctx, r)
+	}
+}
+
 func TestUploadStreamsAndDetectsSourceChangesBeforeSending(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fixture.zip.enc")
 	data := bytes.Repeat([]byte{0x27}, 12<<20)
@@ -364,9 +428,12 @@ func TestUploadStreamsAndDetectsSourceChangesBeforeSending(t *testing.T) {
 	}
 	cmd := command{File: path, Size: int64(len(data)), SHA: testSHA(data)}
 	sink := &uploadSink{hash: sha256.New()}
-	uploaded, name, err := uploadFile(context.Background(), sink, cmd, 0)
+	parallel := &parallelUploadSink{uploadSink: sink, ready: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	uploaded, name, err := uploadFile(ctx, parallel, cmd, 0)
 	if err != nil || name != "fixture.zip.enc" || sink.size != cmd.Size || hex.EncodeToString(sink.hash.Sum(nil)) != cmd.SHA {
-		t.Fatalf("streamed upload mismatch: %v", err)
+		t.Fatalf("parallel streamed upload mismatch: %v", err)
 	}
 	big, ok := uploaded.(*tg.InputFileBig)
 	if !ok || big.ID == 0 || big.Parts != (len(data)+partSize-1)/partSize || big.Name != "fixture.zip.enc" {

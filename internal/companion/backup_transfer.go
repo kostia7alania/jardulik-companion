@@ -42,6 +42,7 @@ type FullBackupReceipt struct {
 	SourceSHA  string `json:"source_sha256"`
 	RandomID   int64  `json:"random_id"`
 	ErrorCode  string `json:"error_code,omitempty"`
+	Phase      string `json:"phase,omitempty"`
 	RetryAfter int64  `json:"retry_after,omitempty"`
 }
 
@@ -139,6 +140,7 @@ func transferEnvironment(c Config) []string {
 		"TELEGRAM_BOT_TOKEN=" + c.Token, "SESSION_KEY=" + base64.StdEncoding.EncodeToString(c.SessionKey),
 		"APP_DATA_DIR=" + c.DataDir, "TELEGRAM_TRANSFER_SESSION_FILE=" + c.transferSessionPath(),
 		"TELEGRAM_TRANSFER_BYTES_PER_SECOND=" + strconv.FormatInt(c.TransferBytesPerSecond, 10),
+		"TELEGRAM_TRANSFER_SOCKS5=" + c.TransferSOCKS5,
 		"BACKUP_CHAT_ID=" + strconv.FormatInt(c.BackupChatID, 10), "BACKUP_THREAD_ID=" + strconv.FormatInt(c.BackupThreadID, 10),
 	}
 }

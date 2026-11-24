@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,7 +18,7 @@ import (
 	"time"
 )
 
-const Version = "0.2.0"
+const Version = "0.2.1"
 
 type Config struct {
 	FullBackupEnabled                                  bool
@@ -29,6 +30,7 @@ type Config struct {
 	CompatibilityGap                                   time.Duration
 	TelegramAPIID, TransferBytesPerSecond              int64
 	TelegramAPIHash, TransferHelper, TransferSession   string
+	TransferSOCKS5                                     string
 	OwnerID, SourceBotID, BackupChatID, BackupThreadID int64
 	SessionKey, BackupKey                              []byte
 	AllowReactions                                     bool
@@ -119,6 +121,13 @@ func LoadConfig() (Config, error) {
 			return c, errors.New("invalid TELEGRAM_TRANSFER_BYTES_PER_SECOND")
 		}
 		c.TransferBytesPerSecond = rate
+	}
+	c.TransferSOCKS5 = strings.TrimSpace(os.Getenv("TELEGRAM_TRANSFER_SOCKS5"))
+	if c.TransferSOCKS5 != "" {
+		address, parseErr := netip.ParseAddrPort(c.TransferSOCKS5)
+		if parseErr != nil || !address.Addr().IsLoopback() || address.Addr().Zone() != "" || address.Port() == 0 {
+			return c, errors.New("invalid TELEGRAM_TRANSFER_SOCKS5")
+		}
 	}
 	c.TelegramAPIHash = strings.TrimSpace(os.Getenv("TELEGRAM_API_HASH"))
 	if (c.TelegramAPIID == 0) != (c.TelegramAPIHash == "") {
