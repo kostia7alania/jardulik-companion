@@ -1,11 +1,47 @@
 # Jardulik Companion
 
+[![CI](https://github.com/kostia7alania/jardulik-companion/actions/workflows/ci.yml/badge.svg)](https://github.com/kostia7alania/jardulik-companion/actions/workflows/ci.yml)
+[![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](go.mod)
+
+Независимый помощник для Jardulik. В Telegram можно сохранять анкеты, просматривать историю и получать уведомления. В этом репозитории находятся Go-сервисы, интерфейс и инструкции для самостоятельной установки.
+
+**[Демо](https://kostia7alania.ru/jardulik-companion/) · [Открыть бота](https://t.me/dvachers_jardulik_bot?start=readme) · [Скачать релиз](https://github.com/kostia7alania/jardulik-companion/releases/latest) · [Установка и перенос](docs/installation.md)**
+
+[![Лендинг и демонстрация Jardulik Companion](docs/images/landing-preview.png)](https://kostia7alania.ru/jardulik-companion/)
+
+## Установка
+
+| Задача | Как запустить |
+| --- | --- |
+| Посмотреть продукт | Откройте [публичное демо](https://kostia7alania.ru/jardulik-companion/) с примером архива и очереди |
+| Запустить у себя | Распакуйте пакет для своей платформы из [релиза](https://github.com/kostia7alania/jardulik-companion/releases/latest) и запустите `./jardulik serve-web` |
+| Собрать из исходников | `docker compose up --build` или `go run ./cmd/jardulik serve-web` |
+| Подключить своего бота | Настройте свой токен и ключи по [инструкции](docs/installation.md) |
+
+Локальный интерфейс открывается по адресу `http://127.0.0.1:8787`. Go-бинарник содержит лендинг и демонстрационные данные. Для демо достаточно одного бинарника.
+
+## Что переносится
+
+```mermaid
+flowchart LR
+    A["GitHub Release · программа"] --> C["Установка на новый хост"]
+    B[".zip.enc · бизнес-данные"] --> D["Проверка SHA-256 и restore"]
+    K["BACKUP_KEY · отдельным каналом"] --> D
+    C --> D --> E["Проверка SQLite и медиа"] --> F["Переключение рабочего бота"]
+```
+
+Файл `*__jardulik-full__*.zip.enc` содержит SQLite, исходные медиа и конфигурацию восстановления. Восстановление проверяют в новой директории. Для работы с восстановленными сессиями нужен прежний `SESSION_KEY`. [Порядок переноса](docs/installation.md)
+
+Исходный код проекта доступен под [MIT](LICENSE). Сторонние зависимости распространяются по своим лицензиям. Jardulik Companion является независимым проектом. [Политика конфиденциальности](https://kostia7alania.ru/jardulik-companion/privacy.html) · [Условия](https://kostia7alania.ru/jardulik-companion/terms.html)
+
+## Как работает сервис
+
 Операторский тред `🖥 Сервер · логи` показывает текущий цикл и очереди, живые роли и ошибки сервиса. Статус редактируется раз в минуту, одинаковые ошибки объединяются счётчиком. Настройка и восстановление: [docs/operations.md](docs/operations.md).
 
 Независимый многопользовательский Telegram-помощник для Jardulik: основной Go-сервис, SQLite WAL и прямой HTTP API. Браузер нужен для первого подключения; на VPS он не запускается. В состав релиза входит отдельный короткоживущий MTProto helper для крупных резервных копий.
 
 - Бот: [@dvachers_jardulik_bot](https://t.me/dvachers_jardulik_bot).
-- Лендинг: [Jardulik Companion](https://kostia7alania.ru/jardulik-companion-site/).
 - Личный API-клиент: [запуск и работа через SSH](docs/owner-debug-client.md).
 - Совместимость: [отдельная служба и таблица связей](docs/compatibility-worker.md).
 - Целевой дизайн: [независимый сбор и правила реакций](docs/collection-and-reaction-policy.md).

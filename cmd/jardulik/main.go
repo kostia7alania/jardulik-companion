@@ -25,6 +25,14 @@ func run() error {
 	if (command == "serve-bot-parser" || command == "serve-poster" || command == "serve-compatibility" || command == "serve-miniapp") && len(os.Args) != 2 {
 		return errors.New("usage: jardulik " + command)
 	}
+	if command == "serve-web" {
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik serve-web")
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+		return companion.RunWeb(ctx, os.Getenv("JARDULIK_WEB_LISTEN"))
+	}
 	if command == "version" {
 		fmt.Println(companion.Version)
 		return nil
@@ -346,7 +354,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-bot-parser, serve-poster, serve-compatibility, serve-miniapp, miniapp-test-card, sync-status, sync-recover-auth, sync-resume-crawl, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, refresh-archive-viewer-control, version")
+		return errors.New("commands: serve, serve-web, serve-bot-parser, serve-poster, serve-compatibility, serve-miniapp, miniapp-test-card, sync-status, sync-recover-auth, sync-resume-crawl, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, refresh-archive-viewer-control, version")
 	}
 }
 func main() {

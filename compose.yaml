@@ -1,0 +1,36 @@
+x-runtime: &runtime
+  image: jardulik-companion:local
+  build: .
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  read_only: true
+  restart: unless-stopped
+
+services:
+  web:
+    <<: *runtime
+    command: [serve-web]
+    environment:
+      JARDULIK_WEB_LISTEN: 0.0.0.0:8787
+    ports:
+      - "127.0.0.1:${JARDULIK_WEB_PORT:-8787}:8787"
+
+  bot:
+    <<: *runtime
+    profiles: [live]
+    command: [serve]
+    env_file:
+      - path: ${JARDULIK_ENV_FILE:-.env.local}
+        required: false
+        format: raw
+    environment:
+      APP_DATA_DIR: /data
+      TELEGRAM_TRANSFER_HELPER: /app/telegram-transfer
+      TELEGRAM_TRANSFER_SESSION_FILE: /data/telegram-bot-session.enc
+      JARDULIK_DEBUG_LISTEN: ""
+    volumes:
+      - state:/data
+    stop_grace_period: 45s
+
+volumes:
+  state:

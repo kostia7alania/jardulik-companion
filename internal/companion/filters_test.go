@@ -36,6 +36,7 @@ func filterFixture(t *testing.T) (*Service, *[]uxMessage, *int64, *[]string) {
 			if r.URL.Scheme != "https" || r.Header.Get("Authorization") != "" || r.URL.Path != "/assets/RU-DtiNLDz2.js" {
 				t.Fatalf("untrusted dictionary request: %s", r.URL)
 			}
+			// Serve a synthetic city module in the same format as the source.
 			raw, err := os.ReadFile(filepath.Join("testdata", "filters", "RU.js"))
 			if err != nil {
 				t.Fatal(err)
@@ -251,28 +252,34 @@ func TestFiltersResetCancelAndOtherProfilesAreExplicit(t *testing.T) {
 	}
 }
 
-func TestFilterCitySourceFixturesAndUnknownFormats(t *testing.T) {
+func TestFilterCityModuleFormats(t *testing.T) {
 	var assets map[string]string
 	if err := json.Unmarshal(filterCityAssetsJSON, &assets); err != nil || len(assets) != 228 {
 		t.Fatalf("pinned asset index: %d %v", len(assets), err)
 	}
-	for iso, want := range map[string]string{"RU": "Vladikavkaz", "XS": "Tskhinval", "XA": "Sukhumi", "GE": "Tbilisi", "AM": "Yerevan"} {
+	for iso, want := range map[string]filterCity{
+		"RU": {Name: "Vladikavkaz", Russian: "Владикавказ"},
+		"XS": {Name: "Tskhinval", Russian: "Цхинвал"},
+		"XA": {Name: "Sukhumi", Russian: "Сухум"},
+		"GE": {Name: "Tbilisi", Russian: "Тбилиси"},
+		"AM": {Name: "Yerevan", Russian: "Ереван"},
+	} {
 		raw, err := os.ReadFile(filepath.Join("testdata", "filters", iso+".js"))
 		if err != nil {
 			t.Fatal(err)
 		}
 		cities, err := decodeCityModule(raw)
 		if err != nil {
-			t.Fatalf("%s source module rejected: %v", iso, err)
+			t.Fatalf("%s fixture module rejected: %v", iso, err)
 		}
 		found := false
 		for _, city := range cities {
-			if city.Name == want {
+			if city == want {
 				found = true
 			}
 		}
 		if !found {
-			t.Fatalf("%s source canonical city missing", iso)
+			t.Fatalf("%s fixture city or translation missing", iso)
 		}
 	}
 	tooManyRows := `const a=[` + strings.Repeat(`"City",`, filterCityRows) + `"City"];export{a as default};`

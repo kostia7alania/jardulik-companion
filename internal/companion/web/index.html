@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Независимый Telegram-помощник для Jardulik. История анкет, совместимость и очереди в одном месте.">
+  <meta name="theme-color" content="#151321">
+  <title>Jardulik Companion — Telegram-помощник для Jardulik</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">К содержанию</a>
+  <header class="site-header shell">
+    <a class="brand" href="./" aria-label="Jardulik Companion, главная">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span></span>
+      <span>Jardulik<span class="brand-secondary"> Companion</span></span>
+    </a>
+    <nav aria-label="Навигация">
+      <a href="#demo">Демо</a>
+      <a href="#install">Установка</a>
+      <a class="source-link" href="https://github.com/kostia7alania/jardulik-companion">GitHub <span aria-hidden="true">↗</span></a>
+    </nav>
+  </header>
+  <main id="main">
+    <section class="hero shell" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="product-kind"><span aria-hidden="true"></span> Независимый Telegram-помощник</p>
+        <h1 id="hero-title">Твой Jardulik<br>в одном месте.</h1>
+        <p class="lead">Сохраняй анкеты, следи за изменениями и смотри совместимость прямо в Telegram.</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="https://t.me/dvachers_jardulik_bot?start=landing">Открыть в Telegram <span aria-hidden="true">↗</span></a>
+          <a class="button button-secondary" href="#demo">Посмотреть демо <span aria-hidden="true">↓</span></a>
+        </div>
+      </div>
+      <div class="demo-wrap" id="demo">
+        <section class="demo" aria-labelledby="demo-title">
+          <div class="demo-top">
+            <div>
+              <p class="demo-product">Companion</p>
+              <h2 id="demo-title">Рабочее пространство</h2>
+            </div>
+            <span class="demo-label"><span aria-hidden="true"></span> Демо</span>
+          </div>
+          <div class="demo-tabs" role="tablist" aria-label="Разделы рабочего пространства">
+            <button class="demo-tab" type="button" role="tab" id="tab-overview" aria-controls="demo-panel" aria-selected="true" data-view="overview" tabindex="0">Обзор</button>
+            <button class="demo-tab" type="button" role="tab" id="tab-archive" aria-controls="demo-panel" aria-selected="false" data-view="archive" tabindex="-1" disabled>Анкеты</button>
+            <button class="demo-tab" type="button" role="tab" id="tab-queue" aria-controls="demo-panel" aria-selected="false" data-view="queue" tabindex="-1" disabled>Очередь</button>
+            <button class="demo-tab" type="button" role="tab" id="tab-compatibility" aria-controls="demo-panel" aria-selected="false" data-view="compatibility" tabindex="-1" disabled>Совместимость</button>
+          </div>
+          <div id="demo-panel" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+            <dl class="demo-metrics" id="demo-metrics">
+              <div class="metric"><dt>Анкеты</dt><dd>24</dd></div>
+              <div class="metric"><dt>Изменения</dt><dd>6</dd></div>
+              <div class="metric"><dt>В очереди</dt><dd>3</dd></div>
+            </dl>
+            <div class="demo-list-heading">
+              <h3 id="demo-view-title">Последние события</h3>
+              <span class="demo-column-label" aria-hidden="true">Статус</span>
+            </div>
+            <ul class="demo-list" id="demo-rows">
+              <li><span class="row-icon row-icon-done" aria-hidden="true">✓</span><span class="row-copy"><strong>Анкета 024</strong><span>Новая версия сохранена</span></span><span class="row-status" data-tone="done">Готово</span></li>
+              <li><span class="row-icon row-icon-score" aria-hidden="true">≈</span><span class="row-copy"><strong>Анкета 017</strong><span>Оценка совместимости</span></span><span class="row-status" data-tone="score">82%</span></li>
+              <li><span class="row-icon row-icon-wait" aria-hidden="true">⌛</span><span class="row-copy"><strong>Проверка анкет</strong><span>Следующая задача цикла</span></span><span class="row-status" data-tone="wait">В очереди</span></li>
+            </ul>
+          </div>
+          <p class="demo-caption" id="demo-caption">Вымышленные анкеты и события для знакомства с функциями.</p>
+          <p class="demo-fallback" id="demo-fallback" role="status" hidden>Сейчас доступен сохранённый обзор. Обнови страницу, чтобы открыть остальные разделы.</p>
+        </section>
+      </div>
+    </section>
+
+    <section class="features shell" aria-labelledby="features-title">
+      <h2 id="features-title" class="section-title">Что делает Companion</h2>
+      <div class="feature-grid">
+        <article class="feature">
+          <span class="feature-icon" aria-hidden="true">▤</span>
+          <h3>Хранит историю анкет</h3>
+          <p>Возвращайся к сохранённым анкетам и смотри, что изменилось в описании или фотографиях.</p>
+        </article>
+        <article class="feature">
+          <span class="feature-icon" aria-hidden="true">≈</span>
+          <h3>Сохраняет совместимость</h3>
+          <p>Открывай прошлые оценки из каталога. Новый расчёт нужен, когда меняются значимые поля анкеты.</p>
+        </article>
+        <article class="feature">
+          <span class="feature-icon" aria-hidden="true">↻</span>
+          <h3>Показывает ход задач</h3>
+          <p>Проверяй, что уже собрано, какой цикл в работе и где нужна ручная проверка.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="onboard shell" aria-labelledby="onboard-title">
+      <div class="onboard-heading">
+        <h2 id="onboard-title" class="section-title">Как начать</h2>
+        <p>Настройка начинается в личном чате с ботом.</p>
+      </div>
+      <ol class="onboard-steps">
+        <li><h3>Запусти бота</h3><p>Открой Jardulik Companion в Telegram и нажми «Старт».</p></li>
+        <li><h3>Подключи свой аккаунт</h3><p>Нажми «Подключить» в меню и следуй подсказкам бота.</p></li>
+        <li><h3>Открой меню</h3><p>Сохраняй анкеты и настрой автоматизацию. Автолайки включаются отдельно.</p></li>
+      </ol>
+    </section>
+
+    <section class="installation shell" id="install" aria-labelledby="install-title">
+      <div class="install-copy">
+        <h2 id="install-title" class="section-title">Запусти у себя</h2>
+        <p>Склонируй репозиторий и выполни одну из команд в его каталоге. Для просмотра демо токены не нужны.</p>
+        <div class="install-links">
+          <a class="text-link" href="https://github.com/kostia7alania/jardulik-companion/releases/latest">Готовые сборки <span aria-hidden="true">↗</span></a>
+          <a class="text-link" href="https://github.com/kostia7alania/jardulik-companion#readme">Инструкция <span aria-hidden="true">↗</span></a>
+        </div>
+      </div>
+      <div class="install-commands">
+        <div class="command">
+          <div class="command-header"><h3>Docker Compose</h3><button type="button" data-copy="compose-command" hidden>Копировать</button></div>
+          <code id="compose-command">docker compose up --build</code>
+        </div>
+        <div class="command">
+          <div class="command-header"><h3>Go</h3><button type="button" data-copy="go-command" hidden>Копировать</button></div>
+          <code id="go-command">go run ./cmd/jardulik serve-web</code>
+        </div>
+        <p class="install-address">Демо откроется на <code>localhost:8787</code>.</p>
+        <p id="copy-status" class="visually-hidden" role="status"></p>
+      </div>
+    </section>
+  </main>
+  <footer class="site-footer shell">
+    <span>Jardulik Companion</span>
+    <nav aria-label="Информация о проекте">
+      <a href="./privacy.html">Конфиденциальность</a>
+      <a href="./terms.html">Условия</a>
+      <a href="https://github.com/kostia7alania/jardulik-companion">Репозиторий</a>
+    </nav>
+  </footer>
+</body>
+</html>
