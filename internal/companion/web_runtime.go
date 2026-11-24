@@ -10,9 +10,12 @@ import (
 	"time"
 )
 
-// Only first-party presentation assets and synthetic demo data are embedded.
+// Only approved public presentation, demo, and read-only API reference files are embedded.
 //
-//go:embed web/index.html web/icon.svg web/styles.css web/app.js web/demo.json web/privacy.html web/terms.html web/bot.html web/guide.html
+//go:embed web/index.html web/bot.js web/icon.svg web/styles.css web/app.js web/demo.json web/privacy.html web/terms.html web/bot.html web/guide.html
+//go:embed web/swagger/index.html web/swagger/openapi.json web/swagger/swagger.css web/swagger/swagger.js
+//go:embed web/swagger/vendor/swagger-ui-bundle.js web/swagger/vendor/swagger-ui.css
+//go:embed web/swagger/vendor/LICENSE web/swagger/vendor/NOTICE web/swagger/vendor/provenance.json web/swagger/vendor/swagger-ui-bundle.js.LICENSE.txt
 var publicWeb embed.FS
 
 func publicWebHandler() http.Handler {

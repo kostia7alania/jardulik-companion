@@ -33,6 +33,8 @@ flowchart LR
 
 ## 🧭 Документация
 
+[Swagger UI](https://kostia7alania.ru/jardulik-companion/swagger/) · [OpenAPI JSON](internal/companion/web/swagger/openapi.json)
+
 [Релизы](https://github.com/kostia7alania/jardulik-companion/releases/latest) · [Службы и восстановление](docs/operations.md) · [Сбор и публикация](docs/sync-cycles.md) · [Конфиденциальность](https://kostia7alania.ru/jardulik-companion/privacy.html) · [Условия](https://kostia7alania.ru/jardulik-companion/terms.html)
 
 Исходный код распространяется под [MIT](LICENSE). Сторонние зависимости сохраняют свои лицензии.

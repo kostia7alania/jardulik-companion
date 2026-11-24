@@ -1,6 +1,6 @@
 # Личный API-клиент Jardulik
 
-Публичный [Swagger-справочник](https://kostia7alania.ru/jardulik-companion-site/swagger/) и [OpenAPI JSON](https://kostia7alania.ru/jardulik-companion-site/swagger/openapi.json) описывают API. Личный клиент открывается через Go-сервис и использует текущую сессию основного владельца. Bearer, обновление токена и настроенный User-Agent добавляет бэк.
+Публичный [Swagger-справочник](https://kostia7alania.ru/jardulik-companion/swagger/) и [OpenAPI JSON](https://kostia7alania.ru/jardulik-companion/swagger/openapi.json) описывают API. Личный клиент открывается через Go-сервис и использует текущую сессию основного владельца. Bearer, обновление токена и настроенный User-Agent добавляет бэк.
 
 ## Запуск
 

@@ -6,6 +6,7 @@ on:
     paths:
       - 'internal/companion/web/**'
       - 'docs/images/landing-preview.png'
+      - 'scripts/check_swagger.py'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -29,12 +30,16 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - name: Check API reference
+        run: python3 scripts/check_swagger.py
       - name: Stage public files
         working-directory: internal/companion/web
         run: |
-          mkdir -p "$RUNNER_TEMP/jardulik-web"
-          cp index.html styles.css app.js demo.json privacy.html terms.html bot.html guide.html 404.html sitemap.xml icon.svg "$RUNNER_TEMP/jardulik-web/"
+          mkdir -p "$RUNNER_TEMP/jardulik-web/swagger/vendor"
+          cp index.html styles.css app.js bot.js demo.json privacy.html terms.html bot.html guide.html 404.html sitemap.xml icon.svg "$RUNNER_TEMP/jardulik-web/"
           cp ../../../docs/images/landing-preview.png "$RUNNER_TEMP/jardulik-web/social.png"
+          cp swagger/index.html swagger/openapi.json swagger/swagger.css swagger/swagger.js "$RUNNER_TEMP/jardulik-web/swagger/"
+          cp swagger/vendor/LICENSE swagger/vendor/NOTICE swagger/vendor/provenance.json swagger/vendor/swagger-ui-bundle.js swagger/vendor/swagger-ui-bundle.js.LICENSE.txt swagger/vendor/swagger-ui.css "$RUNNER_TEMP/jardulik-web/swagger/vendor/"
       - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
           path: ${{ runner.temp }}/jardulik-web
