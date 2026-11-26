@@ -22,7 +22,7 @@ func TestFullBackupRetentionOnlyPrunesVerifiedOldFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := func(i int) string {
-		return fmt.Sprintf("20261124T030000Z__jardulik-full__1-%d.zip.enc", i)
+		return fmt.Sprintf("20261124T030000Z__jardulik-full__1-profiles-%d.zip.enc", i)
 	}
 	exec := func(stmt string, args ...any) {
 		t.Helper()

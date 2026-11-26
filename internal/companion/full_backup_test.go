@@ -136,6 +136,9 @@ func TestFullBackupRoundTripKeepsVersionsObserversAndOriginals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !fullBackupFilename.MatchString(filepath.Base(artifact.Path)) {
+		t.Fatalf("generated full backup is not eligible for local retention: %s", filepath.Base(artifact.Path))
+	}
 	if artifact.UploadEnabled || artifact.Profiles != 2 || artifact.Versions != 4 || artifact.MediaFiles != 3 || artifact.SourceFingerprint == "" {
 		t.Fatalf("unexpected artifact: %+v", artifact)
 	}

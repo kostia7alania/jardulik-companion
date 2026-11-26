@@ -14,7 +14,7 @@ import (
 	"syscall"
 )
 
-var fullBackupFilename = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z__jardulik-full__[0-9]+-[0-9]+\.zip\.enc$`)
+var fullBackupFilename = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}Z__jardulik-full__[0-9]+-profiles-[0-9]+\.zip\.enc$`)
 
 type FullBackupPruneResult struct {
 	Files int   `json:"files_removed"`
