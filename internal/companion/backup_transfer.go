@@ -369,6 +369,9 @@ func (a *Archiver) processNextFullBackup(ctx context.Context) (bool, error) {
 		return true, errors.New("backup companion delivery unconfirmed")
 	}
 	_, err = a.Store.DB.ExecContext(ctx, "UPDATE full_backup_jobs SET companion_message_id=? WHERE id=?", message.ID, job.id)
+	if err == nil {
+		a.pruneFullBackupsBestEffort(ctx)
+	}
 	return true, err
 }
 
@@ -462,5 +465,8 @@ func (a *Archiver) recoverFullBackupJobs(ctx context.Context) error {
 	_, err := a.Store.DB.ExecContext(ctx, `UPDATE archive_backups SET state='disabled',error='legacy_metadata_backup_disabled' WHERE state='pending';
  UPDATE full_backup_jobs SET state='pending',error='' WHERE state='building';
  UPDATE full_backup_jobs SET state='uncertain',error='worker_restarted_during_transfer' WHERE state='sending';`)
+	if err == nil {
+		a.pruneFullBackupsBestEffort(ctx)
+	}
 	return err
 }

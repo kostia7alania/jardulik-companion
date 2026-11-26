@@ -280,6 +280,13 @@ func run() error {
 		result, buildErr := s.Archiver.BuildFullBackup(ctx, len(os.Args) == 3)
 		_ = json.NewEncoder(os.Stdout).Encode(result)
 		return buildErr
+	case "backup-prune":
+		if len(os.Args) != 2 {
+			return errors.New("usage: jardulik backup-prune")
+		}
+		result, pruneErr := s.Archiver.PruneFullBackups(ctx)
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		return pruneErr
 	case "backup-send-once":
 		if len(os.Args) != 2 {
 			return errors.New("usage: jardulik backup-send-once (requires explicit transfer activation)")
@@ -354,7 +361,7 @@ func run() error {
 		}
 		return s.RefreshCardCaptions(ctx)
 	default:
-		return errors.New("commands: serve, serve-web, serve-bot-parser, serve-poster, serve-compatibility, serve-miniapp, miniapp-test-card, sync-status, sync-recover-auth, sync-resume-crawl, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, refresh-archive-viewer-control, version")
+		return errors.New("commands: serve, serve-web, serve-bot-parser, serve-poster, serve-compatibility, serve-miniapp, miniapp-test-card, sync-status, sync-recover-auth, sync-resume-crawl, operations-status, compatibility-status, reaction-message-status, reaction-message-set (JSON on stdin), reaction-draft-import, reaction-draft-status, reaction-hold-resolve, connect (URL on stdin), account, fetch, import-analysis, crawl-request, crawl-status, status, backup, backup-daily, backup-send-once, backup-full, backup-prune, restore, restore-telegram, restore-media, repair-posts, repair-zips, reconcile-albums, refresh-captions, refresh-profile-caption, refresh-archive-viewer-control, version")
 	}
 }
 func main() {

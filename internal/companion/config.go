@@ -18,10 +18,11 @@ import (
 	"time"
 )
 
-const Version = "0.2.1"
+const Version = "0.2.2"
 
 type Config struct {
 	FullBackupEnabled                                  bool
+	BackupLocalKeep                                    int
 	DataDir, Token, APIBase, TelegramBase              string
 	UserAgent                                          string
 	DebugListen                                        string
@@ -157,6 +158,12 @@ func LoadConfig() (Config, error) {
 		}
 	}
 	c.FullBackupEnabled = os.Getenv("FULL_BACKUP_TRANSFER_ENABLED") == "true"
+	if raw := strings.TrimSpace(os.Getenv("BACKUP_LOCAL_KEEP")); raw != "" {
+		c.BackupLocalKeep, err = strconv.Atoi(raw)
+		if err != nil || c.BackupLocalKeep < 0 {
+			return c, errors.New("invalid BACKUP_LOCAL_KEEP")
+		}
+	}
 	c.AllowReactions = os.Getenv("ALLOW_REACTIONS") == "true"
 	c.RichCards = os.Getenv("TELEGRAM_RICH_CARDS") == "true"
 	c.ArchivePaused = os.Getenv("ARCHIVE_WORKER_PAUSED") == "true"
